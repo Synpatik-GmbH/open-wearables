@@ -272,18 +272,20 @@ class ImportService:
             inserted_ids = self.event_record_service.bulk_create(db_session, records)
             db_session.flush()
 
-            # Filter details to only those records that were actually inserted (avoid FK violation)
-            details_to_insert = [details_by_id[rid] for rid in inserted_ids if rid in details_by_id]
-
-            # Bulk create details (requires event_record to exist due to FK)
-            if details_to_insert:
-                self.event_record_service.bulk_create_details(db_session, details_to_insert, detail_type="workout")
-            workouts_saved = len(inserted_ids)
-
-            # Bulk create time series samples
+            # Bulk create time series samples BEFORE details so HR rows are
+            # visible to the Edwards zone query inside bulk_create_details
             if time_series_samples:
                 self.timeseries_service.bulk_create_samples(db_session, time_series_samples)
                 records_saved += len(time_series_samples)
+                db_session.flush()
+
+            # Filter details to only those records that were actually inserted (avoid FK violation)
+            details_to_insert = [details_by_id[rid] for rid in inserted_ids if rid in details_by_id]
+
+            # Bulk create details — zone query now sees HR rows
+            if details_to_insert:
+                self.event_record_service.bulk_create_details(db_session, details_to_insert, detail_type="workout")
+            workouts_saved = len(inserted_ids)
 
         # Process time series samples (records)
         samples = self._build_statistic_bundles(request, user_id)
