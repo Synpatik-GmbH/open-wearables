@@ -153,9 +153,7 @@ class EventRecordService(
         if duration_seconds and duration_seconds > 0:
             completeness = round(min(1.0, zones["sampled_minutes"] / (duration_seconds / 60)), 4)
 
-        zone_minutes: dict[str, int | None] = {
-            f"hr_zone_{i}_min": zones[f"zone_{i}_min"] for i in range(1, 6)
-        }
+        zone_minutes: dict[str, int | None] = {f"hr_zone_{i}_min": zones[f"zone_{i}_min"] for i in range(1, 6)}
         return zone_minutes, completeness
 
     def _resolve_avg_hr(
@@ -710,9 +708,7 @@ class EventRecordService(
             data_source = data_sources_by_id.get(record.data_source_id)
             if data_source is None:
                 continue
-            zone_minutes, completeness = self._workout_hr_zone_fields(
-                db_session, record, data_source, birth_date_cache
-            )
+            zone_minutes, completeness = self._workout_hr_zone_fields(db_session, record, data_source, birth_date_cache)
             dispatches.append(
                 (
                     _EventRecordSnapshot(
