@@ -45,6 +45,7 @@ from app.schemas.utils import (
     TimeseriesMetadata,
 )
 from app.utils.exceptions import handle_exceptions
+from app.utils.heart_rate import estimate_max_hr
 from app.utils.pagination import (
     decode_activity_cursor,
     encode_activity_cursor,
@@ -59,7 +60,7 @@ SLEEP_PHYSIO_SERIES_TYPES = [
 ]
 
 # Activity summary constants
-DEFAULT_MAX_HR = 190  # Assumes ~30 years old when birth_date unavailable
+# DEFAULT_MAX_HR is imported from app.utils.heart_rate (single source of truth).
 ACTIVE_STEPS_THRESHOLD = 30  # Steps per minute to be considered "active"
 METERS_PER_FLOOR = 3.0  # Standard floor height for floors_climbed calculation
 
@@ -171,18 +172,8 @@ class SummariesService:
         Falls back to DEFAULT_MAX_HR if birth_date is not available.
         """
         user = self.user_repo.get(db_session, user_id)
-        if not user or not user.personal_record or not user.personal_record.birth_date:
-            return DEFAULT_MAX_HR
-
-        # Calculate age as of the reference date
-        birth_date = user.personal_record.birth_date
-        age = reference_date.year - birth_date.year
-        # Adjust if birthday hasn't occurred yet this year
-        if (reference_date.month, reference_date.day) < (birth_date.month, birth_date.day):
-            age -= 1
-
-        max_hr = 220 - age
-        return max(max_hr, 100)  # Ensure reasonable minimum
+        birth_date = user.personal_record.birth_date if user and user.personal_record else None
+        return estimate_max_hr(birth_date, reference_date)
 
     def _get_hr_zone_thresholds(self, max_hr: int) -> dict[str, int]:
         """Calculate HR zone thresholds as percentages of max HR.

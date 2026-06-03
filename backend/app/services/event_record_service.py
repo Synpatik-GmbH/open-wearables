@@ -14,6 +14,7 @@ from app.models import (
     EventRecordDetail,
     HealthScore,
     SleepDetails,
+    User,
     WorkoutDetails,
 )
 from app.repositories import (
@@ -23,6 +24,7 @@ from app.repositories import (
     EventRecordRepository,
     HealthScoreRepository,
 )
+from app.repositories.user_repository import UserRepository
 from app.schemas.enums import WORKOUTS_WITH_PACE, HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -48,6 +50,7 @@ from app.services.outgoing_webhooks.events import on_sleep_created, on_workout_c
 from app.services.scores.sleep_service import sleep_score_service
 from app.services.services import AppService
 from app.utils.exceptions import handle_exceptions
+from app.utils.heart_rate import estimate_max_hr
 from app.utils.pagination import encode_cursor
 
 
@@ -67,6 +70,15 @@ class _EventRecordSnapshot:
     end_datetime: datetime
     duration_seconds: int | None
     type: str | None
+    # Edwards HR-zone minutes + HR-trace completeness for workout records. Computed
+    # while the session is live (before the after_commit listener fires) and carried
+    # as plain values; all None for non-workout records or when no HR series exists.
+    hr_zone_1_min: int | None = None
+    hr_zone_2_min: int | None = None
+    hr_zone_3_min: int | None = None
+    hr_zone_4_min: int | None = None
+    hr_zone_5_min: int | None = None
+    hr_trace_completeness: float | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +99,62 @@ class EventRecordService(
         self.data_source_repo = DataSourceRepository()
         self.data_point_series_repo = DataPointSeriesRepository(DataPointSeries)
         self.health_score_repo = HealthScoreRepository(HealthScore)
+        self.user_repo = UserRepository(User)
+
+    def _user_birth_date(self, db_session: DbSession, user_id: UUID) -> date | None:
+        """Return the user's birth_date (for max-HR estimation), or None."""
+        user = self.user_repo.get(db_session, user_id)
+        if user and user.personal_record:
+            return user.personal_record.birth_date
+        return None
+
+    def _workout_hr_zone_fields(
+        self,
+        db_session: DbSession,
+        record: EventRecord,
+        data_source: DataSource,
+        birth_date_cache: dict[UUID, date | None] | None = None,
+    ) -> tuple[dict[str, int | None], float | None]:
+        """Compute the Edwards HR-zone minutes + completeness for a workout record.
+
+        Returns ``(zone_minutes, completeness)`` where ``zone_minutes`` maps the five
+        ``hr_zone_N_min`` snapshot fields. Both are all-None for non-workout records,
+        when outgoing webhooks are disabled (the query would be wasted), or when the
+        workout window carries no HR series. The computation runs while the session is
+        live; results are carried into the after_commit snapshot as plain values.
+        ``birth_date_cache`` lets the bulk path avoid one user lookup per workout when
+        many share a user.
+        """
+        none_zones: dict[str, int | None] = {f"hr_zone_{i}_min": None for i in range(1, 6)}
+        if (record.category or "").lower() != "workout" or not svix_service.is_enabled():
+            return none_zones, None
+
+        user_id = data_source.user_id
+        if birth_date_cache is not None and user_id in birth_date_cache:
+            birth_date = birth_date_cache[user_id]
+        else:
+            birth_date = self._user_birth_date(db_session, user_id)
+            if birth_date_cache is not None:
+                birth_date_cache[user_id] = birth_date
+
+        max_hr = estimate_max_hr(birth_date, record.start_datetime)
+        zones = self.data_point_series_repo.get_workout_hr_zone_minutes(
+            db_session,
+            data_source.id,
+            record.start_datetime,
+            record.end_datetime,
+            max_hr,
+        )
+        if zones is None:
+            return none_zones, None
+
+        completeness: float | None = None
+        duration_seconds = record.duration_seconds
+        if duration_seconds and duration_seconds > 0:
+            completeness = round(min(1.0, zones["sampled_minutes"] / (duration_seconds / 60)), 4)
+
+        zone_minutes: dict[str, int | None] = {f"hr_zone_{i}_min": zones[f"zone_{i}_min"] for i in range(1, 6)}
+        return zone_minutes, completeness
 
     def _resolve_avg_hr(
         self,
@@ -149,6 +217,7 @@ class EventRecordService(
                 # Snapshot ORM attributes as plain values before registering the listener.
                 # after_commit expires all ORM objects, so accessing attributes inside the
                 # listener would trigger lazy loads on a committed session → InvalidRequestError.
+                zone_minutes, completeness = self._workout_hr_zone_fields(db_session, record, data_source)
                 _rec = _EventRecordSnapshot(
                     category=record.category,
                     id=record.id,
@@ -157,6 +226,8 @@ class EventRecordService(
                     end_datetime=record.end_datetime,
                     duration_seconds=record.duration_seconds,
                     type=getattr(record, "type", None),
+                    hr_trace_completeness=completeness,
+                    **zone_minutes,
                 )
                 _ds = _DataSourceSnapshot(
                     provider=str(data_source.provider),
@@ -582,6 +653,12 @@ class EventRecordService(
                 if detail.total_elevation_gain is not None
                 else None,
                 avg_pace_sec_per_km=avg_pace,
+                hr_zone_1_min=record.hr_zone_1_min,
+                hr_zone_2_min=record.hr_zone_2_min,
+                hr_zone_3_min=record.hr_zone_3_min,
+                hr_zone_4_min=record.hr_zone_4_min,
+                hr_zone_5_min=record.hr_zone_5_min,
+                hr_trace_completeness=record.hr_trace_completeness,
             )
 
     def bulk_create(
@@ -623,6 +700,7 @@ class EventRecordService(
         # after_commit expires all ORM objects, so the listener captures snapshots
         # instead of live ORM references to avoid lazy loads on a committed session.
         dispatches: list[tuple[_EventRecordSnapshot, _DataSourceSnapshot, EventRecordDetailCreate]] = []
+        birth_date_cache: dict[UUID, date | None] = {}
         for detail in details:
             record = records_by_id.get(detail.record_id)
             if record is None or record.data_source_id is None:
@@ -630,6 +708,7 @@ class EventRecordService(
             data_source = data_sources_by_id.get(record.data_source_id)
             if data_source is None:
                 continue
+            zone_minutes, completeness = self._workout_hr_zone_fields(db_session, record, data_source, birth_date_cache)
             dispatches.append(
                 (
                     _EventRecordSnapshot(
@@ -640,6 +719,8 @@ class EventRecordService(
                         end_datetime=record.end_datetime,
                         duration_seconds=record.duration_seconds,
                         type=getattr(record, "type", None),
+                        hr_trace_completeness=completeness,
+                        **zone_minutes,
                     ),
                     _DataSourceSnapshot(
                         provider=str(data_source.provider),
