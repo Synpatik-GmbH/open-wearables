@@ -341,6 +341,53 @@ class TestPolarWorkoutsNormalization:
         assert record.type == WorkoutType.CYCLING.value
 
 
+class TestPolarExerciseSchemaParsing:
+    """Regression tests for ExerciseJSON numeric field types.
+
+    Polar returns training-load-pro values and distance as floating-point
+    numbers. These fields were typed ``int``, so a fractional ``cardio-load``
+    (e.g. 8.24828) raised a Pydantic ``int_from_float`` ValidationError and
+    aborted the whole workouts batch — surfacing as a 'partial' sync.
+    """
+
+    def test_fractional_training_load_and_distance_parse(self) -> None:
+        """Fractional load and distance values must parse without error."""
+        exercise = PolarExerciseJSON(
+            id="FRAC123",
+            device="Polar Vantage V2",
+            start_time="2026-06-11T13:00:00",
+            start_time_utc_offset=0,
+            duration="PT1H0M0S",
+            sport="RUNNING",
+            distance=8235.5,
+            training_load_pro={
+                "cardio-load": 8.24828,
+                "muscle-load": 1.5,
+                "perceived-load": 12.7,
+            },
+        )
+
+        assert exercise.distance == pytest.approx(8235.5)
+        assert exercise.training_load_pro is not None
+        assert exercise.training_load_pro.cardio_load == pytest.approx(8.24828)
+        assert exercise.training_load_pro.muscle_load == pytest.approx(1.5)
+        assert exercise.training_load_pro.perceived_load == pytest.approx(12.7)
+
+    def test_integer_distance_still_accepted(self) -> None:
+        """Widening int->float must not reject integer payloads."""
+        exercise = PolarExerciseJSON(
+            id="INT123",
+            device="Polar Vantage V2",
+            start_time="2026-06-11T13:00:00",
+            start_time_utc_offset=0,
+            duration="PT1H0M0S",
+            sport="RUNNING",
+            distance=10000,
+        )
+
+        assert exercise.distance == pytest.approx(10000.0)
+
+
 class TestPolarWorkoutsAPIRequests:
     """Tests for API request methods."""
 
