@@ -356,15 +356,15 @@ class TestPolar247NightlyRechargeNormalization:
     def test_empty_input(self, data_247: Polar247Data) -> None:
         assert data_247.normalize_nightly_recharge([], uuid4()) == ([], [])
 
-    def test_emits_rmssd_hrv_sample(self, data_247: Polar247Data, sample_recharge: dict) -> None:
+    def test_emits_hrv_and_rhr_samples(self, data_247: Polar247Data, sample_recharge: dict) -> None:
         user_id = uuid4()
         _, samples = data_247.normalize_nightly_recharge([sample_recharge], user_id)
 
-        assert len(samples) == 1
-        sample = samples[0]
-        assert sample.series_type == SeriesType.heart_rate_variability_rmssd
-        assert sample.value == 48  # heart_rate_variability_avg, RMSSD ms
-        assert sample.user_id == user_id
+        assert len(samples) == 2
+        by_type = {s.series_type: s for s in samples}
+        assert by_type[SeriesType.heart_rate_variability_rmssd].value == 48  # heart_rate_variability_avg, RMSSD ms
+        assert by_type[SeriesType.resting_heart_rate].value == 52  # heart_rate_avg, bpm
+        assert all(s.user_id == user_id for s in samples)
 
 
 # ---------------------------------------------------------------------------
