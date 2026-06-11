@@ -565,6 +565,26 @@ class Polar247Data(Base247DataTemplate):
                         series_type=SeriesType.heart_rate_variability_rmssd,
                     )
                 )
+            # Bridge: likewise emit the Recharge average heart rate as a
+            # resting_heart_rate sample (same rationale as the HRV bridge — it is
+            # only a health-score component otherwise, off the timeseries read
+            # path). heart_rate_avg is the average HR over the recharge window
+            # (~first 4h of sleep) in bpm — a nightly resting HR used downstream
+            # within-person for co-suppression, not an absolute clinical resting
+            # HR. The worker already reads resting_heart_rate → physiology_daily
+            # .rhr_bpm, so no downstream change is required.
+            if parsed.heart_rate_avg is not None:
+                samples.append(
+                    TimeSeriesSampleCreate(
+                        id=uuid4(),
+                        user_id=user_id,
+                        provider=ProviderName.POLAR,
+                        source=ProviderName.POLAR,
+                        recorded_at=datetime.fromisoformat(parsed.date).replace(tzinfo=timezone.utc),
+                        value=parsed.heart_rate_avg,
+                        series_type=SeriesType.resting_heart_rate,
+                    )
+                )
         return scores, samples
 
     # -------------------------------------------------------------------------
