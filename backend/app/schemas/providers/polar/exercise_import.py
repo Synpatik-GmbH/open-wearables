@@ -29,9 +29,9 @@ class RoutePointJSON(BaseModel):
 
 class TrainingLoadProJSON(BaseModel):
     date: str | None = None
-    cardio_load: int | None = Field(None, alias="cardio-load")
-    muscle_load: int | None = Field(None, alias="muscle-load")
-    perceived_load: int | None = Field(None, alias="perceived-load")
+    cardio_load: float | None = Field(None, alias="cardio-load")
+    muscle_load: float | None = Field(None, alias="muscle-load")
+    perceived_load: float | None = Field(None, alias="perceived-load")
     cardio_load_interpretation: str | None = Field(None, alias="cardio-load-interpretation")
     muscle_load_interpretation: str | None = Field(None, alias="muscle-load-interpretation")
     perceived_load_interpretation: str | None = Field(None, alias="perceived-load-interpretation")
@@ -53,7 +53,7 @@ class ExerciseJSON(BaseModel):
     duration: str
 
     calories: int | None = None
-    distance: int | None = None
+    distance: float | None = None
     heart_rate: HeartRateJSON | None = None
     heart_rate_zones: list[HRZoneJSON] | None = None
 
