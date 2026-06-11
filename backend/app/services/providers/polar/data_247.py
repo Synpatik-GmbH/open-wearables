@@ -512,8 +512,9 @@ class Polar247Data(Base247DataTemplate):
         self,
         raw_items: list[dict[str, Any]],
         user_id: UUID,
-    ) -> list[HealthScoreCreate]:
+    ) -> tuple[list[HealthScoreCreate], list[TimeSeriesSampleCreate]]:
         scores: list[HealthScoreCreate] = []
+        samples: list[TimeSeriesSampleCreate] = []
         for raw in raw_items:
             if (parsed := self._parse(raw, NightlyRechargeJSON, user_id, "nightly_recharge")) is None:
                 continue
@@ -546,7 +547,25 @@ class Polar247Data(Base247DataTemplate):
                     components=components or None,
                 )
             )
-        return scores
+            # Bridge: also emit the Recharge HRV average as an RMSSD timeseries
+            # sample. The health-score component above is off the timeseries read
+            # path, so downstream consumers that read the
+            # heart_rate_variability_rmssd series (e.g. readiness) would otherwise
+            # never see it. heart_rate_variability_avg is RMSSD in ms (see
+            # NightlyRechargeJSON) — the same metric and unit WHOOP emits.
+            if parsed.heart_rate_variability_avg is not None:
+                samples.append(
+                    TimeSeriesSampleCreate(
+                        id=uuid4(),
+                        user_id=user_id,
+                        provider=ProviderName.POLAR,
+                        source=ProviderName.POLAR,
+                        recorded_at=datetime.fromisoformat(parsed.date).replace(tzinfo=timezone.utc),
+                        value=parsed.heart_rate_variability_avg,
+                        series_type=SeriesType.heart_rate_variability_rmssd,
+                    )
+                )
+        return scores, samples
 
     # -------------------------------------------------------------------------
     # SleepWise — Alertness: GET /v3/users/sleepwise/alertness
@@ -875,6 +894,17 @@ class Polar247Data(Base247DataTemplate):
             health_score_service.bulk_create(db, scores)
         return len(scores)
 
+    def _save_nightly_recharge(
+        self,
+        db: DbSession,
+        scores: list[HealthScoreCreate],
+        samples: list[TimeSeriesSampleCreate],
+    ) -> int:
+        """Persist Recharge health scores plus the bridged RMSSD HRV samples."""
+        self._save_scores(db, scores)
+        self._save_timeseries(db, samples)
+        return len(scores)
+
     def fetch_and_save_from_webhook(
         self,
         db: DbSession,
@@ -994,9 +1024,9 @@ class Polar247Data(Base247DataTemplate):
             "cardio_load": lambda: self._save_scores(
                 db, self.normalize_cardio_load(self.get_cardio_load_data(db, user_id, start_time, end_time), user_id)
             ),
-            "nightly_recharge": lambda: self._save_scores(
+            "nightly_recharge": lambda: self._save_nightly_recharge(
                 db,
-                self.normalize_nightly_recharge(
+                *self.normalize_nightly_recharge(
                     self.get_nightly_recharge_data(db, user_id, start_time, end_time), user_id
                 ),
             ),
