@@ -491,9 +491,7 @@ class TestPriorityQueueRouting:
         mock_task.apply_async.assert_not_called()
 
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
-    def test_priority_set_override_is_respected(
-        self, mock_task: MagicMock, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_priority_set_override_is_respected(self, mock_task: MagicMock, monkeypatch: pytest.MonkeyPatch) -> None:
         from app.config import settings
 
         monkeypatch.setattr(settings, "webhook_priority_events", "sync.started")
