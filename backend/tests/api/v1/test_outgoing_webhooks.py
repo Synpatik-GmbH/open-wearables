@@ -428,3 +428,41 @@ class TestOutgoingWebhooksAPI:
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# Webhook fast lane — priority-set config (see calibra-ow-deploy
+# docs/specs/2026-07-04-ow-webhook-fast-lane-design.md)
+# ---------------------------------------------------------------------------
+
+
+class TestWebhookPrioritySettings:
+    def test_default_set_contains_the_nine_calibra_events(self) -> None:
+        from app.config import Settings
+
+        s = Settings()
+        assert s.webhook_priority_event_set == frozenset(
+            {
+                "workout.created",
+                "sleep.created",
+                "series.heart_rate_variability_rmssd.created",
+                "series.heart_rate_variability_sdnn.created",
+                "series.respiratory_rate.created",
+                "series.resting_heart_rate.created",
+                "series.oxygen_saturation.created",
+                "series.skin_temperature.created",
+                "series.weight.created",
+            }
+        )
+
+    def test_set_parses_comma_list_stripping_whitespace_and_empties(self) -> None:
+        from app.config import Settings
+
+        s = Settings(webhook_priority_events=" workout.created , sleep.created ,, ")
+        assert s.webhook_priority_event_set == frozenset({"workout.created", "sleep.created"})
+
+    def test_empty_value_yields_empty_set_fail_safe(self) -> None:
+        from app.config import Settings
+
+        s = Settings(webhook_priority_events="")
+        assert s.webhook_priority_event_set == frozenset()
