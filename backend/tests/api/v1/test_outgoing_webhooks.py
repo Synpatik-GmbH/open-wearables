@@ -72,13 +72,15 @@ class TestWebhookEmit:
             elevation_gain_meters=120.0,
             avg_pace_sec_per_km=360,
         )
-        mock_task.delay.assert_called_once()
-        args = mock_task.delay.call_args
-        assert args[0][0] == "workout.created"
-        assert args[0][1]["data"]["source"]["provider"] == "garmin"
-        assert args[0][1]["data"]["calories_kcal"] == 450.0
-        assert args[0][1]["data"]["distance_meters"] == 10000.0
-        assert args[0][1]["data"]["avg_heart_rate_bpm"] == 155
+        mock_task.apply_async.assert_called_once()
+        call = mock_task.apply_async.call_args
+        assert call.kwargs["queue"] == "webhook_sync"
+        args = call.kwargs["args"]
+        assert args[0] == "workout.created"
+        assert args[1]["data"]["source"]["provider"] == "garmin"
+        assert args[1]["data"]["calories_kcal"] == 450.0
+        assert args[1]["data"]["distance_meters"] == 10000.0
+        assert args[1]["data"]["avg_heart_rate_bpm"] == 155
 
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
     def test_on_sleep_created_dispatches(self, mock_task: MagicMock) -> None:
@@ -97,11 +99,13 @@ class TestWebhookEmit:
             stages={"deep_minutes": 90, "rem_minutes": 60, "light_minutes": 120, "awake_minutes": 10},
             is_nap=False,
         )
-        mock_task.delay.assert_called_once()
-        args = mock_task.delay.call_args
-        assert args[0][0] == "sleep.created"
-        assert args[0][1]["data"]["efficiency_percent"] == 85.0
-        assert args[0][1]["data"]["stages"]["deep_minutes"] == 90
+        mock_task.apply_async.assert_called_once()
+        call = mock_task.apply_async.call_args
+        assert call.kwargs["queue"] == "webhook_sync"
+        args = call.kwargs["args"]
+        assert args[0] == "sleep.created"
+        assert args[1]["data"]["efficiency_percent"] == 85.0
+        assert args[1]["data"]["stages"]["deep_minutes"] == 90
 
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
     def test_on_timeseries_batch_saved_dispatches(self, mock_task: MagicMock) -> None:
@@ -241,7 +245,8 @@ class TestWebhookEmit:
         with patch(
             "app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event",
         ) as mock_task:
-            mock_task.delay.side_effect = ConnectionError("Redis not available")
+            # workout.created is a priority event → routed via apply_async
+            mock_task.apply_async.side_effect = ConnectionError("Redis not available")
             # Should NOT raise
             _dispatch("workout.created", {"type": "workout.created", "data": {}})
 
@@ -466,3 +471,33 @@ class TestWebhookPrioritySettings:
 
         s = Settings(webhook_priority_events="")
         assert s.webhook_priority_event_set == frozenset()
+
+
+class TestPriorityQueueRouting:
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_priority_event_routes_to_webhook_sync(self, mock_task: MagicMock) -> None:
+        _dispatch("workout.created", {"k": "v"}, idempotency_key="idem-1")
+        mock_task.apply_async.assert_called_once()
+        call = mock_task.apply_async.call_args
+        assert call.kwargs["queue"] == "webhook_sync"
+        assert call.kwargs["args"] == ("workout.created", {"k": "v"})
+        assert call.kwargs["kwargs"] == {"channels": None, "idempotency_key": "idem-1"}
+        mock_task.delay.assert_not_called()
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_non_priority_event_keeps_default_delay(self, mock_task: MagicMock) -> None:
+        _dispatch("sync.started", {"k": "v"})
+        mock_task.delay.assert_called_once()
+        mock_task.apply_async.assert_not_called()
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_priority_set_override_is_respected(
+        self, mock_task: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from app.config import settings
+
+        monkeypatch.setattr(settings, "webhook_priority_events", "sync.started")
+        _dispatch("sync.started", {"k": "v"})
+        assert mock_task.apply_async.call_args.kwargs["queue"] == "webhook_sync"
+        _dispatch("workout.created", {"k": "v"})
+        mock_task.delay.assert_called_once()  # no longer in the (overridden) set
