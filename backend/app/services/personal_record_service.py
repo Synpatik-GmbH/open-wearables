@@ -50,7 +50,9 @@ class PersonalRecordService(
         existing = self.crud.get_by_user_id(db_session, user_id)
         if existing is None:
             creator = PersonalRecordCreate(id=uuid4(), user_id=user_id, **payload.model_dump())
-            return self.crud.create(db_session, creator), True
+            # crud.create is widened to `ModelType | None` by @handle_duplicates;
+            # the create path never returns None. Mirrors AppService.create (services.py).
+            return self.crud.create(db_session, creator), True  # ty:ignore[invalid-return-type]
 
         return self.crud.update(db_session, existing, payload), False
 
