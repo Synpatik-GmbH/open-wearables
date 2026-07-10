@@ -272,6 +272,7 @@ class ImportService:
 
         # Process workouts in batch
         workout_bundles = list(self._build_workout_bundles(request, user_id))
+        details_to_insert: list[EventRecordDetailCreate] = []
         if workout_bundles:
             records = [record for record, _, _ in workout_bundles]
             details_by_id = {detail.record_id: detail for _, detail, _ in workout_bundles}
@@ -284,22 +285,28 @@ class ImportService:
 
             # Filter details to only those records that were actually inserted (avoid FK violation)
             details_to_insert = [details_by_id[rid] for rid in inserted_ids if rid in details_by_id]
-
-            # Bulk create details (requires event_record to exist due to FK)
-            if details_to_insert:
-                self.event_record_service.bulk_create_details(db_session, details_to_insert, detail_type="workout")
             workouts_saved = len(inserted_ids)
 
-            # Bulk create time series samples
+            # Bulk create the workout-embedded time series samples
             if time_series_samples:
                 self.timeseries_service.bulk_create_samples(db_session, time_series_samples)
                 records_saved += len(time_series_samples)
 
-        # Process time series samples (records)
+        # Process time series samples (records) — the granular heart_rate trace lives here.
         samples = self._build_statistic_bundles(request, user_id)
         if samples:
             self.timeseries_service.bulk_create_samples(db_session, samples)
             records_saved += len(samples)
+
+        # Create workout details LAST. bulk_create_details computes the Edwards HR zones for
+        # workout.created from the heart_rate series present in the DB at that moment, so every
+        # HR sample above — workout-embedded AND the same-upload records trace — must be inserted
+        # first. Inserting details before the HR trace emitted NULL zones on the webhook even when
+        # the HR shipped in the same upload, so the consumer showed the lower background-HR load
+        # until an hourly heal re-derived Edwards. (requires event_record to exist due to FK)
+        if details_to_insert:
+            db_session.flush()  # make the HR samples visible to the zone query
+            self.event_record_service.bulk_create_details(db_session, details_to_insert, detail_type="workout")
 
         # Commit all workout and timeseries changes in one transaction
         db_session.commit()

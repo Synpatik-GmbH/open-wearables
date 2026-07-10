@@ -17,6 +17,7 @@ from app.models import EventRecord, WorkoutDetails
 from app.schemas.enums import SeriesType
 from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
 from app.services.apple.healthkit.import_service import ImportService
+from app.services.event_record_service import EventRecordService
 from tests.factories import UserFactory
 
 SDK_ENVELOPE: dict[str, str] = {
@@ -329,6 +330,100 @@ class TestAppleSDKImport:
 
         workouts = db.query(EventRecord).filter(EventRecord.category == "workout").all()
         assert len(workouts) == 1
+
+    def test_workout_hr_zones_populated_when_hr_trace_in_same_payload(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        """A workout co-uploaded with its per-minute HR trace must emit NON-null Edwards
+        zones on ``workout.created``.
+
+        Regression guard: ``load_data`` used to create the workout detail (which computes
+        the Edwards zones from the HR series then in the DB) BEFORE inserting the HR trace,
+        so a workout whose HR shipped in the same upload still emitted null zones and the
+        consumer saw the lower background-HR load until an hourly heal ran.
+        """
+        user = UserFactory()
+
+        # One Apple Watch, used for BOTH the workout and its HR trace, so the HR samples
+        # resolve to the same data_source the zone query filters on.
+        watch_source = {
+            "name": "Test Apple Watch",
+            "bundleIdentifier": "com.apple.health",
+            "deviceManufacturer": "Apple Inc.",
+            "deviceModel": "Watch",
+            "productType": "Watch7,5",
+            "deviceHardwareVersion": "Watch7,5",
+            "deviceSoftwareVersion": "10.3.1",
+            "operatingSystemVersion": {"majorVersion": 10, "minorVersion": 3, "patchVersion": 1},
+        }
+
+        # 5 HR samples on 5 distinct minutes inside the workout window, all 150 bpm.
+        # With no birth_date, max_hr falls back to 190 → zone-3 band is [133, 152) → 150 bpm
+        # lands in zone 3, so hr_zone_3_min must be 5.
+        hr_records = [
+            {
+                "id": f"HR00000{i}-0000-0000-0000-000000000000",
+                "type": "HKQuantityTypeIdentifierHeartRate",
+                "unit": "count/min",
+                "value": 150,
+                "startDate": f"2025-03-25T17:{28 + i:02d}:30Z",
+                "endDate": f"2025-03-25T17:{28 + i:02d}:30Z",
+                "source": watch_source,
+            }
+            for i in range(5)
+        ]
+
+        payload: dict[str, Any] = {
+            **SDK_ENVELOPE,
+            "data": {
+                "records": hr_records,
+                "workouts": [
+                    {
+                        "id": "9999AAAA-1111-2222-3333-444455556666",
+                        "type": "running",
+                        "startDate": "2025-03-25T17:27:00Z",
+                        "endDate": "2025-03-25T17:35:00Z",  # 8-minute window
+                        "source": watch_source,
+                        "values": [
+                            {"type": "duration", "unit": "s", "value": 480},
+                            {"type": "averageHeartRate", "unit": "bpm", "value": 150},
+                        ],
+                    }
+                ],
+            },
+        }
+
+        captured: dict[str, Any] = {}
+
+        def fake_emit(
+            record: EventRecord,
+            data_source: Any,
+            detail: Any,
+            zone_minutes: dict[str, int | None] | None = None,
+            hr_trace_completeness: float | None = None,
+        ) -> None:
+            if (record.category or "").lower() == "workout":
+                captured["zones"] = zone_minutes
+                captured["completeness"] = hr_trace_completeness
+
+        with (
+            patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=True),
+            patch.object(EventRecordService, "_emit_event_record_webhook", staticmethod(fake_emit)),
+        ):
+            result = import_service.load_data(db, payload, str(user.id))
+
+        assert result["workouts_saved"] == 1
+
+        zones = captured.get("zones")
+        assert zones is not None, "workout.created was emitted with no zone data"
+        # All five zone fields must be integers (the null-zone fallback makes them all None).
+        assert all(zones[f"hr_zone_{i}_min"] is not None for i in range(1, 6)), (
+            f"expected non-null Edwards zones, got {zones}"
+        )
+        assert zones["hr_zone_3_min"] == 5
+        assert captured["completeness"] is not None
 
     def test_import_records_as_time_series(
         self,
