@@ -12,7 +12,13 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from tests.factories import ApiKeyFactory, DataSourceFactory, EventRecordFactory, UserFactory
+from tests.factories import (
+    ApiKeyFactory,
+    DataPointSeriesFactory,
+    DataSourceFactory,
+    EventRecordFactory,
+    UserFactory,
+)
 from tests.utils import api_key_headers
 
 
@@ -57,6 +63,86 @@ class TestWorkoutsEndpoints:
         assert len(data) == 2
         assert any(w["id"] == str(workout1.id) for w in data)
         assert any(w["id"] == str(workout2.id) for w in data)
+
+    def test_get_workouts_includes_hr_zone_minutes(self, client: TestClient, db: Session) -> None:
+        """REST workouts carry the same Edwards HR-zone minutes the webhook computes.
+
+        Parity with the ``workout.created`` webhook: ``get_workouts`` computes zone
+        minutes from the HR timeseries (via ``get_workout_hr_zone_minutes``) so the
+        adapter reconcile pull no longer falls back to background-HR. No birth_date on
+        the user → max_hr falls back to 190 → Edwards zone 3 = [133, 152) bpm.
+        """
+        # Arrange: a 3-minute workout with 3 HR samples (one per minute) at 140 bpm → zone 3.
+        user = UserFactory()
+        data_source = DataSourceFactory(user=user)
+        start = datetime(2026, 1, 5, 8, 0, 0, tzinfo=timezone.utc)
+        workout = EventRecordFactory(
+            data_source=data_source,
+            category="workout",
+            type_="running",
+            start_datetime=start,
+            duration_seconds=180,
+        )
+        for i in range(3):
+            DataPointSeriesFactory(
+                data_source=data_source,
+                value=140,
+                recorded_at=start + timedelta(minutes=i, seconds=30),
+            )
+        api_key = ApiKeyFactory()
+        headers = api_key_headers(api_key.id)
+
+        # Act
+        response = client.get(
+            f"/api/v1/users/{user.id}/events/workouts",
+            headers=headers,
+            params={
+                "start_date": (start - timedelta(days=1)).isoformat(),
+                "end_date": (start + timedelta(days=1)).isoformat(),
+            },
+        )
+
+        # Assert
+        assert response.status_code == 200
+        workout_json = next(w for w in response.json()["data"] if w["id"] == str(workout.id))
+        assert workout_json["hr_zone_1_min"] == 0
+        assert workout_json["hr_zone_2_min"] == 0
+        assert workout_json["hr_zone_3_min"] == 3
+        assert workout_json["hr_zone_4_min"] == 0
+        assert workout_json["hr_zone_5_min"] == 0
+        assert workout_json["hr_trace_completeness"] == 1.0
+
+    def test_get_workouts_hr_zones_null_without_hr_series(self, client: TestClient, db: Session) -> None:
+        """A workout with no HR timeseries reports null zones + null completeness (not 0)."""
+        # Arrange: workout but NO DataPointSeries HR samples.
+        user = UserFactory()
+        data_source = DataSourceFactory(user=user)
+        start = datetime(2026, 1, 5, 8, 0, 0, tzinfo=timezone.utc)
+        workout = EventRecordFactory(
+            data_source=data_source,
+            category="workout",
+            type_="running",
+            start_datetime=start,
+            duration_seconds=180,
+        )
+        api_key = ApiKeyFactory()
+        headers = api_key_headers(api_key.id)
+
+        # Act
+        response = client.get(
+            f"/api/v1/users/{user.id}/events/workouts",
+            headers=headers,
+            params={
+                "start_date": (start - timedelta(days=1)).isoformat(),
+                "end_date": (start + timedelta(days=1)).isoformat(),
+            },
+        )
+
+        # Assert
+        assert response.status_code == 200
+        workout_json = next(w for w in response.json()["data"] if w["id"] == str(workout.id))
+        assert workout_json["hr_zone_3_min"] is None
+        assert workout_json["hr_trace_completeness"] is None
 
     def test_get_workouts_empty_list(self, client: TestClient, db: Session) -> None:
         """Test retrieving workouts for a user with no workouts."""
