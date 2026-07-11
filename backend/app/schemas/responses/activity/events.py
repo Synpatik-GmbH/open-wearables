@@ -26,6 +26,15 @@ class Workout(BaseModel):
     max_heart_rate_bpm: int | None = None
     avg_pace_sec_per_km: int | float | None = None
     elevation_gain_meters: float | None = None
+    # Edwards HR-zone minutes + trace completeness, computed from the HR timeseries
+    # (same source as the workout.created webhook) so a reconcile pull can derive
+    # Edwards load instead of falling back to background-HR. Null when no HR series.
+    hr_zone_1_min: int | None = None
+    hr_zone_2_min: int | None = None
+    hr_zone_3_min: int | None = None
+    hr_zone_4_min: int | None = None
+    hr_zone_5_min: int | None = None
+    hr_trace_completeness: float | None = None
 
 
 class WorkoutDetailed(Workout):

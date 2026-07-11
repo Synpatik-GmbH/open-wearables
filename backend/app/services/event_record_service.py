@@ -103,7 +103,24 @@ class EventRecordService(
         none_zones: dict[str, int | None] = {f"hr_zone_{i}_min": None for i in range(1, 6)}
         if (record.category or "").lower() != "workout" or not svix_service.is_enabled():
             return none_zones, None
+        return self._compute_workout_hr_zone_fields(db_session, record, data_source, birth_date_cache)
 
+    def _compute_workout_hr_zone_fields(
+        self,
+        db_session: DbSession,
+        record: EventRecord,
+        data_source: DataSource,
+        birth_date_cache: dict[UUID, date | None] | None = None,
+    ) -> tuple[dict[str, int | None], float | None]:
+        """Edwards HR-zone minutes + HR-trace completeness from the HR timeseries.
+
+        The webhook-independent core of :meth:`_workout_hr_zone_fields`: NO ``svix``
+        gate, so the REST ``get_workouts`` path can reuse the exact same computation the
+        ``workout.created`` webhook uses (single source of truth — they can never drift).
+        Returns all-None zones + None completeness when the window carries no HR series.
+        ``birth_date_cache`` lets a page of workouts avoid one user lookup per workout.
+        """
+        none_zones: dict[str, int | None] = {f"hr_zone_{i}_min": None for i in range(1, 6)}
         user_id = data_source.user_id
         if birth_date_cache is not None and user_id in birth_date_cache:
             birth_date = birth_date_cache[user_id]
@@ -812,9 +829,17 @@ class EventRecordService(
 
         computed_hr = self._resolve_avg_hr(db_session, [r for r, _ in records])
 
+        # Edwards HR-zone minutes, computed on read from the HR timeseries (same source
+        # as the workout.created webhook) so the adapter reconcile can derive Edwards load
+        # instead of falling back to background-HR. Cache birth_date across the page.
+        birth_date_cache: dict[UUID, date | None] = {}
+
         data = []
         for record, data_source in records:
             details: WorkoutDetails | None = record.detail if isinstance(record.detail, WorkoutDetails) else None
+            zone_minutes, hr_trace_completeness = self._compute_workout_hr_zone_fields(
+                db_session, record, data_source, birth_date_cache
+            )
 
             workout = Workout(
                 id=record.id,
@@ -833,6 +858,12 @@ class EventRecordService(
                 elevation_gain_meters=float(details.total_elevation_gain)
                 if details and details.total_elevation_gain
                 else None,
+                hr_zone_1_min=zone_minutes["hr_zone_1_min"],
+                hr_zone_2_min=zone_minutes["hr_zone_2_min"],
+                hr_zone_3_min=zone_minutes["hr_zone_3_min"],
+                hr_zone_4_min=zone_minutes["hr_zone_4_min"],
+                hr_zone_5_min=zone_minutes["hr_zone_5_min"],
+                hr_trace_completeness=hr_trace_completeness,
             )
             data.append(workout)
 
