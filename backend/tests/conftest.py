@@ -232,6 +232,21 @@ def mock_webhook_dispatch() -> Generator[MagicMock, None, None]:
 
 
 @pytest.fixture(autouse=True)
+def mock_finalize_workout_zones() -> Generator[MagicMock, None, None]:
+    """Prevent the workout settle-debounce task from attempting a real Redis/Celery enqueue.
+
+    Ingest now schedules ``finalize_workout_zones`` for every workout (deferring
+    ``workout.created`` until the HR trace settles), so tests that don't care about the
+    debounce must not enqueue a real task. Patches ONLY ``.apply_async`` on the real task
+    object (mirrors ``mock_webhook_dispatch``): the task's own reschedule uses its
+    module-global name, so patching the whole object would swallow that call — patching the
+    method leaves the task callable while stubbing the enqueue. Tests that verify scheduling
+    override ``.apply_async`` via their own @patch (innermost wins)."""
+    with patch("app.integrations.celery.tasks.finalize_workout_zones_task.finalize_workout_zones.apply_async") as mock:
+        yield mock
+
+
+@pytest.fixture(autouse=True)
 def mock_celery_tasks(monkeypatch: pytest.MonkeyPatch) -> Generator[MagicMock, None, None]:
     """Mock Celery tasks to run synchronously."""
     mock_task = MagicMock()

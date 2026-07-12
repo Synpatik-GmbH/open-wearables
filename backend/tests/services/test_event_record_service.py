@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models import DataSource, EventRecord
 from app.schemas.model_crud.activities import EventRecordCreate, EventRecordDetailCreate, EventRecordQueryParams
 from app.schemas.model_crud.activities.sleep import SleepStage
@@ -106,13 +107,16 @@ class TestEventRecordServiceCreateDetail:
 
 
 class TestEventRecordServiceBulkCreateDetails:
-    """bulk_create_details must dispatch a webhook per detail on commit.
+    """bulk_create_details defers each workout.created to the settle-debounce task on commit.
 
-    Before the fix, Apple/Google/Samsung SDK imports saved workouts through
-    bulk_create + bulk_create_details and no webhook was ever emitted.
+    Workouts no longer emit synchronously at ingest (partial HR trace → partial Edwards
+    zones). Instead one finalize_workout_zones task is scheduled per workout after the
+    transaction commits; it recomputes the zones and emits once the trace has settled.
     """
 
-    def test_bulk_create_details_emits_workout_webhooks(self, db: Session) -> None:
+    FINALIZE_APPLY_PATH = "app.integrations.celery.tasks.finalize_workout_zones_task.finalize_workout_zones.apply_async"
+
+    def test_bulk_create_details_schedules_workout_finalize(self, db: Session) -> None:
         data_source = DataSourceFactory(source="apple")
         rec1 = EventRecordFactory(mapping=data_source, category="workout", type_="running")
         rec2 = EventRecordFactory(mapping=data_source, category="workout", type_="cycling")
@@ -133,13 +137,18 @@ class TestEventRecordServiceBulkCreateDetails:
         with (
             patch("app.services.event_record_service.svix_service.is_enabled", return_value=True),
             patch("app.services.event_record_service.on_workout_created") as mock_workout,
+            patch(self.FINALIZE_APPLY_PATH) as mock_apply,
         ):
             event_record_service.bulk_create_details(db, details, detail_type="workout")
             db.commit()
 
-        assert mock_workout.call_count == 2
-        dispatched_ids = {c.kwargs["record_id"] for c in mock_workout.call_args_list}
-        assert dispatched_ids == {rec1.id, rec2.id}
+        # No synchronous emit — the debounce task owns the workout emit now.
+        mock_workout.assert_not_called()
+        # One finalize task scheduled per workout, after commit, with the debounce countdown.
+        assert mock_apply.call_count == 2
+        scheduled_ids = {c.kwargs["args"][0] for c in mock_apply.call_args_list}
+        assert scheduled_ids == {str(rec1.id), str(rec2.id)}
+        assert all(c.kwargs["countdown"] == settings.workout_zone_debounce_seconds for c in mock_apply.call_args_list)
 
     def test_bulk_create_details_silent_when_svix_disabled(self, db: Session) -> None:
         data_source = DataSourceFactory(source="apple")
@@ -150,21 +159,25 @@ class TestEventRecordServiceBulkCreateDetails:
         with (
             patch("app.services.event_record_service.svix_service.is_enabled", return_value=False),
             patch("app.services.event_record_service.on_workout_created") as mock_workout,
+            patch(self.FINALIZE_APPLY_PATH) as mock_apply,
         ):
             event_record_service.bulk_create_details(db, details, detail_type="workout")
             db.commit()
 
         mock_workout.assert_not_called()
+        mock_apply.assert_not_called()
 
     def test_bulk_create_details_empty_list_is_noop(self, db: Session) -> None:
         with (
             patch("app.services.event_record_service.svix_service.is_enabled", return_value=True),
             patch("app.services.event_record_service.on_workout_created") as mock_workout,
+            patch(self.FINALIZE_APPLY_PATH) as mock_apply,
         ):
             event_record_service.bulk_create_details(db, [], detail_type="workout")
             db.commit()
 
         mock_workout.assert_not_called()
+        mock_apply.assert_not_called()
 
 
 class TestEventRecordServiceGetRecordsResponse:

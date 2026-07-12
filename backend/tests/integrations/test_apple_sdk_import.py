@@ -13,12 +13,14 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models import EventRecord, WorkoutDetails
 from app.schemas.enums import SeriesType
+from app.schemas.model_crud.activities import EventRecordDetailCreate
 from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
 from app.services.apple.healthkit.import_service import ImportService
-from app.services.event_record_service import EventRecordService
-from tests.factories import UserFactory
+from app.services.event_record_service import event_record_service
+from tests.factories import DataSourceFactory, EventRecordFactory, UserFactory
 
 SDK_ENVELOPE: dict[str, str] = {
     "provider": "apple",
@@ -331,23 +333,26 @@ class TestAppleSDKImport:
         workouts = db.query(EventRecord).filter(EventRecord.category == "workout").all()
         assert len(workouts) == 1
 
-    def test_workout_hr_zones_populated_when_hr_trace_in_same_payload(
+    def test_workout_created_deferred_to_finalize_task_not_emitted_at_ingest(
         self,
         db: Session,
         import_service: ImportService,
     ) -> None:
-        """A workout co-uploaded with its per-minute HR trace must emit NON-null Edwards
-        zones on ``workout.created``.
+        """A workout co-uploaded with a (partial) HR trace must NOT emit ``workout.created``
+        synchronously at ingest — ingest only schedules the settle-debounce task.
 
-        Regression guard: ``load_data`` used to create the workout detail (which computes
-        the Edwards zones from the HR series then in the DB) BEFORE inserting the HR trace,
-        so a workout whose HR shipped in the same upload still emitted null zones and the
-        consumer saw the lower background-HR load until an hourly heal ran.
+        Two-upload incident replay: ``load_data`` used to emit ``workout.created`` inline
+        with whatever HR trace was present at ingest, so a workout whose HR uploaded in
+        later chunks emitted partial Edwards zones and the consumer saw the lower
+        background-HR load until an hourly heal ran. Now ingest schedules
+        ``finalize_workout_zones`` (Task 2), which recomputes the zones and emits exactly
+        once after the HR trace settles — so here we assert NO synchronous emit and that
+        the task was scheduled once for the workout with the debounce countdown. (The
+        task's own emit-with-full-zones is covered by Task 2's unit tests.)
         """
         user = UserFactory()
 
-        # One Apple Watch, used for BOTH the workout and its HR trace, so the HR samples
-        # resolve to the same data_source the zone query filters on.
+        # One Apple Watch, used for BOTH the workout and its (first-half) HR trace.
         watch_source = {
             "name": "Test Apple Watch",
             "bundleIdentifier": "com.apple.health",
@@ -359,9 +364,8 @@ class TestAppleSDKImport:
             "operatingSystemVersion": {"majorVersion": 10, "minorVersion": 3, "patchVersion": 1},
         }
 
-        # 5 HR samples on 5 distinct minutes inside the workout window, all 150 bpm.
-        # With no birth_date, max_hr falls back to 190 → zone-3 band is [133, 152) → 150 bpm
-        # lands in zone 3, so hr_zone_3_min must be 5.
+        # Upload #1 carries only the FIRST HALF of the HR trace (the incident: the trace
+        # uploads in later chunks). Ingest must NOT emit off this partial trace.
         hr_records = [
             {
                 "id": f"HR00000{i}-0000-0000-0000-000000000000",
@@ -372,7 +376,7 @@ class TestAppleSDKImport:
                 "endDate": f"2025-03-25T17:{28 + i:02d}:30Z",
                 "source": watch_source,
             }
-            for i in range(5)
+            for i in range(2)
         ]
 
         payload: dict[str, Any] = {
@@ -395,35 +399,63 @@ class TestAppleSDKImport:
             },
         }
 
-        captured: dict[str, Any] = {}
-
-        def fake_emit(
-            record: EventRecord,
-            data_source: Any,
-            detail: Any,
-            zone_minutes: dict[str, int | None] | None = None,
-            hr_trace_completeness: float | None = None,
-        ) -> None:
-            if (record.category or "").lower() == "workout":
-                captured["zones"] = zone_minutes
-                captured["completeness"] = hr_trace_completeness
-
         with (
             patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=True),
-            patch.object(EventRecordService, "_emit_event_record_webhook", staticmethod(fake_emit)),
+            patch("app.services.event_record_service.on_workout_created") as mock_workout,
+            patch(
+                "app.integrations.celery.tasks.finalize_workout_zones_task.finalize_workout_zones.apply_async"
+            ) as mock_apply,
         ):
             result = import_service.load_data(db, payload, str(user.id))
 
         assert result["workouts_saved"] == 1
 
-        zones = captured.get("zones")
-        assert zones is not None, "workout.created was emitted with no zone data"
-        # All five zone fields must be integers (the null-zone fallback makes them all None).
-        assert all(zones[f"hr_zone_{i}_min"] is not None for i in range(1, 6)), (
-            f"expected non-null Edwards zones, got {zones}"
+        workout = db.query(EventRecord).filter(EventRecord.category == "workout").first()
+        assert workout is not None
+
+        # No synchronous workout.created at ingest — the partial trace must never be emitted.
+        mock_workout.assert_not_called()
+
+        # The settle-debounce task was scheduled exactly once for this workout id.
+        mock_apply.assert_called_once_with(
+            args=[str(workout.id)],
+            countdown=settings.workout_zone_debounce_seconds,
         )
-        assert zones["hr_zone_3_min"] == 5
-        assert captured["completeness"] is not None
+
+    def test_sleep_detail_still_emits_synchronously_no_debounce(
+        self,
+        db: Session,
+    ) -> None:
+        """Scope guard: the workout-only defer must not touch sleep.
+
+        ``create_detail(detail_type="sleep")`` (the exact call the SDK sleep pipeline
+        makes) still emits ``sleep.created`` synchronously and never schedules the workout
+        settle-debounce task.
+        """
+        user = UserFactory()
+        data_source = DataSourceFactory(user=user, source="apple")
+        record = EventRecordFactory(mapping=data_source, category="sleep", type_="sleep_session")
+        detail = EventRecordDetailCreate(
+            record_id=record.id,
+            sleep_total_duration_minutes=420,
+            sleep_time_in_bed_minutes=450,
+            sleep_deep_minutes=60,
+            sleep_light_minutes=240,
+            sleep_rem_minutes=120,
+            sleep_awake_minutes=30,
+        )
+
+        with (
+            patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=True),
+            patch("app.services.event_record_service.on_sleep_created") as mock_sleep,
+            patch(
+                "app.integrations.celery.tasks.finalize_workout_zones_task.finalize_workout_zones.apply_async"
+            ) as mock_apply,
+        ):
+            event_record_service.create_detail(db, detail, detail_type="sleep")
+
+        mock_sleep.assert_called_once()
+        mock_apply.assert_not_called()
 
     def test_import_records_as_time_series(
         self,

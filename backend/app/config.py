@@ -107,6 +107,13 @@ class Settings(BaseSettings):
     # Independent of ingest_workout_samples (DB samples) and raw_payload_storage (JSON payloads).
     store_fit_files: bool = False
 
+    # WORKOUT HR-ZONE DEBOUNCE
+    # workout.created lands before the full HR trace uploads, so zones computed at
+    # ingest are partial. The Celery debounce re-polls completeness before emitting.
+    workout_zone_debounce_seconds: int = 1  # delay between completeness polls
+    workout_zone_target_completeness: float = 0.95  # emit once the trace is this complete
+    workout_zone_hard_cap_seconds: int = 5  # emit whatever we have past this elapsed
+
     # SCORE SETTINGS
     score_backfill_days: int = 30  # How far back the missing-score query looks
     sleep_score_interval_seconds: int = 600  # How often to run the fill-missing-scores task (default: 10 min)
