@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Query
 
+from app.config import settings
 from app.database import DbSession
 from app.models import (
     DataPointSeries,
@@ -203,22 +204,25 @@ class EventRecordService(
     ) -> EventRecordDetail:
         result = self.event_record_detail_repo.create(db_session, detail, detail_type=detail_type)
         # event_record_detail_repo.create commits internally, so data is already persisted.
-        # Fire the webhook directly with fresh fetches rather than via after_commit — using
-        # after_commit defers the call to the *next* session commit, at which point SQLAlchemy
-        # has expired the captured ORM objects, causing lazy-load failures inside after_commit.
+        if detail_type == "workout":
+            # Defer workout.created to the settle-debounce task so the eventual webhook
+            # carries the COMPLETE HR trace + final Edwards zones. Emitting inline here would
+            # ship whatever partial trace happened to be present at ingest — the incident the
+            # debounce fixes. The task recomputes the zones once the trace has settled, so no
+            # live zone compute or synchronous emit happens on the workout path anymore.
+            if svix_service.is_enabled() and detail.record_id is not None:
+                self._schedule_workout_finalize(detail.record_id)
+            return result  # ty:ignore[invalid-return-type]
+
+        # Sleep / menstrual details still emit synchronously. Fire the webhook directly with
+        # fresh fetches rather than via after_commit — using after_commit defers the call to
+        # the *next* session commit, at which point SQLAlchemy has expired the captured ORM
+        # objects, causing lazy-load failures inside after_commit.
         record = db_session.get(EventRecord, detail.record_id)
         if record is not None and record.data_source_id is not None:
             data_source = db_session.get(DataSource, record.data_source_id)
             if data_source is not None:
-                # Compute Edwards HR zones while the session is live, then fire directly.
-                zone_minutes, completeness = self._workout_hr_zone_fields(db_session, record, data_source)
-                self._emit_event_record_webhook(
-                    record,
-                    data_source,
-                    detail,
-                    zone_minutes=zone_minutes,
-                    hr_trace_completeness=completeness,
-                )
+                self._emit_event_record_webhook(record, data_source, detail)
 
         return result  # ty:ignore[invalid-return-type]
 
@@ -720,6 +724,22 @@ class EventRecordService(
             hr_trace_completeness=hr_trace_completeness,
         )
 
+    @staticmethod
+    def _schedule_workout_finalize(record_id: UUID) -> None:
+        """Schedule the settle-debounce task that emits ``workout.created`` once the HR
+        trace has settled (Task 2).
+
+        Imported lazily to avoid a circular import: the task module imports the
+        ``event_record_service`` singleton at load time. ``on_workout_created`` keys Svix
+        idempotency on the record id, so even a duplicate schedule collapses to one delivery.
+        """
+        from app.integrations.celery.tasks.finalize_workout_zones_task import finalize_workout_zones
+
+        finalize_workout_zones.apply_async(
+            args=[str(record_id)],
+            countdown=settings.workout_zone_debounce_seconds,
+        )
+
     def bulk_create(
         self,
         db_session: DbSession,
@@ -736,7 +756,13 @@ class EventRecordService(
         details: list[EventRecordDetailCreate],
         detail_type: str = "workout",
     ) -> None:
-        """Bulk create event record details and fire one webhook per detail on commit."""
+        """Bulk create event record details and dispatch their webhooks on commit.
+
+        Workouts are DEFERRED: after commit, one ``finalize_workout_zones`` settle-debounce
+        task is scheduled per workout (it recomputes the Edwards zones and emits
+        ``workout.created`` once the HR trace has settled — no synchronous emit at ingest).
+        Sleep / menstrual details keep the synchronous after-commit ``*.created`` emit.
+        """
         self.event_record_detail_repo.bulk_create(db_session, details, detail_type=detail_type)  # ty:ignore[invalid-argument-type]
 
         if not details or not svix_service.is_enabled():
@@ -744,6 +770,18 @@ class EventRecordService(
 
         record_ids = [d.record_id for d in details if d.record_id is not None]
         if not record_ids:
+            return
+
+        if detail_type == "workout":
+            # Schedule the debounce task per workout AFTER the transaction commits — the
+            # detail FK guarantees the EventRecord exists, and deferring to after_commit
+            # avoids racing the task against uncommitted rows. No live zone compute needed
+            # here (the task computes zones later from the settled HR trace).
+            @sa_event.listens_for(db_session, "after_commit", once=True)
+            def _schedule_workout_finalizers(session: DbSession) -> None:  # noqa: ARG001
+                for record_id in record_ids:
+                    self._schedule_workout_finalize(record_id)
+
             return
 
         records = db_session.query(EventRecord).filter(EventRecord.id.in_(record_ids)).all()
@@ -755,13 +793,7 @@ class EventRecordService(
         )
         data_sources_by_id = {ds.id: ds for ds in data_sources}
 
-        dispatches: list[
-            tuple[EventRecord, DataSource, EventRecordDetailCreate, dict[str, int | None], float | None]
-        ] = []
-        # Edwards zones need the live session (they query data_point_series), so compute
-        # them here — before the expunge below — and carry the plain values into the
-        # after_commit closure. The cache avoids one user lookup per workout of a user.
-        birth_date_cache: dict[UUID, date | None] = {}
+        dispatches: list[tuple[EventRecord, DataSource, EventRecordDetailCreate]] = []
         for detail in details:
             record = records_by_id.get(detail.record_id)
             if record is None or record.data_source_id is None:
@@ -769,8 +801,7 @@ class EventRecordService(
             data_source = data_sources_by_id.get(record.data_source_id)
             if data_source is None:
                 continue
-            zone_minutes, completeness = self._workout_hr_zone_fields(db_session, record, data_source, birth_date_cache)
-            dispatches.append((record, data_source, detail, zone_minutes, completeness))
+            dispatches.append((record, data_source, detail))
 
         if not dispatches:
             return
@@ -785,14 +816,8 @@ class EventRecordService(
 
         @sa_event.listens_for(db_session, "after_commit", once=True)
         def _dispatch_bulk_webhooks(session: DbSession) -> None:  # noqa: ARG001
-            for record, data_source, detail, zone_minutes, completeness in dispatches:
-                self._emit_event_record_webhook(
-                    record,
-                    data_source,
-                    detail,
-                    zone_minutes=zone_minutes,
-                    hr_trace_completeness=completeness,
-                )
+            for record, data_source, detail in dispatches:
+                self._emit_event_record_webhook(record, data_source, detail)
 
     @handle_exceptions
     def _get_records_with_filters(
