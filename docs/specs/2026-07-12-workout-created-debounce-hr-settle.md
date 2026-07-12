@@ -73,12 +73,16 @@ Add a cheap idempotency guard so the task emits exactly once and a late reschedu
 ### 4.4 Zones are the single source of truth
 `_compute_workout_hr_zone_fields` is already the shared core used by both the REST read and the webhook (comment: "single source — they can never drift"). The task reuses it, so the debounced webhook payload equals what the REST would return at that moment. No new zone logic.
 
-## 5. Tunables (confirm)
+## 5. Tunables (CONFIRMED — Dragan 2026-07-12)
 
-- `DEBOUNCE_D` — poll interval / initial defer. Given the evidence (uploads ~1.2s apart), **10s** comfortably covers the common case in one tick; the poll handles wider spreads. **Proposed: 10s.**
-- `TARGET_COMPLETENESS` — emit-now fast path. **Proposed: 0.95** (don't keep polling once effectively complete).
-- `HARD_CAP_T` — max total defer before emitting whatever is present. **Proposed: 120s.**
+- `DEBOUNCE_D` = **1s** — poll interval / initial defer.
+- `TARGET_COMPLETENESS` = **0.95** — emit-now fast path.
+- `HARD_CAP_T` = **5s** — max total defer before emitting whatever is present.
 All three in settings/config (env-tunable), not hardcoded.
+
+**Trade-off (intentional):** the 5s cap prioritizes low latency. A workout whose HR is still arriving after 5s emits partial and relies on the REST-recompute / adapter-reconcile backstop. The observed incident (second upload +1.2s) resolves well within the cap: tick@1s (partial, prev=None→reschedule), tick@2s (grew→reschedule), tick@3s (stable→emit). The walk (uploads 87ms apart) settles by tick@2s.
+
+**This rules out the "single deferred emit" variant (§9.3):** a single emit at `countdown=1s` would fire *before* the +1.2s second upload → still partial. The self-polling debounce is required at these values.
 
 ## 6. Edge cases
 - **Workout deleted before finalize:** task no-ops (record gone).
@@ -96,7 +100,7 @@ All three in settings/config (env-tunable), not hardcoded.
 - Feature branch → PR into Synaptik fork → Dragan merges + tags `0.6.2-syn.5` → deploy via calibra-ow-deploy. Never merge upstream / into `release/0.6.2-syn` directly.
 - Config defaults shippable; can dial `DEBOUNCE_D`/`HARD_CAP_T` from data after deploy.
 
-## 9. Decisions to confirm
-1. `DEBOUNCE_D` = 10s, `TARGET_COMPLETENESS` = 0.95, `HARD_CAP_T` = 120s — OK?
-2. Emitted-marker: Redis `SETNX` (no migration) vs a `workout_created_emitted_at` column?
-3. Ship the self-polling debounce (§4.1), or start with the simplest variant — a **single** deferred emit at `countdown=D` (no poll), accepting that spreads > D fall through to the REST/reconcile backstop?
+## 9. Decisions (RESOLVED)
+1. `DEBOUNCE_D` = 1s, `TARGET_COMPLETENESS` = 0.95, `HARD_CAP_T` = 5s (§5). ✅
+2. Emitted-marker: **Redis `SETNX workout:{id}:emitted`** (no migration; Svix idempotency_key=workout_id as the second guard). ✅
+3. **Self-polling debounce (§4.1)** — required at D=1s (the single-deferred variant would miss the +1.2s upload). ✅
