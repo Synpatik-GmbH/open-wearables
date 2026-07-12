@@ -242,9 +242,7 @@ def mock_finalize_workout_zones() -> Generator[MagicMock, None, None]:
     module-global name, so patching the whole object would swallow that call — patching the
     method leaves the task callable while stubbing the enqueue. Tests that verify scheduling
     override ``.apply_async`` via their own @patch (innermost wins)."""
-    with patch(
-        "app.integrations.celery.tasks.finalize_workout_zones_task.finalize_workout_zones.apply_async"
-    ) as mock:
+    with patch("app.integrations.celery.tasks.finalize_workout_zones_task.finalize_workout_zones.apply_async") as mock:
         yield mock
 
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from logging import getLogger
+from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 from celery import shared_task
@@ -24,6 +25,9 @@ from app.config import settings
 from app.database import SessionLocal
 from app.integrations.redis_client import get_redis_client
 from app.models import DataSource, EventRecord
+
+if TYPE_CHECKING:
+    from app.models import WorkoutDetails
 from app.services.apple.healthkit.workout_settle import should_emit
 from app.services.event_record_service import event_record_service
 
@@ -80,8 +84,10 @@ def finalize_workout_zones(
         ):
             # Emit-once guard: only the poll that wins SETNX fires the webhook.
             if redis.set(_emitted_key(workout_id), "1", nx=True, ex=_EMITTED_TTL_SECONDS):
+                # This task is only ever scheduled for workout records, so the persisted
+                # detail is a WorkoutDetails; narrow the base repo return type for the checker.
                 event_record_service._emit_workout_created_from_persisted(
-                    db, record, data_source, detail, zone_minutes, completeness
+                    db, record, data_source, cast("WorkoutDetails", detail), zone_minutes, completeness
                 )
             return {"emitted": True, "completeness": completeness}
 

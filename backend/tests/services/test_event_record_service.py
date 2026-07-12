@@ -114,9 +114,7 @@ class TestEventRecordServiceBulkCreateDetails:
     transaction commits; it recomputes the zones and emits once the trace has settled.
     """
 
-    FINALIZE_APPLY_PATH = (
-        "app.integrations.celery.tasks.finalize_workout_zones_task.finalize_workout_zones.apply_async"
-    )
+    FINALIZE_APPLY_PATH = "app.integrations.celery.tasks.finalize_workout_zones_task.finalize_workout_zones.apply_async"
 
     def test_bulk_create_details_schedules_workout_finalize(self, db: Session) -> None:
         data_source = DataSourceFactory(source="apple")
@@ -150,9 +148,7 @@ class TestEventRecordServiceBulkCreateDetails:
         assert mock_apply.call_count == 2
         scheduled_ids = {c.kwargs["args"][0] for c in mock_apply.call_args_list}
         assert scheduled_ids == {str(rec1.id), str(rec2.id)}
-        assert all(
-            c.kwargs["countdown"] == settings.workout_zone_debounce_seconds for c in mock_apply.call_args_list
-        )
+        assert all(c.kwargs["countdown"] == settings.workout_zone_debounce_seconds for c in mock_apply.call_args_list)
 
     def test_bulk_create_details_silent_when_svix_disabled(self, db: Session) -> None:
         data_source = DataSourceFactory(source="apple")
