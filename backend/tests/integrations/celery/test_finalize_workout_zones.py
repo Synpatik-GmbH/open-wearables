@@ -185,3 +185,42 @@ class TestFinalizeWorkoutZones:
         assert result == {"emitted": True, "completeness": 0.80}
         emit.assert_not_called()
         apply_async.assert_not_called()
+
+    def test_reschedule_preserves_first_seen(self) -> None:
+        """Growing, first_seen ALREADY set → reschedule forwards the SAME first_seen_iso
+        (not re-stamped to now). Guards the hard-cap: re-stamping would keep elapsed ~0
+        so the cap could never fire."""
+        workout_id = str(uuid4())
+        redis = MagicMock()
+        redis.get.return_value = None
+        db = MagicMock()
+        db.get.side_effect = [_record(), MagicMock()]
+        _, _, emit = _install(redis=redis, db=db, completeness=0.80)
+
+        first_seen = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+        with patch.object(finalize_workout_zones, "apply_async") as apply_async:
+            result = finalize_workout_zones(workout_id, prev_completeness=0.41, first_seen_iso=first_seen)
+
+        assert result["reason"] == "rescheduled"
+        emit.assert_not_called()
+        # The SAME first_seen is forwarded, parsed back equal — not reset to now.
+        forwarded = apply_async.call_args.kwargs["kwargs"]["first_seen_iso"]
+        assert datetime.fromisoformat(forwarded) == datetime.fromisoformat(first_seen)
+
+    def test_noop_when_detail_missing(self) -> None:
+        """Record + data_source present but the workout detail is absent → 'missing' no-op."""
+        workout_id = str(uuid4())
+        redis = MagicMock()
+        redis.get.return_value = None
+        db = MagicMock()
+        db.get.side_effect = [_record(), MagicMock()]  # record, data_source both present
+        get_detail, compute, emit = _install(redis=redis, db=db, completeness=0.80)
+        get_detail.return_value = None  # detail absent
+
+        with patch.object(finalize_workout_zones, "apply_async") as apply_async:
+            result = finalize_workout_zones(workout_id)
+
+        assert result == {"emitted": False, "reason": "missing"}
+        compute.assert_not_called()
+        emit.assert_not_called()
+        apply_async.assert_not_called()
