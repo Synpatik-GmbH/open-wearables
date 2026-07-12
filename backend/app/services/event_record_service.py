@@ -668,6 +668,58 @@ class EventRecordService(
                     hr_trace_completeness=hr_trace_completeness,
                 )
 
+    @staticmethod
+    def _emit_workout_created_from_persisted(
+        db_session: DbSession,  # reserved for Task 3 parity; keeps the signature symmetric with the compute helpers
+        record: EventRecord,
+        data_source: DataSource,
+        detail: WorkoutDetails,
+        zone_minutes: dict[str, int | None] | None = None,
+        hr_trace_completeness: float | None = None,
+    ) -> None:
+        """Emit ``workout.created`` from the PERSISTED ``WorkoutDetails`` ORM model.
+
+        Mirrors the ``"workout"`` branch of :meth:`_emit_event_record_webhook` but reads the
+        persisted detail row (rather than the create schema) so the finalize-zones debounce
+        task can re-emit once the HR trace has settled. Kept as the single workout payload
+        builder so the ingest-time and debounce emits can never drift (Task 3 folds the
+        create-schema branch onto this helper).
+
+        ``on_workout_created`` already keys Svix idempotency on ``record.id``
+        (``workout.created.{record_id}``), so a double emit collapses to one delivery.
+        """
+        if not svix_service.is_enabled():
+            return
+        avg_pace: int | None = None
+        if detail.average_speed and float(detail.average_speed) > 0:
+            avg_pace = int(1000 / float(detail.average_speed))
+        zones = zone_minutes or {}
+        on_workout_created(
+            record_id=record.id,
+            user_id=data_source.user_id,
+            provider=str(data_source.provider),
+            device=data_source.device_model,
+            workout_type=record.type,
+            start_time=record.start_datetime.isoformat(),
+            end_time=record.end_datetime.isoformat(),
+            zone_offset=record.zone_offset,
+            duration_seconds=record.duration_seconds,
+            calories_kcal=float(detail.energy_burned) if detail.energy_burned is not None else None,
+            distance_meters=float(detail.distance) if detail.distance is not None else None,
+            avg_heart_rate_bpm=int(detail.heart_rate_avg) if detail.heart_rate_avg is not None else None,
+            max_heart_rate_bpm=int(detail.heart_rate_max) if detail.heart_rate_max is not None else None,
+            elevation_gain_meters=float(detail.total_elevation_gain)
+            if detail.total_elevation_gain is not None
+            else None,
+            avg_pace_sec_per_km=avg_pace,
+            hr_zone_1_min=zones.get("hr_zone_1_min"),
+            hr_zone_2_min=zones.get("hr_zone_2_min"),
+            hr_zone_3_min=zones.get("hr_zone_3_min"),
+            hr_zone_4_min=zones.get("hr_zone_4_min"),
+            hr_zone_5_min=zones.get("hr_zone_5_min"),
+            hr_trace_completeness=hr_trace_completeness,
+        )
+
     def bulk_create(
         self,
         db_session: DbSession,
