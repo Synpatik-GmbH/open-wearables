@@ -11,6 +11,7 @@ from uuid import UUID
 import httpx
 from fastapi import HTTPException
 from redis import Redis
+from sqlalchemy.exc import InvalidRequestError
 from starlette.status import HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED, HTTP_500_INTERNAL_SERVER_ERROR
 
 from app.database import DbSession
@@ -178,8 +179,21 @@ class BaseOAuthTemplate(ABC):
                 user_id=str(user_id),
                 status_code=e.response.status_code,
             )
-            # 400/401 = refresh token is dead so revoke + notify
+            # A 400/401 has two very different causes and they must not be conflated:
+            #   1. the user really revoked us -> revoke + notify (below)
+            #   2. the token we sent was already spent by a CONCURRENT refresh
+            #
+            # Providers that ROTATE refresh tokens (Whoop) invalidate the old one the
+            # instant a refresh succeeds. Two workers handling two webhooks for the same
+            # user both load the connection, both hold the same token, and the loser is
+            # rejected 150ms later -- while the connection is perfectly healthy and a
+            # fresh access token has just been written. Re-read the row: if the stored
+            # refresh token is no longer the one we presented, we lost that race, so
+            # hand back the winner's tokens instead of destroying a live connection.
             if e.response.status_code in (HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED):
+                rotated = self._tokens_rotated_concurrently(db, user_id, refresh_token)
+                if rotated is not None:
+                    return rotated
                 self._revoke_connection(db, user_id, reason="refresh_failed")
                 raise HTTPException(
                     status_code=HTTP_401_UNAUTHORIZED,
@@ -196,6 +210,74 @@ class BaseOAuthTemplate(ABC):
                 user_id=str(user_id),
             )
             raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Token refresh failed: {str(e)}")
+
+    def _tokens_rotated_concurrently(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        presented_refresh_token: str,
+    ) -> OAuthTokenResponse | None:
+        """Tokens the winner of a concurrent refresh stored, or None if we really were rejected.
+
+        Called only after the provider rejected ``presented_refresh_token``. The row is
+        re-read because the value we hold was loaded before the request and another
+        worker may have rotated it since. A difference means the rejection was a race,
+        not a revocation.
+
+        If the freshly stored token turns out to be dead too (the user revoked right
+        after someone else rotated), nothing is lost: the next attempt presents the
+        stored token, finds it unchanged, and revokes then. Deferring detection by one
+        cycle costs a single failed webhook, whereas revoking a healthy connection
+        costs the user every sync until they reconnect by hand.
+
+        DEPENDS ON READ COMMITTED (the Postgres default, verified as unset on our
+        server). The winning worker is a different process whose COMMIT landed after
+        this transaction began; only under READ COMMITTED does the refresh below take a
+        new snapshot and see it. Raise the isolation level and this check silently stops
+        detecting anything and healthy connections start being revoked again — the tests
+        will NOT catch that, because they drive both sides through one session.
+        """
+        connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
+        if connection is not None:
+            # The query alone is not enough: SQLAlchemy hands back the instance already
+            # in this session's identity map, attributes and all. Refresh just this row
+            # rather than expiring the whole session, which would force every other
+            # object the caller holds to re-query for no reason.
+            try:
+                db.refresh(connection)
+            except InvalidRequestError:
+                return None  # row vanished under us; let the caller take the revoke path
+        if (
+            connection is None
+            or connection.status == ConnectionStatus.REVOKED
+            or not connection.access_token
+            or not connection.refresh_token
+            or connection.refresh_token == presented_refresh_token
+        ):
+            return None
+
+        expires_in = 0
+        if connection.token_expires_at is not None:
+            expires_at = connection.token_expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            expires_in = max(int((expires_at - datetime.now(timezone.utc)).total_seconds()), 0)
+
+        log_structured(
+            logger,
+            "warning",
+            "Refresh token was rotated by a concurrent refresh; reusing the stored tokens instead of revoking",
+            provider=self.provider_name,
+            task="refresh_access_token",
+            user_id=str(user_id),
+        )
+        return OAuthTokenResponse(
+            access_token=connection.access_token,
+            token_type="Bearer",
+            refresh_token=connection.refresh_token,
+            expires_in=expires_in,
+            scope=connection.scope,
+        )
 
     def _revoke_connection(self, db: DbSession, user_id: UUID, *, reason: str) -> None:
         """Mark the connection revoked and emit a connection.revoked webhook."""
