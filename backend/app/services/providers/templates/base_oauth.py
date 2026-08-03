@@ -11,6 +11,7 @@ from uuid import UUID
 import httpx
 from fastapi import HTTPException
 from redis import Redis
+from sqlalchemy.exc import InvalidRequestError
 from starlette.status import HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED, HTTP_500_INTERNAL_SERVER_ERROR
 
 from app.database import DbSession
@@ -228,9 +229,24 @@ class BaseOAuthTemplate(ABC):
         stored token, finds it unchanged, and revokes then. Deferring detection by one
         cycle costs a single failed webhook, whereas revoking a healthy connection
         costs the user every sync until they reconnect by hand.
+
+        DEPENDS ON READ COMMITTED (the Postgres default, verified as unset on our
+        server). The winning worker is a different process whose COMMIT landed after
+        this transaction began; only under READ COMMITTED does the refresh below take a
+        new snapshot and see it. Raise the isolation level and this check silently stops
+        detecting anything and healthy connections start being revoked again — the tests
+        will NOT catch that, because they drive both sides through one session.
         """
-        db.expire_all()  # the row may have been written by another process
         connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
+        if connection is not None:
+            # The query alone is not enough: SQLAlchemy hands back the instance already
+            # in this session's identity map, attributes and all. Refresh just this row
+            # rather than expiring the whole session, which would force every other
+            # object the caller holds to re-query for no reason.
+            try:
+                db.refresh(connection)
+            except InvalidRequestError:
+                return None  # row vanished under us; let the caller take the revoke path
         if (
             connection is None
             or connection.status == ConnectionStatus.REVOKED
