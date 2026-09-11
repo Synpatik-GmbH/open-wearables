@@ -2,11 +2,14 @@
 Unit tests for refresh token service.
 """
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models import RefreshToken
 from app.schemas.auth import TokenType
 from app.services.refresh_token_service import refresh_token_service
@@ -281,3 +284,77 @@ class TestDeveloperRefreshIsUnchanged:
         result = refresh_token_service.refresh_token(db, old)
 
         assert result.refresh_token != old
+
+
+class TestSdkRefreshGrace:
+    """D-02, D-03, D-05, INV-01, INV-04 (fork spec 2026-09-11)."""
+
+    def test_superseded_token_with_unrevoked_successor_gets_the_same_successor(self, db: Session) -> None:
+        user = UserFactory()
+        old = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
+        first = refresh_token_service.refresh_token(db, old)
+
+        again = refresh_token_service.refresh_token(db, old)
+
+        assert again.refresh_token == first.refresh_token
+
+    def test_grace_is_idempotent_and_writes_no_rows(self, db: Session) -> None:
+        user = UserFactory()
+        old = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
+        first = refresh_token_service.refresh_token(db, old)
+        rows_before = db.query(RefreshToken).filter(RefreshToken.user_id == user.id).count()
+
+        a = refresh_token_service.refresh_token(db, old)
+        b = refresh_token_service.refresh_token(db, old)
+
+        assert a.refresh_token == b.refresh_token == first.refresh_token
+        assert db.query(RefreshToken).filter(RefreshToken.user_id == user.id).count() == rows_before
+
+    def test_superseded_token_is_rejected_once_its_successor_was_rotated(self, db: Session) -> None:
+        user = UserFactory()
+        old = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
+        successor = refresh_token_service.refresh_token(db, old).refresh_token
+        refresh_token_service.refresh_token(db, successor)  # the client applied the successor
+
+        with pytest.raises(HTTPException) as exc_info:
+            refresh_token_service.refresh_token(db, old)
+
+        assert exc_info.value.status_code == 401
+
+    def test_superseded_token_is_rejected_once_its_successor_was_revoked(self, db: Session) -> None:
+        user = UserFactory()
+        old = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
+        successor = refresh_token_service.refresh_token(db, old).refresh_token
+        token = db.execute(select(RefreshToken).where(RefreshToken.id == successor)).scalar_one()
+        refresh_token_service.repo.revoke_token(db, token)
+
+        with pytest.raises(HTTPException) as exc_info:
+            refresh_token_service.refresh_token(db, old)
+
+        assert exc_info.value.status_code == 401
+
+    def test_token_revoked_while_live_gets_no_grace(self, db: Session) -> None:
+        user = UserFactory()
+        token = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
+        refresh_token_service.revoke_token(db, token)
+
+        with pytest.raises(HTTPException) as exc_info:
+            refresh_token_service.refresh_token(db, token)
+
+        assert exc_info.value.status_code == 401
+
+    def test_grace_boundary_is_inclusive(self, db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+        user = UserFactory()
+        rotated_at = datetime(2026, 9, 11, 15, 10, 4, tzinfo=timezone.utc)
+        grace = timedelta(seconds=settings.sdk_refresh_grace_seconds)
+        old = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
+        monkeypatch.setattr(refresh_token_service, "_now", lambda: rotated_at)
+        successor = refresh_token_service.refresh_token(db, old).refresh_token
+
+        monkeypatch.setattr(refresh_token_service, "_now", lambda: rotated_at + grace)
+        assert refresh_token_service.refresh_token(db, old).refresh_token == successor
+
+        monkeypatch.setattr(refresh_token_service, "_now", lambda: rotated_at + grace + timedelta(seconds=1))
+        with pytest.raises(HTTPException) as exc_info:
+            refresh_token_service.refresh_token(db, old)
+        assert exc_info.value.status_code == 401

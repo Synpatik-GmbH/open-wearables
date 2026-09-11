@@ -1,6 +1,6 @@
 import secrets
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging import Logger, getLogger
 from uuid import UUID
 
@@ -44,6 +44,14 @@ class RefreshTokenService:
         A re-read under the lock must see what is committed now, not an object cached by the first read.
         """
         stmt = select(RefreshToken).where(RefreshToken.id == token_id).execution_options(populate_existing=True)
+        return db_session.execute(stmt).scalar_one_or_none()
+
+    @staticmethod
+    def _read_successor(db_session: DbSession, token_id: str) -> RefreshToken | None:
+        """The row that replaced `token_id` by rotation, if any (fork spec D-03), read fresh."""
+        stmt = (
+            select(RefreshToken).where(RefreshToken.rotated_from == token_id).execution_options(populate_existing=True)
+        )
         return db_session.execute(stmt).scalar_one_or_none()
 
     @staticmethod
@@ -157,7 +165,20 @@ class RefreshTokenService:
                 rotated_from=token_id,
             )
             return self._sdk_token_response(user_id, app_id, successor_id)  # ty:ignore[invalid-argument-type]
+        # token was revoked. Only a rotation leaves a successor naming it (D-03).
+        successor = self._read_successor(db_session, token_id)
+        if successor is None:
+            reason = "revoked"
+        elif successor.revoked_at is not None:
+            reason = "rotated_successor_used"
+        elif self._now() - token.revoked_at > timedelta(seconds=settings.sdk_refresh_grace_seconds):
+            reason = "rotated_past_grace"
+        else:
+            successor_id = successor.id
+            db_session.commit()  # grace writes nothing (INV-04); ends the transaction, releasing the lock
+            return self._sdk_token_response(user_id, app_id, successor_id)  # ty:ignore[invalid-argument-type]
         db_session.commit()
+        self.logger.debug(f"SDK refresh rejected: {reason}")
         raise self._unauthorized()
 
     def _refresh_non_sdk(self, db_session: DbSession, refresh_token_str: str) -> TokenResponse:
