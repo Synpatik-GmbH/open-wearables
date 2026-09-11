@@ -4,6 +4,7 @@ Unit tests for refresh token service.
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.models import RefreshToken
@@ -206,3 +207,77 @@ class TestRevokeToken:
             refresh_token_service.revoke_token(db, refresh_token)
 
         assert exc_info.value.status_code == 404
+
+
+class TestSdkRotationIsLinkedAndSerialised:
+    """INV-01 live branch and D-06 (fork spec 2026-09-11)."""
+
+    def test_rotation_links_the_successor_to_the_presented_token(self, db: Session) -> None:
+        user = UserFactory()
+        old = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
+
+        result = refresh_token_service.refresh_token(db, old)
+
+        successor = db.execute(select(RefreshToken).where(RefreshToken.id == result.refresh_token)).scalar_one()
+        assert successor.rotated_from == old
+
+    def test_sdk_refresh_takes_the_user_app_lock(self, db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+        user = UserFactory()
+        old = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
+        calls: list[tuple[object, str]] = []
+        real_lock = refresh_token_service._lock_user_app
+
+        def spy(session: Session, user_id: object, app_id: str) -> None:
+            calls.append((user_id, app_id))
+            real_lock(session, user_id, app_id)  # ty: ignore[invalid-argument-type]
+
+        monkeypatch.setattr(refresh_token_service, "_lock_user_app", spy)
+
+        refresh_token_service.refresh_token(db, old)
+
+        assert calls == [(user.id, "test_app")]
+
+    def test_row_deleted_between_first_read_and_lock_is_rejected(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        user = UserFactory()
+        old = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
+        real_lock = refresh_token_service._lock_user_app
+
+        def lock_then_delete(session: Session, user_id: object, app_id: str) -> None:
+            real_lock(session, user_id, app_id)  # ty: ignore[invalid-argument-type]
+            session.execute(delete(RefreshToken).where(RefreshToken.id == old))
+
+        monkeypatch.setattr(refresh_token_service, "_lock_user_app", lock_then_delete)
+
+        with pytest.raises(HTTPException) as exc_info:
+            refresh_token_service.refresh_token(db, old)
+
+        assert exc_info.value.status_code == 401
+
+
+class TestDeveloperRefreshIsUnchanged:
+    """D-04: developer tokens take today's code — strict rotation, no lock."""
+
+    def test_old_developer_token_is_rejected_right_after_rotation(self, db: Session) -> None:
+        developer = DeveloperFactory()
+        old = refresh_token_service.create_developer_refresh_token(db, developer.id)
+        refresh_token_service.refresh_token(db, old)
+
+        with pytest.raises(HTTPException) as exc_info:
+            refresh_token_service.refresh_token(db, old)
+
+        assert exc_info.value.status_code == 401
+
+    def test_developer_refresh_takes_no_lock(self, db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+        developer = DeveloperFactory()
+        old = refresh_token_service.create_developer_refresh_token(db, developer.id)
+
+        def fail(*_args: object) -> None:
+            raise AssertionError("developer refresh must not take the SDK lock")
+
+        monkeypatch.setattr(refresh_token_service, "_lock_user_app", fail)
+
+        result = refresh_token_service.refresh_token(db, old)
+
+        assert result.refresh_token != old
