@@ -358,3 +358,59 @@ class TestSdkRefreshGrace:
         with pytest.raises(HTTPException) as exc_info:
             refresh_token_service.refresh_token(db, old)
         assert exc_info.value.status_code == 401
+
+
+class TestSdkRevokeReachesUnrevokedSuccessor:
+    """INV-03 (fork spec 2026-09-11)."""
+
+    def test_revoking_a_superseded_token_revokes_its_unrevoked_successor(self, db: Session) -> None:
+        user = UserFactory()
+        old = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
+        successor = refresh_token_service.refresh_token(db, old).refresh_token
+
+        assert refresh_token_service.revoke_token(db, old) is True
+
+        row = db.execute(select(RefreshToken).where(RefreshToken.id == successor)).scalar_one()
+        assert row.revoked_at is not None
+        with pytest.raises(HTTPException) as exc_info:
+            refresh_token_service.refresh_token(db, old)
+        assert exc_info.value.status_code == 401
+
+    def test_revoking_a_superseded_token_whose_successor_is_revoked_is_not_found(self, db: Session) -> None:
+        user = UserFactory()
+        old = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
+        successor = refresh_token_service.refresh_token(db, old).refresh_token
+        refresh_token_service.refresh_token(db, successor)  # successor rotated → revoked
+
+        with pytest.raises(HTTPException) as exc_info:
+            refresh_token_service.revoke_token(db, old)
+
+        assert exc_info.value.status_code == 404
+
+    def test_revoke_where_row_is_deleted_between_first_read_and_lock_is_not_found(
+        self, db: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        user = UserFactory()
+        token = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
+        real_lock = refresh_token_service._lock_user_app
+
+        def lock_then_delete(session: Session, user_id: object, app_id: str) -> None:
+            real_lock(session, user_id, app_id)  # ty: ignore[invalid-argument-type]
+            session.execute(delete(RefreshToken).where(RefreshToken.id == token))
+
+        monkeypatch.setattr(refresh_token_service, "_lock_user_app", lock_then_delete)
+
+        with pytest.raises(HTTPException) as exc_info:
+            refresh_token_service.revoke_token(db, token)
+
+        assert exc_info.value.status_code == 404
+
+    def test_revoking_a_rotated_developer_token_is_not_found(self, db: Session) -> None:
+        developer = DeveloperFactory()
+        old = refresh_token_service.create_developer_refresh_token(db, developer.id)
+        refresh_token_service.refresh_token(db, old)
+
+        with pytest.raises(HTTPException) as exc_info:
+            refresh_token_service.revoke_token(db, old)
+
+        assert exc_info.value.status_code == 404

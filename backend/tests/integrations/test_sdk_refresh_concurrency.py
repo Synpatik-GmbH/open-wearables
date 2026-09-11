@@ -91,3 +91,28 @@ def test_grace_refresh_waits_for_a_concurrent_rotation_of_the_successor(
     error = result_a.get("error")
     assert isinstance(error, HTTPException), result_a
     assert error.status_code == 401, result_a
+
+
+def test_revoke_waits_for_a_concurrent_rotation_and_reaches_the_successor(
+    session_factory: sessionmaker, committed_user: UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with session_factory() as setup:
+        t0 = refresh_token_service.create_sdk_refresh_token(setup, committed_user, APP_ID)
+    a, b = session_factory(), session_factory()  # A rotates T0; B revokes T0
+    try:
+        paused = PausedCommit(monkeypatch, a)
+        thread_a, result_a, _ = run_in_thread(lambda: refresh_token_service.refresh_token(a, t0))
+        assert paused.reached.wait(timeout=10), "A never reached its commit"
+        pid_b = backend_pid(b)
+        thread_b, result_b, done_b = run_in_thread(lambda: refresh_token_service.revoke_token(b, t0))
+        wait_until_blocked_or_done(session_factory, pid_b, done_b)
+        paused.release.set()
+        thread_a.join(timeout=15)
+        thread_b.join(timeout=15)
+    finally:
+        a.close()
+        b.close()
+
+    assert "error" not in result_a, result_a.get("error")
+    assert "error" not in result_b, result_b.get("error")
+    assert all(r.revoked_at is not None for r in sdk_rows(session_factory, committed_user))

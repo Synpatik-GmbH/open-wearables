@@ -213,23 +213,43 @@ class RefreshTokenService:
     def revoke_token(self, db_session: DbSession, refresh_token_str: str) -> bool:
         """Revoke a refresh token.
 
-        Args:
-            db_session: Database session
-            refresh_token_str: The refresh token string
-
-        Returns:
-            True if the token was revoked, False if not found
+        For an SDK token that was rotated and whose successor is unrevoked, the successor is revoked
+        instead (fork spec INV-03): otherwise a phone that missed a rotation reply and then logged out
+        would leave its successor live. Developer tokens keep upstream behaviour (D-04).
 
         Raises:
-            HTTPException: If the refresh token is not found
+            HTTPException: 404 if there is nothing to revoke
         """
+        first_read = self._read_fresh(db_session, refresh_token_str)
+        if first_read is None:
+            raise self._not_found()
+        if first_read.token_type != TokenType.SDK:
+            return self._revoke_non_sdk(db_session, refresh_token_str)
+        token_id = first_read.id
+        self._lock_user_app(db_session, first_read.user_id, first_read.app_id)  # ty:ignore[invalid-argument-type]
+        token = self._read_fresh(db_session, token_id)
+        if token is None:
+            db_session.commit()
+            raise self._not_found()
+        if token.revoked_at is None:
+            self.repo.revoke_token(db_session, token)  # commits
+            return True
+        successor = self._read_successor(db_session, token_id)
+        if successor is None or successor.revoked_at is not None:
+            db_session.commit()
+            raise self._not_found()
+        self.repo.revoke_token(db_session, successor)  # commits
+        return True
+
+    @staticmethod
+    def _not_found() -> HTTPException:
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Refresh token not found")
+
+    def _revoke_non_sdk(self, db_session: DbSession, refresh_token_str: str) -> bool:
+        """Upstream behaviour for developer tokens, unchanged (fork spec D-04)."""
         token = self.repo.get_valid_token(db_session, refresh_token_str)
         if not token:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Refresh token not found",
-            )
-
+            raise self._not_found()
         self.repo.revoke_token(db_session, token)
         self.logger.debug(f"Revoked refresh token {refresh_token_str[:10]}...")
         return True
