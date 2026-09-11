@@ -4,6 +4,8 @@ Unit tests for refresh token repository.
 
 from datetime import datetime, timezone
 
+import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import RefreshToken
@@ -254,3 +256,40 @@ class TestRefreshTokenRepository:
         # Assert
         db.refresh(token)
         assert token.last_used_at is not None
+
+
+class TestRotatedFromLink:
+    """INV-02: one presented token can never have two successors."""
+
+    def test_second_successor_for_same_token_is_rejected_by_the_database(self, db: Session) -> None:
+        user = UserFactory()
+        now = datetime.now(timezone.utc)
+        predecessor = RefreshToken(
+            id="rt-" + "0" * 32, token_type=TokenType.SDK, user_id=user.id, app_id="app", created_at=now
+        )
+        db.add(predecessor)
+        db.flush()
+        db.add(
+            RefreshToken(
+                id="rt-" + "1" * 32,
+                token_type=TokenType.SDK,
+                user_id=user.id,
+                app_id="app",
+                created_at=now,
+                rotated_from=predecessor.id,
+            )
+        )
+        db.flush()
+        db.add(
+            RefreshToken(
+                id="rt-" + "2" * 32,
+                token_type=TokenType.SDK,
+                user_id=user.id,
+                app_id="app",
+                created_at=now,
+                rotated_from=predecessor.id,
+            )
+        )
+
+        with pytest.raises(IntegrityError):
+            db.flush()
