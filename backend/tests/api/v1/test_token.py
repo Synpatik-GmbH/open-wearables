@@ -153,6 +153,23 @@ class TestRefreshToken:
         response = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": old_refresh_token})
         assert response.status_code == 401
 
+    def test_second_mint_for_same_user_and_app_revokes_the_first_token(
+        self, client: TestClient, db: Session, api_v1_prefix: str
+    ) -> None:
+        """POST /users/{id}/token revokes earlier SDK chains for that user and app (fork spec D-11)."""
+        developer = DeveloperFactory()
+        application = ApplicationFactory(developer=developer, app_secret="test_app_secret")
+        user = UserFactory()
+        credentials = {"app_id": application.app_id, "app_secret": "test_app_secret"}
+
+        first = client.post(f"{api_v1_prefix}/users/{user.id}/token", json=credentials)
+        assert first.status_code == 200
+        second = client.post(f"{api_v1_prefix}/users/{user.id}/token", json=credentials)
+        assert second.status_code == 200
+
+        response = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": first.json()["refresh_token"]})
+        assert response.status_code == 401
+
 
 class TestRevokeRefreshToken:
     """Tests for POST /api/v1/token/revoke."""

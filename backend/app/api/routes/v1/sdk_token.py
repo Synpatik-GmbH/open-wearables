@@ -68,7 +68,7 @@ def create_user_token(
         user_id=str(user_id),
     )
 
-    refresh_token = refresh_token_service.create_sdk_refresh_token(db, user_id, app_id)
+    refresh_token = refresh_token_service.mint_sdk_refresh_token(db, user_id, app_id)
 
     return TokenResponse(
         access_token=access_token,

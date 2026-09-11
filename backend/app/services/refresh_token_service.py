@@ -5,7 +5,7 @@ from logging import Logger, getLogger
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 
 from app.config import settings
 from app.database import DbSession
@@ -103,6 +103,25 @@ class RefreshTokenService:
         self.repo.create(db_session, token)
         self.logger.debug(f"Created SDK refresh token for user {user_id}, app {app_id}")
         return token_id
+
+    def mint_sdk_refresh_token(self, db_session: DbSession, user_id: UUID, app_id: str) -> str:
+        """Fresh SDK mint: revoke the user's earlier live SDK tokens for this app, then create one.
+
+        Calibra is one phone per account (fork spec D-11): a reconnect means "this phone is the one".
+        Runs under the (user, app) lock so a concurrent rotation cannot slip a successor past it (D-06).
+        """
+        self._lock_user_app(db_session, user_id, app_id)
+        db_session.execute(
+            update(RefreshToken)
+            .where(
+                RefreshToken.token_type == TokenType.SDK,
+                RefreshToken.user_id == user_id,
+                RefreshToken.app_id == app_id,
+                RefreshToken.revoked_at.is_(None),
+            )
+            .values(revoked_at=self._now())
+        )
+        return self.create_sdk_refresh_token(db_session, user_id, app_id)  # one commit for both
 
     def create_developer_refresh_token(self, db_session: DbSession, developer_id: UUID) -> str:
         """Create a refresh token for a developer token.

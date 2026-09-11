@@ -414,3 +414,35 @@ class TestSdkRevokeReachesUnrevokedSuccessor:
             refresh_token_service.revoke_token(db, old)
 
         assert exc_info.value.status_code == 404
+
+
+class TestSdkMintRevokesEarlierChains:
+    """D-11 (fork spec 2026-09-11): one phone per account."""
+
+    def test_mint_revokes_earlier_live_tokens_for_the_same_user_and_app(self, db: Session) -> None:
+        user = UserFactory()
+        earlier = refresh_token_service.create_sdk_refresh_token(db, user.id, "calibra_app")
+        other_app = refresh_token_service.create_sdk_refresh_token(db, user.id, "other_app")
+        developer = DeveloperFactory()
+        developer_token = refresh_token_service.create_developer_refresh_token(db, developer.id)
+
+        minted = refresh_token_service.mint_sdk_refresh_token(db, user.id, "calibra_app")
+
+        def revoked_at(token_id: str) -> object:
+            return db.execute(select(RefreshToken.revoked_at).where(RefreshToken.id == token_id)).scalar_one()
+
+        assert revoked_at(earlier) is not None
+        assert revoked_at(minted) is None
+        assert revoked_at(other_app) is None
+        assert revoked_at(developer_token) is None
+
+    def test_superseded_token_is_rejected_once_a_mint_revoked_its_successor(self, db: Session) -> None:
+        user = UserFactory()
+        old = refresh_token_service.create_sdk_refresh_token(db, user.id, "calibra_app")
+        refresh_token_service.refresh_token(db, old)  # old → successor (unapplied by the phone)
+
+        refresh_token_service.mint_sdk_refresh_token(db, user.id, "calibra_app")  # reconnect
+
+        with pytest.raises(HTTPException) as exc_info:
+            refresh_token_service.refresh_token(db, old)
+        assert exc_info.value.status_code == 401
