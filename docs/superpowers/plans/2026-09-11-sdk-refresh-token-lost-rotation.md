@@ -4,7 +4,7 @@
 
 **Goal:** A phone that never received a rotation reply keeps syncing instead of being locked out; a reconnect revokes the user's earlier SDK tokens; every outcome is logged for the stuck-client query.
 
-**Architecture:** All changes are in `refresh_token_service.py` (OW fork) plus one nullable column. SDK refresh, revoke and mint each run in one transaction that first takes a per-`(user_id, app_id)` PostgreSQL advisory lock. A successor row names its predecessor in a unique `rotated_from` column; a superseded token presented while its successor is unrevoked (and within `sdk_refresh_grace_seconds`) gets the same successor back. Developer tokens keep today's code.
+**Architecture:** `refresh_token_service.py` (OW fork) orchestrates only. Every query, the advisory lock and every write live in `refresh_token_repository.py`, per the spec's §5.2 and `backend/AGENTS.md:297` — the services layer issues no query and no write directly. The five new repository methods do **not** commit; each SDK path is one transaction closed by a single commit, issued by `repo.create`/`repo.revoke_token` on a path that writes and by the service on a path that writes nothing, because `pg_advisory_xact_lock` is held only for that transaction. Plus one nullable column. SDK refresh, revoke and mint each run in one transaction that first takes a per-`(user_id, app_id)` PostgreSQL advisory lock. A successor row names its predecessor in a unique `rotated_from` column; a superseded token presented while its successor is unrevoked (and within `sdk_refresh_grace_seconds`) gets the same successor back. Developer tokens keep today's code.
 
 **Tech Stack:** Python 3.13, FastAPI 0.138, SQLAlchemy 2.0.51 (sync `Session`), PostgreSQL (16 in Azure, 18 in tests), Alembic 1.18, pydantic-settings 2.14, pytest + Testcontainers, uv, ruff, ty.
 
@@ -31,6 +31,19 @@
 - Tests build the schema with `BaseDbModel.metadata.create_all` (`backend/tests/conftest.py:71`), not migrations: every schema property must be declared on the model **and** in the migration (Task 1 checks both).
 
 ---
+
+- **SUPERSEDED IN PART BY THE SHIPPED CODE (commit `b295ec7a`) — read before any task below.** The
+  tasks define `_lock_user_app`, `_read_fresh` and `_read_successor` on `RefreshTokenService`. They
+  shipped on `RefreshTokenRepository` as `lock_user_app`, `get_by_id` and `get_successor`, joined by
+  `mark_revoked` (replacing the inline `token.revoked_at = self._now()` in `_refresh_sdk`) and
+  `revoke_live_sdk_tokens` (replacing the mint's inline `update(...)`), because
+  `backend/AGENTS.md:297` reserves database operations for repositories. None of the five commits:
+  each SDK path is still ONE transaction, closed by a single commit that `repo.create` or
+  `repo.revoke_token` issues on a path that writes and the service issues on a path that writes
+  nothing, because `pg_advisory_xact_lock` is held only for that transaction. **Where any task body,
+  code listing, drill step or test snippet below names those five operations, the shipped code
+  wins** — read `backend/app/repositories/refresh_token_repository.py` and
+  `backend/app/services/refresh_token_service.py`. Everything else in this plan stands as written.
 
 ## Task 0: Setup (not a reviewed task)
 

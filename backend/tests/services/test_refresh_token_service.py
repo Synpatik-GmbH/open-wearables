@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import RefreshToken
+from app.repositories.refresh_token_repository import refresh_token_repository
 from app.schemas.auth import TokenType
 from app.services.refresh_token_service import refresh_token_service
 from tests.factories import DeveloperFactory, UserFactory
@@ -228,13 +229,13 @@ class TestSdkRotationIsLinkedAndSerialised:
         user = UserFactory()
         old = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
         calls: list[tuple[object, str]] = []
-        real_lock = refresh_token_service._lock_user_app
+        real_lock = refresh_token_repository.lock_user_app
 
         def spy(session: Session, user_id: object, app_id: str) -> None:
             calls.append((user_id, app_id))
             real_lock(session, user_id, app_id)  # ty: ignore[invalid-argument-type]
 
-        monkeypatch.setattr(refresh_token_service, "_lock_user_app", spy)
+        monkeypatch.setattr(refresh_token_repository, "lock_user_app", spy)
 
         refresh_token_service.refresh_token(db, old)
 
@@ -245,13 +246,13 @@ class TestSdkRotationIsLinkedAndSerialised:
     ) -> None:
         user = UserFactory()
         old = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
-        real_lock = refresh_token_service._lock_user_app
+        real_lock = refresh_token_repository.lock_user_app
 
         def lock_then_delete(session: Session, user_id: object, app_id: str) -> None:
             real_lock(session, user_id, app_id)  # ty: ignore[invalid-argument-type]
             session.execute(delete(RefreshToken).where(RefreshToken.id == old))
 
-        monkeypatch.setattr(refresh_token_service, "_lock_user_app", lock_then_delete)
+        monkeypatch.setattr(refresh_token_repository, "lock_user_app", lock_then_delete)
 
         with pytest.raises(HTTPException) as exc_info:
             refresh_token_service.refresh_token(db, old)
@@ -279,7 +280,7 @@ class TestDeveloperRefreshIsUnchanged:
         def fail(*_args: object) -> None:
             raise AssertionError("developer refresh must not take the SDK lock")
 
-        monkeypatch.setattr(refresh_token_service, "_lock_user_app", fail)
+        monkeypatch.setattr(refresh_token_repository, "lock_user_app", fail)
 
         result = refresh_token_service.refresh_token(db, old)
 
@@ -392,13 +393,13 @@ class TestSdkRevokeReachesUnrevokedSuccessor:
     ) -> None:
         user = UserFactory()
         token = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
-        real_lock = refresh_token_service._lock_user_app
+        real_lock = refresh_token_repository.lock_user_app
 
         def lock_then_delete(session: Session, user_id: object, app_id: str) -> None:
             real_lock(session, user_id, app_id)  # ty: ignore[invalid-argument-type]
             session.execute(delete(RefreshToken).where(RefreshToken.id == token))
 
-        monkeypatch.setattr(refresh_token_service, "_lock_user_app", lock_then_delete)
+        monkeypatch.setattr(refresh_token_repository, "lock_user_app", lock_then_delete)
 
         with pytest.raises(HTTPException) as exc_info:
             refresh_token_service.revoke_token(db, token)

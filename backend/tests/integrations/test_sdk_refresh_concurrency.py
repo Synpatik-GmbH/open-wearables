@@ -9,6 +9,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import sessionmaker
 
 from app.models import RefreshToken, User
+from app.repositories.refresh_token_repository import refresh_token_repository
 from app.services.refresh_token_service import refresh_token_service
 from tests.integrations.sdk_refresh_race_support import (
     PausedCommit,
@@ -146,3 +147,31 @@ def test_mint_waits_for_a_concurrent_rotation_and_leaves_only_its_own_token_live
     assert "error" not in result_b, result_b.get("error")
     live = [r.id for r in sdk_rows(session_factory, committed_user) if r.revoked_at is None]
     assert live == [result_b["value"]]
+
+
+def test_mint_that_fails_before_its_insert_leaves_the_earlier_token_live(
+    session_factory: sessionmaker, committed_user: UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-11's revoke and the mint's insert are ONE transaction (§5.2).
+
+    Asserted from a second connection, where only committed rows are visible. If
+    `revoke_live_sdk_tokens` committed on its own, a mint whose insert then failed would leave the
+    user with every token revoked and no successor — locked out by the very code meant to heal it.
+    """
+    with session_factory() as setup:
+        earlier = refresh_token_service.create_sdk_refresh_token(setup, committed_user, APP_ID)
+
+    def insert_fails(*_args: object, **_kwargs: object) -> RefreshToken:
+        raise RuntimeError("the successor insert failed")
+
+    monkeypatch.setattr(refresh_token_repository, "create", insert_fails)
+    session = session_factory()
+    try:
+        with pytest.raises(RuntimeError):
+            refresh_token_service.mint_sdk_refresh_token(session, committed_user, APP_ID)
+        session.rollback()
+    finally:
+        session.close()
+
+    live = [r.id for r in sdk_rows(session_factory, committed_user) if r.revoked_at is None]
+    assert live == [earlier]

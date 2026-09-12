@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import RefreshToken
+from app.repositories.refresh_token_repository import refresh_token_repository
 from app.services.refresh_token_service import (
     REFRESH_ACTION_GRACE_REISSUED,
     REFRESH_ACTION_REJECTED,
@@ -94,13 +95,13 @@ def test_row_deleted_between_reads_logs_unknown_with_user(
 ) -> None:
     user = UserFactory()
     token = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
-    real_lock = refresh_token_service._lock_user_app
+    real_lock = refresh_token_repository.lock_user_app
 
     def lock_then_delete(session: Session, user_id: object, app_id: str) -> None:
         real_lock(session, user_id, app_id)  # ty: ignore[invalid-argument-type]
         session.execute(delete(RefreshToken).where(RefreshToken.id == token))
 
-    monkeypatch.setattr(refresh_token_service, "_lock_user_app", lock_then_delete)
+    monkeypatch.setattr(refresh_token_repository, "lock_user_app", lock_then_delete)
     capsys.readouterr()
     with pytest.raises(HTTPException):
         refresh_token_service.refresh_token(db, token)

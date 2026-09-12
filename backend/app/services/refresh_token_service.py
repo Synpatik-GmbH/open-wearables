@@ -6,7 +6,6 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import select, text, update
 
 from app.config import settings
 from app.database import DbSession
@@ -54,34 +53,6 @@ class RefreshTokenService:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or revoked refresh token",
             headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    @staticmethod
-    def _read_fresh(db_session: DbSession, token_id: str) -> RefreshToken | None:
-        """Read a token row from the database, bypassing the session's identity map.
-
-        A re-read under the lock must see what is committed now, not an object cached by the first read.
-        """
-        stmt = select(RefreshToken).where(RefreshToken.id == token_id).execution_options(populate_existing=True)
-        return db_session.execute(stmt).scalar_one_or_none()
-
-    @staticmethod
-    def _read_successor(db_session: DbSession, token_id: str) -> RefreshToken | None:
-        """The row that replaced `token_id` by rotation, if any (fork spec D-03), read fresh."""
-        stmt = (
-            select(RefreshToken).where(RefreshToken.rotated_from == token_id).execution_options(populate_existing=True)
-        )
-        return db_session.execute(stmt).scalar_one_or_none()
-
-    @staticmethod
-    def _lock_user_app(db_session: DbSession, user_id: UUID, app_id: str) -> None:
-        """Serialise every SDK token transaction for one (user, app) (fork spec D-06).
-
-        Transaction-scoped: PostgreSQL releases it at commit or rollback.
-        """
-        db_session.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
-            {"key": f"{user_id}:{app_id}"},
         )
 
     @staticmethod
@@ -133,17 +104,8 @@ class RefreshTokenService:
         Calibra is one phone per account (fork spec D-11): a reconnect means "this phone is the one".
         Runs under the (user, app) lock so a concurrent rotation cannot slip a successor past it (D-06).
         """
-        self._lock_user_app(db_session, user_id, app_id)
-        db_session.execute(
-            update(RefreshToken)
-            .where(
-                RefreshToken.token_type == TokenType.SDK,
-                RefreshToken.user_id == user_id,
-                RefreshToken.app_id == app_id,
-                RefreshToken.revoked_at.is_(None),
-            )
-            .values(revoked_at=self._now())
-        )
+        self.repo.lock_user_app(db_session, user_id, app_id)
+        self.repo.revoke_live_sdk_tokens(db_session, user_id, app_id, self._now())
         return self.create_sdk_refresh_token(db_session, user_id, app_id)  # one commit for both
 
     def create_developer_refresh_token(self, db_session: DbSession, developer_id: UUID) -> str:
@@ -180,7 +142,7 @@ class RefreshTokenService:
         Raises:
             HTTPException: 401 if the refresh token is invalid or revoked
         """
-        first_read = self._read_fresh(db_session, refresh_token_str)
+        first_read = self.repo.get_by_id(db_session, refresh_token_str)
         if first_read is None:
             self._log_refresh(REFRESH_ACTION_REJECTED, reason=REFRESH_REASON_UNKNOWN)
             raise self._unauthorized()
@@ -193,8 +155,8 @@ class RefreshTokenService:
         token_id = first_read.id
         user_id = first_read.user_id
         app_id = first_read.app_id
-        self._lock_user_app(db_session, user_id, app_id)  # ty:ignore[invalid-argument-type]
-        token = self._read_fresh(db_session, token_id)
+        self.repo.lock_user_app(db_session, user_id, app_id)  # ty:ignore[invalid-argument-type]
+        token = self.repo.get_by_id(db_session, token_id)
         if token is None:
             db_session.commit()  # nothing written; ends the transaction, releasing the lock
             self._log_refresh(
@@ -205,7 +167,7 @@ class RefreshTokenService:
             )
             raise self._unauthorized()
         if token.revoked_at is None:
-            token.revoked_at = self._now()
+            self.repo.mark_revoked(token, self._now())
             # create_sdk_refresh_token commits once: the revoke above and the successor insert together
             successor_id = self.create_sdk_refresh_token(
                 db_session,
@@ -216,7 +178,7 @@ class RefreshTokenService:
             self._log_refresh(REFRESH_ACTION_ROTATED, user_id=user_id, token_type=TokenType.SDK)
             return self._sdk_token_response(user_id, app_id, successor_id)  # ty:ignore[invalid-argument-type]
         # token was revoked. Only a rotation leaves a successor naming it (D-03).
-        successor = self._read_successor(db_session, token_id)
+        successor = self.repo.get_successor(db_session, token_id)
         rotated_age = self._now() - token.revoked_at
         if successor is None:
             reason = REFRESH_REASON_REVOKED
@@ -277,21 +239,21 @@ class RefreshTokenService:
         Raises:
             HTTPException: 404 if there is nothing to revoke
         """
-        first_read = self._read_fresh(db_session, refresh_token_str)
+        first_read = self.repo.get_by_id(db_session, refresh_token_str)
         if first_read is None:
             raise self._not_found()
         if first_read.token_type != TokenType.SDK:
             return self._revoke_non_sdk(db_session, refresh_token_str)
         token_id = first_read.id
-        self._lock_user_app(db_session, first_read.user_id, first_read.app_id)  # ty:ignore[invalid-argument-type]
-        token = self._read_fresh(db_session, token_id)
+        self.repo.lock_user_app(db_session, first_read.user_id, first_read.app_id)  # ty:ignore[invalid-argument-type]
+        token = self.repo.get_by_id(db_session, token_id)
         if token is None:
             db_session.commit()
             raise self._not_found()
         if token.revoked_at is None:
             self.repo.revoke_token(db_session, token)  # commits
             return True
-        successor = self._read_successor(db_session, token_id)
+        successor = self.repo.get_successor(db_session, token_id)
         if successor is None or successor.revoked_at is not None:
             db_session.commit()
             raise self._not_found()

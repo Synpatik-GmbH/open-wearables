@@ -23,8 +23,8 @@ OW issues SDK refresh tokens and rotates them on every use. `refresh_token`
 (`backend/app/services/refresh_token_service.py:97`), revokes the presented token
 (`backend/app/services/refresh_token_service.py:105`) and creates a successor
 (`backend/app/services/refresh_token_service.py:113`). The revoke and the create are two
-separate commits (`backend/app/repositories/refresh_token_repository.py:42`,
-`backend/app/repositories/refresh_token_repository.py:20`). Nothing links a token to its
+separate commits (`backend/app/repositories/refresh_token_repository.py:43`,
+`backend/app/repositories/refresh_token_repository.py:21`). Nothing links a token to its
 successor (`backend/app/models/refresh_token.py:30` is the only revocation field). This code is
 byte-identical to upstream `0.6.2`: `git diff 0.6.2 0.6.2-syn.6` on the service, repository, model
 and route files is empty.
@@ -447,12 +447,18 @@ fall under D-09.
 
 ### 5.2 Flow
 
+<!-- depends: D-04, D-06, D-11, INV-01, INV-03, INV-04 -->
 `refresh_token` and `revoke_token` each read the presented row unlocked, branch on `token_type`
 (D-04), and in the SDK branch run INV-01 or INV-03 as one transaction under D-06's lock. The mint
 route takes the same lock, then runs D-11's revocation and the insert in one transaction. The
-repository gains one method per transaction. The commit-per-call helpers
-(`backend/app/repositories/refresh_token_repository.py:20`,
-`backend/app/repositories/refresh_token_repository.py:42`) remain for developer tokens.
+repository gains the SDK paths' reads, lock and writes as methods that do NOT commit, so the service
+can compose them under one lock while INV-01's branch stays out of the repository
+(`backend/AGENTS.md:270`). Each SDK transaction is closed by exactly one commit: `create` or
+`revoke_token` issues it on a path that writes, and the service issues it directly on a path that
+writes nothing — INV-04's grace re-issue and the 401/404 exits. The commit-per-call helpers
+(`backend/app/repositories/refresh_token_repository.py:21`,
+`backend/app/repositories/refresh_token_repository.py:43`) are unchanged; they serve developer
+tokens and each SDK path's final write.
 
 <!-- depends: D-06, D-08, INV-01 -->
 **Deadlock with user deletion.** `DELETE /users/{id}` (`backend/app/api/routes/v1/users.py:62`)
@@ -618,3 +624,4 @@ such chains sooner in practice.
 | --- | --- | --- | --- |
 | 2026-09-11 | Initial draft, revised in the same session before acceptance. Final shape follows an independent analysis: successor link on the successor row (`rotated_from`, unique); token-type branch before any lock; `log_structured` at INFO; validated grace setting; D-11 added on Dragan's "one phone per account"; the two-successor forks reclassified as hygiene, not cause; upstream reporting removed. Design-review round 2: row locks replaced by one per-`(user, app)` advisory lock so a mint cannot miss a concurrently inserted successor; D-08 defines the 500 path and the deleted-between-reads path. Design-review round 3 corrected claims only, with no change to design behaviour: concurrency test interleaving pinned; user-delete overlap outcomes completed. | semantic (round 2, before acceptance) | — |
 | 2026-09-12 | Corrected a false claim about rollback, with no change to any decision, invariant or predicate. §5.1 said an image rollback was safe; it is not sufficient on its own, because the old image's `alembic upgrade head` cannot locate `7c3e9a41d2b8` and aborts under `set -e` (`backend/scripts/start/app.sh:10`), leaving the rolled-back revision unhealthy. D-10's consequence corrected to match, and §5.5 gained the rollback procedure — `alembic downgrade 9f0940493a9b` from the new image first, then the image roll — with its consequence: dropping the column nulls every link, so a client mid-grace then falls under D-09 and needs one reconnect. | additive | — |
+| 2026-09-12 | §5.2 corrected to describe the shipped repository split, and the two commit-per-call citations in §1 and §5.2 moved from `:20`/`:42` to `:21`/`:43` (an import line added by the same commit). The previous wording, "the repository gains one method per transaction", read literally puts INV-01's branch (revoked → successor → grace) inside a repository method, which `backend/AGENTS.md:270` forbids. Raised by review of the implementation (PR #20). No decision, invariant, predicate, acceptance set or observable behaviour changes. | additive | — |
