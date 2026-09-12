@@ -28,6 +28,11 @@ def create_user_token(
 
     Both methods return access_token with refresh_token.
 
+    One live device per (user, app): issuing a token revokes every refresh token still live
+    for that user and application. Calling this again — including a provisioning retry —
+    disconnects the device currently holding a token, which must re-authenticate to resume
+    syncing. Developer tokens are unaffected.
+
     Returns a JWT token scoped to SDK endpoints only.
     Tokens expire after configured time (default: 60 minutes).
 
