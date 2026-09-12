@@ -17,8 +17,10 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.integrations.celery.tasks.emit_webhook_event_task import emit_webhook_event
 from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEventType
+from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.events import (
     SVIX_MAX_SAMPLES_PER_EVENT,
     _dispatch,
@@ -252,6 +254,27 @@ class TestWebhookEmit:
 
 
 # ---------------------------------------------------------------------------
+# Svix payload retention
+# ---------------------------------------------------------------------------
+
+
+class TestSvixPayloadRetention:
+    def test_send_sets_payload_retention_period(self) -> None:
+        """Every emitted message must carry an explicit retention window."""
+        mock_client = MagicMock()
+        with patch.object(svix_service, "_client", mock_client):
+            svix_service.send("workout.created", str(uuid4()), {"data": {}})
+
+        message_in = mock_client.message.create.call_args[0][1]
+        assert message_in.payload_retention_period == settings.svix_payload_retention_days
+
+    def test_default_retention_is_the_platform_floor(self) -> None:
+        # svix-server rejects anything below 5 days with a 422, and accepts but silently
+        # ignores payloadRetentionHours, so 5 days is the shortest retention it will honour.
+        assert settings.svix_payload_retention_days == 5
+
+
+# ---------------------------------------------------------------------------
 # emit_webhook_event Celery task (unit, Svix mocked)
 # ---------------------------------------------------------------------------
 
@@ -259,7 +282,7 @@ class TestWebhookEmit:
 class TestEmitWebhookEventTask:
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.svix_service")
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.developer_service")
-    def test_sends_to_all_developers(
+    def test_sends_to_developers_with_endpoints(
         self,
         mock_dev_service: MagicMock,
         mock_svix: MagicMock,
@@ -267,6 +290,7 @@ class TestEmitWebhookEventTask:
         dev1 = MagicMock(id=uuid4(), email="dev1@test.com")
         dev2 = MagicMock(id=uuid4(), email="dev2@test.com")
         mock_dev_service.crud.get_all.return_value = [dev1, dev2]
+        mock_svix.has_endpoints.return_value = True
         mock_svix.send.return_value = MagicMock(id="msg_123")
 
         result = emit_webhook_event(
@@ -275,8 +299,33 @@ class TestEmitWebhookEventTask:
         )
 
         assert result["sent"] == 2
-        assert mock_svix.ensure_application.call_count == 2
+        assert result["skipped"] == 0
         assert mock_svix.send.call_count == 2
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.svix_service")
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.developer_service")
+    def test_skips_developers_without_endpoints(
+        self,
+        mock_dev_service: MagicMock,
+        mock_svix: MagicMock,
+    ) -> None:
+        with_ep = MagicMock(id=uuid4(), email="with@test.com")
+        without_ep = MagicMock(id=uuid4(), email="without@test.com")
+        mock_dev_service.crud.get_all.return_value = [with_ep, without_ep]
+        mock_svix.has_endpoints.side_effect = lambda app_id: app_id == str(with_ep.id)
+        mock_svix.send.return_value = MagicMock(id="msg_123")
+
+        result = emit_webhook_event(
+            "workout.created",
+            {"type": "workout.created", "data": {}},
+        )
+
+        assert result["sent"] == 1
+        assert result["skipped"] == 1
+        assert mock_svix.send.call_count == 1
+        assert mock_svix.send.call_args[0][1] == str(with_ep.id)
+        # No Svix application is created for an account that never registered an endpoint.
+        assert mock_svix.ensure_application.call_count == 0
 
 
 # ---------------------------------------------------------------------------

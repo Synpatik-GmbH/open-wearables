@@ -166,6 +166,7 @@ def send(
                 payload=payload,
                 event_id=idempotency_key,
                 channels=channels or None,
+                payload_retention_period=settings.svix_payload_retention_days,
             ),
         )
     except httpx.ConnectError:
@@ -223,6 +224,34 @@ def create_endpoint(
 def list_endpoints(app_id: str) -> ListResponseEndpointOut:
     assert _client is not None
     return _client.endpoint.list(app_id)
+
+
+def has_endpoints(app_id: str) -> bool:
+    """Return True when the developer's Svix application has at least one endpoint.
+
+    The emit task uses this to skip developers who never registered an endpoint,
+    so no payload is stored for an application that could not deliver it anyway.
+    A 404 means the application was never created, which implies no endpoint.
+    On any other failure we fall back to the previous behaviour and let
+    :func:`send` run, so a lookup outage never silently discards an event.
+    """
+    if not is_enabled():
+        return False
+    assert _client is not None
+    try:
+        return bool(_client.endpoint.list(app_id).data)
+    except httpx.ConnectError:
+        # Same contract as send(): when Svix is unreachable nothing can be delivered.
+        logger.warning("Svix server unreachable — skipping endpoint lookup for app=%s", app_id)
+        return False
+    except HttpError as exc:
+        if exc.status_code == 404:
+            return False
+        logger.exception("Failed to list endpoints for app=%s; assuming it has endpoints", app_id)
+        return True
+    except Exception:
+        logger.exception("Failed to list endpoints for app=%s; assuming it has endpoints", app_id)
+        return True
 
 
 def get_endpoint(app_id: str, endpoint_id: str) -> EndpointOut:
@@ -330,6 +359,7 @@ def send_test_message(app_id: str, endpoint_id: str, event_type: str) -> Message
                 event_type=event_type,
                 payload=get_test_payload(event_type),
                 event_id=f"test.{endpoint_id}.{event_type}",
+                payload_retention_period=settings.svix_payload_retention_days,
             ),
         )
     except Exception:
