@@ -249,6 +249,18 @@ class Settings(BaseSettings):
     def webhook_priority_event_set(self) -> frozenset[str]:
         return frozenset(e.strip() for e in self.webhook_priority_events.split(",") if e.strip())
 
+    # Key for the HMAC applied to the Svix event id.  Derived from secret_key if not set.
+    # Rotating it changes every future digest, so events already in Svix stop deduplicating
+    # against new ones.  That only matters within the Celery retry window, but rotate
+    # deliberately rather than incidentally.
+    svix_event_id_secret: SecretStr | None = None
+
+    @model_validator(mode="after")
+    def derive_svix_event_id_secret(self) -> "Settings":
+        if self.svix_event_id_secret is None or self.svix_event_id_secret.get_secret_value() == "":
+            self.svix_event_id_secret = SecretStr(self.secret_key)
+        return self
+
     @model_validator(mode="after")
     def derive_svix_jwt_secret(self) -> "Settings":
         if self.svix_jwt_secret is None or self.svix_jwt_secret.get_secret_value() == "":

@@ -10,6 +10,8 @@ Responsibilities:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 from typing import Any
 from uuid import UUID
@@ -51,6 +53,28 @@ _SVIX_ORG_ID = "org_openwearables"
 # An endpoint with channels=["user.X"] receives only messages for user X.
 # Svix allows up to 5 channels per message; we always send exactly one.
 _USER_CHANNEL_PREFIX = "user."
+
+
+def _hash_event_id(raw: str | None) -> str | None:
+    """Return a keyed digest of the event id, or None when the caller supplied none.
+
+    The event id is hashed because the readable form embedded a user identifier, provider,
+    metric and an ingestion window in a table that has no expiry on the deployed server
+    version.
+
+    The digest is deterministic for a given secret and a given input, so the same logical
+    event still collides in Svix and is still rejected with a 409, which is what keeps the
+    Celery retry in :func:`send` from double-sending.  Hex output satisfies the Svix
+    eventId constraints (``^[a-zA-Z0-9\\-_.]+$``, max 256 characters).
+    """
+    if raw is None:
+        return None
+    assert settings.svix_event_id_secret is not None  # derived from secret_key at startup
+    return hmac.new(
+        settings.svix_event_id_secret.get_secret_value().encode(),
+        raw.encode(),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _user_channels(user_id: UUID | None) -> list[str] | None:
@@ -159,13 +183,14 @@ def send(
         return None
     assert _client is not None
     app_id = str(developer_id)
+    event_id = _hash_event_id(idempotency_key)
     try:
         return _client.message.create(
             app_id,
             MessageIn(
                 event_type=event_type,
                 payload=payload,
-                event_id=idempotency_key,
+                event_id=event_id,
                 channels=channels or None,
                 payload_retention_period=settings.svix_payload_retention_days,
             ),
@@ -181,9 +206,11 @@ def send(
         if exc.status_code == 409:
             # Svix deduplication: the same event_id was already delivered.
             # Treat as success so the Celery task does not retry.
+            # Log the digest, not the readable key, so the identifiers this change removes
+            # from Svix are not reintroduced through the log.
             logger.debug(
                 "Svix duplicate event_id=%s already delivered (409), skipping",
-                idempotency_key,
+                event_id,
             )
             return True  # ty:ignore[invalid-return-type]
         logger.exception("Failed to send webhook event=%s to app=%s", event_type, app_id)
@@ -367,7 +394,7 @@ def send_test_message(app_id: str, endpoint_id: str, event_type: str) -> Message
             MessageIn(
                 event_type=event_type,
                 payload=get_test_payload(event_type),
-                event_id=f"test.{endpoint_id}.{event_type}",
+                event_id=_hash_event_id(f"test.{endpoint_id}.{event_type}"),
                 payload_retention_period=settings.svix_payload_retention_days,
             ),
         )

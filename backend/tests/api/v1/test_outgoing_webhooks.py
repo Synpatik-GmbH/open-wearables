@@ -9,6 +9,7 @@ Covers:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -345,6 +346,52 @@ class TestHasEndpoints:
         assert result["skipped"] == 0
         assert result["sent"] == 1
         assert client.message.create.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Svix event id hashing
+# ---------------------------------------------------------------------------
+
+
+class TestSvixEventIdHashing:
+    # The readable form was e.g.
+    # "timeseries.<user-uuid>.apple.heart_rate.2026-09-12T12_37_09_00_00.<...>.series.heart_rate.created"
+    RAW = (
+        "timeseries.11de240a-4e95-4eed-ae00-983f34dcbd3b.apple.heart_rate"
+        ".2026-09-12T12_37_09_00_00.2026-09-12T12_57_13_00_00.series.heart_rate.created"
+    )
+
+    def test_digest_is_deterministic(self) -> None:
+        """Dedup depends on the same logical event producing the same id every time."""
+        assert svix_service._hash_event_id(self.RAW) == svix_service._hash_event_id(self.RAW)
+
+    def test_different_events_differ(self) -> None:
+        assert svix_service._hash_event_id("sleep.created.a") != svix_service._hash_event_id("sleep.created.b")
+
+    def test_none_passes_through(self) -> None:
+        """Callers that supply no idempotency key must not get one invented."""
+        assert svix_service._hash_event_id(None) is None
+
+    def test_digest_carries_no_identifiers(self) -> None:
+        digest = svix_service._hash_event_id(self.RAW)
+        assert digest is not None
+        for leaked in ("11de240a", "apple", "heart_rate", "2026-09-12", "timeseries"):
+            assert leaked not in digest
+
+    def test_digest_satisfies_svix_event_id_constraints(self) -> None:
+        digest = svix_service._hash_event_id(self.RAW)
+        assert digest is not None
+        assert re.fullmatch(r"[a-zA-Z0-9\-_.]+", digest)
+        assert 1 <= len(digest) <= 256
+
+    def test_send_hashes_the_idempotency_key(self) -> None:
+        mock_client = MagicMock()
+        with patch.object(svix_service, "_client", mock_client):
+            svix_service.send("workout.created", str(uuid4()), {"data": {}}, idempotency_key=self.RAW)
+
+        message_in = mock_client.message.create.call_args[0][1]
+        assert message_in.event_id == svix_service._hash_event_id(self.RAW)
+        assert self.RAW not in (message_in.event_id or "")
 
 
 # ---------------------------------------------------------------------------
