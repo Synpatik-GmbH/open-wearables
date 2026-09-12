@@ -37,6 +37,7 @@ def test_literals_agree_with_the_committed_query() -> None:
     reason_clause = re.search(r"reason in \(([^)]*)\)", KQL)
     assert reason_clause is not None
     kql_reasons = set(re.findall(r"'([a-z_]+)'", reason_clause.group(1)))
+    assert "unknown" not in kql_reasons  # §5.6: the filter leaves `unknown` out, with or without a user_id
 
     assert kql_actions == {
         REFRESH_ACTION_ROTATED,

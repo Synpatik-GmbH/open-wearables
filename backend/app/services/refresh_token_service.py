@@ -21,7 +21,18 @@ from app.utils.structured_logging import log_structured
 REFRESH_ACTION_ROTATED = "refresh_token_rotated"
 REFRESH_ACTION_GRACE_REISSUED = "refresh_token_grace_reissued"
 REFRESH_ACTION_REJECTED = "refresh_token_rejected"
-REFRESH_REJECT_REASONS: tuple[str, ...] = ("unknown", "revoked", "rotated_successor_used", "rotated_past_grace")
+REFRESH_REASON_UNKNOWN = "unknown"
+REFRESH_REASON_REVOKED = "revoked"
+REFRESH_REASON_SUCCESSOR_USED = "rotated_successor_used"
+REFRESH_REASON_PAST_GRACE = "rotated_past_grace"
+# Built from the names above, and every rejection emits through those same names: the emitted set and
+# this tuple are one thing, so a reason the committed query does not know cannot be added silently.
+REFRESH_REJECT_REASONS: tuple[str, ...] = (
+    REFRESH_REASON_UNKNOWN,
+    REFRESH_REASON_REVOKED,
+    REFRESH_REASON_SUCCESSOR_USED,
+    REFRESH_REASON_PAST_GRACE,
+)
 
 
 class RefreshTokenService:
@@ -171,7 +182,7 @@ class RefreshTokenService:
         """
         first_read = self._read_fresh(db_session, refresh_token_str)
         if first_read is None:
-            self._log_refresh(REFRESH_ACTION_REJECTED, reason="unknown")
+            self._log_refresh(REFRESH_ACTION_REJECTED, reason=REFRESH_REASON_UNKNOWN)
             raise self._unauthorized()
         if first_read.token_type != TokenType.SDK:
             return self._refresh_non_sdk(db_session, refresh_token_str)
@@ -186,7 +197,12 @@ class RefreshTokenService:
         token = self._read_fresh(db_session, token_id)
         if token is None:
             db_session.commit()  # nothing written; ends the transaction, releasing the lock
-            self._log_refresh(REFRESH_ACTION_REJECTED, reason="unknown", user_id=user_id, token_type=TokenType.SDK)
+            self._log_refresh(
+                REFRESH_ACTION_REJECTED,
+                reason=REFRESH_REASON_UNKNOWN,
+                user_id=user_id,
+                token_type=TokenType.SDK,
+            )
             raise self._unauthorized()
         if token.revoked_at is None:
             token.revoked_at = self._now()
@@ -203,11 +219,11 @@ class RefreshTokenService:
         successor = self._read_successor(db_session, token_id)
         rotated_age = self._now() - token.revoked_at
         if successor is None:
-            reason = "revoked"
+            reason = REFRESH_REASON_REVOKED
         elif successor.revoked_at is not None:
-            reason = "rotated_successor_used"
+            reason = REFRESH_REASON_SUCCESSOR_USED
         elif rotated_age > timedelta(seconds=settings.sdk_refresh_grace_seconds):
-            reason = "rotated_past_grace"
+            reason = REFRESH_REASON_PAST_GRACE
         else:
             successor_id = successor.id
             db_session.commit()  # grace writes nothing (INV-04); ends the transaction, releasing the lock
