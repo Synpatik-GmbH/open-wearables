@@ -315,8 +315,9 @@ to another's holder.
 calibra-ow-deploy `.github/workflows/deploy-openwearables.yml`. A push to that repo's `main` deploys
 dev. Nothing is reported upstream.
 
-**Consequences.** The migration (§5.1) runs at API start (`backend/scripts/start/app.sh:10`); rollback
-is an image rollback.
+**Consequences.** The migration (§5.1) runs at API start (`backend/scripts/start/app.sh:10`); rolling
+back is not an image rollback alone — the Alembic downgrade has to run from the new image first
+(§5.1), by the procedure in §5.5.
 
 ### D-11 — A fresh mint revokes the user's earlier SDK chains for the same app
 
@@ -436,8 +437,13 @@ A set link always points at an existing row. No code in `backend/app` deletes re
 `backend/app/mappings.py:42`, which takes predecessor and successor together.
 
 <!-- depends: D-09, D-10, INV-01 -->
-The column is nullable and the current code ignores it, so rolling the image back is safe. Rows
-written during a rollback carry no link and fall under D-09.
+The column is nullable and the current code ignores it, so an older image reads and writes the table
+correctly. Rolling the image back is nevertheless not safe on its own: migrations run at API start
+under `set -e` (`backend/scripts/start/app.sh:10`), and the previous image's Alembic cannot locate
+revision `7c3e9a41d2b8`, so `alembic upgrade head` fails, the start script aborts, and the
+rolled-back revision never becomes healthy. A rollback runs the Alembic downgrade from the new image
+first; the procedure and its consequence are §5.5. Rows written during a rollback carry no link and
+fall under D-09.
 
 ### 5.2 Flow
 
@@ -544,6 +550,12 @@ Per D-10:
    - a reconnect from the app leaves exactly one live SDK token for that user and app;
    - after the two internal test users (`11de240a`, `541f2130`) have each had one successful refresh
      post-deploy, the §5.6 query returns no row for either.
+5. To roll back, in this order: run `alembic downgrade 9f0940493a9b` from the current (new) image
+   **first**, then point `OW_REF` back. The reverse order does not work — the old image's
+   `alembic upgrade head` cannot locate `7c3e9a41d2b8` and its start script aborts (§5.1), so the
+   rolled-back revision never becomes healthy. The downgrade drops `rotated_from`, which nulls every
+   link, so a client mid-grace at that moment falls under D-09 and needs one reconnect: the pre-fix
+   state, not worse.
 
 ### 5.6 The consumer query
 
@@ -605,3 +617,4 @@ such chains sooner in practice.
 | Date | Change | Type | Sweep report |
 | --- | --- | --- | --- |
 | 2026-09-11 | Initial draft, revised in the same session before acceptance. Final shape follows an independent analysis: successor link on the successor row (`rotated_from`, unique); token-type branch before any lock; `log_structured` at INFO; validated grace setting; D-11 added on Dragan's "one phone per account"; the two-successor forks reclassified as hygiene, not cause; upstream reporting removed. Design-review round 2: row locks replaced by one per-`(user, app)` advisory lock so a mint cannot miss a concurrently inserted successor; D-08 defines the 500 path and the deleted-between-reads path. Design-review round 3 corrected claims only, with no change to design behaviour: concurrency test interleaving pinned; user-delete overlap outcomes completed. | semantic (round 2, before acceptance) | — |
+| 2026-09-12 | Corrected a false claim about rollback, with no change to any decision, invariant or predicate. §5.1 said an image rollback was safe; it is not sufficient on its own, because the old image's `alembic upgrade head` cannot locate `7c3e9a41d2b8` and aborts under `set -e` (`backend/scripts/start/app.sh:10`), leaving the rolled-back revision unhealthy. D-10's consequence corrected to match, and §5.5 gained the rollback procedure — `alembic downgrade 9f0940493a9b` from the new image first, then the image roll — with its consequence: dropping the column nulls every link, so a client mid-grace then falls under D-09 and needs one reconnect. | additive | — |

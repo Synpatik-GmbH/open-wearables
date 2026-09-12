@@ -115,7 +115,9 @@ def test_revoke_waits_for_a_concurrent_rotation_and_reaches_the_successor(
 
     assert "error" not in result_a, result_a.get("error")
     assert "error" not in result_b, result_b.get("error")
-    assert all(r.revoked_at is not None for r in sdk_rows(session_factory, committed_user))
+    rows = sdk_rows(session_factory, committed_user)
+    assert len(rows) == 2, rows  # T0 and T1 (fork spec §5.4); an empty or one-row list must not pass
+    assert all(r.revoked_at is not None for r in rows)
 
 
 def test_mint_waits_for_a_concurrent_rotation_and_leaves_only_its_own_token_live(
