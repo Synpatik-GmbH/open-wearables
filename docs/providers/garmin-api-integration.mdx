@@ -159,7 +159,7 @@ Once you get access to the Developer Portal, you’ll find the full docs, includ
     deregistrations
     ```
 
-    This is the accept set Open Wearables declares in `supported_event_types()` at `backend/app/services/providers/garmin/webhook_handler.py:334`, minus `mct`. Anything Garmin pushes outside this set is not processed.
+    This is `WELLNESS_TYPES` in `backend/app/services/providers/garmin/webhook_handler.py`, minus `mct`, plus the three types handled outside that list: `activities`, `userPermissionsChange` and `deregistrations`. `WELLNESS_TYPES` is the list the wellness processing loop iterates, so it is what actually gates ingestion. Anything Garmin pushes that is neither in it nor one of those three is not processed.
 
     These are internal names, so if a row on Garmin’s page is labelled differently — `userPermissionsChange` and `deregistrations` especially — match it by meaning and enable the equivalent row, with the sole exception of `mct`, which stays off whatever Garmin calls it.
 
