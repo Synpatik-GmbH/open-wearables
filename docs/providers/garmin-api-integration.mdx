@@ -166,7 +166,7 @@ Once you get access to the Developer Portal, you’ll find the full docs, includ
     <Warning>
     **Why `mct` (Menstrual Cycle Tracking) is left off by default.**
 
-    **Every endpoint in the list above also carries data concerning health.** Sleep, HRV, stress, respiration, blood pressure and the rest are special categories of personal data under **Art. 9 GDPR**. Processing any of them needs your deployment's own lawful basis and compliance assessment — this list does not establish one, and enabling only these endpoints does not make a deployment compliant.
+    **Every data endpoint in the list above also carries data concerning health.** Sleep, HRV, stress, respiration, blood pressure, activity and the rest are special categories of personal data under **Art. 9 GDPR**; the two lifecycle notifications, `userPermissionsChange` and `deregistrations`, carry only a Garmin user id with its permission or revocation state. Processing the health data needs your deployment's own lawful basis and compliance assessment — this list does not establish one, and enabling only these endpoints does not make a deployment compliant.
 
     `mct` is left out on **purpose limitation and data minimisation**, not because the other endpoints are exempt: menstrual cycle and pregnancy data is a further, more intimate category that a deployment should process only if its purpose requires it.
 
