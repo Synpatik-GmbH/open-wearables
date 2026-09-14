@@ -1,0 +1,46 @@
+---
+title: "Pseudonymise Svix User Channels"
+sidebarTitle: "Svix User Channels"
+description: "Moves outgoing-webhook endpoints scoped to a user off the readable user channel, so they keep receiving events after pseudonymous channels ship."
+keywords: ["svix", "webhooks", "channels", "pseudonymisation", "data migration"]
+"og:title": "Pseudonymise Svix User Channels | Open Wearables"
+"og:description": "Moves Svix endpoints scoped to a user off the readable user channel."
+"og:url": "https://docs.openwearables.io/data-migrations/pseudonymise-svix-user-channels"
+"og:type": "article"
+---
+
+**Script:** `scripts/data_migrations/pseudonymise_svix_user_channels.py`
+
+## Problem
+
+Outgoing webhook messages used to be tagged with a readable `user.<user-id>` channel, which Svix stores permanently. Messages now carry an opaque, per-user channel instead. An endpoint scoped to a user **before** that change still filters on the readable channel, which no new message carries, so it receives nothing — while the endpoints API still reports its `user_id`.
+
+## What it does
+
+Pages through every Svix application and endpoint and rewrites each channel still in the readable `user.<uuid>` form to the opaque form. Endpoints that are unscoped, already opaque, on a non-user channel, or on a channel under a previous `SVIX_PSEUDONYM_SECRET` are left untouched. It is idempotent: a rerun migrates only what is still readable.
+
+It writes to **Svix**, not to the Open Wearables database. Svix applies a changed endpoint after refreshing its cached configuration, so events sent in the moments right after the run may still use the old filter.
+
+## Usage
+
+```bash
+# Count endpoints still on the readable channel
+docker compose exec app uv run python scripts/data_migrations/pseudonymise_svix_user_channels.py --dry-run
+
+# Migrate them
+docker compose exec app uv run python scripts/data_migrations/pseudonymise_svix_user_channels.py
+```
+
+## Options
+
+| Flag | Description |
+|---|---|
+| `--dry-run` | Count legacy endpoints without changing them. |
+
+## Output and exit code
+
+```
+Svix user-channel migration (applied): applications: 1, endpoints: 3, legacy: 0, migrated: 0
+```
+
+Exit `0` means the run completed; `legacy: 0` means nothing needed migrating. Exit `1` means Svix is not configured or a request failed — endpoints already migrated stay migrated, so rerun the script.

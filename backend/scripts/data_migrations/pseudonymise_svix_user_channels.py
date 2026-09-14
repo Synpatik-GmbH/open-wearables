@@ -5,9 +5,9 @@ Run ONCE per environment after deploying pseudonymous user channels. An endpoint
 before that deploy filters on the readable channel, which no message carries any more, so it
 receives nothing until migrated. Idempotent: a rerun migrates only what is still readable.
 
-Usage:
-    uv run python scripts/data_migrations/pseudonymise_svix_user_channels.py --dry-run
-    uv run python scripts/data_migrations/pseudonymise_svix_user_channels.py
+Usage (inside Docker):
+    docker compose exec app uv run python scripts/data_migrations/pseudonymise_svix_user_channels.py --dry-run
+    docker compose exec app uv run python scripts/data_migrations/pseudonymise_svix_user_channels.py
 
 Exit 0 with the counts when the run completed (``legacy: 0`` means nothing needed migrating).
 Exit 1 when Svix is not configured or any request failed; nothing is lost, rerun it.
@@ -25,13 +25,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if not svix_service.is_enabled():
-        print("Svix is not configured (set SVIX_JWT_SECRET or SVIX_AUTH_TOKEN); nothing was checked.")
+        print("Svix is not configured (set SVIX_JWT_SECRET or SVIX_AUTH_TOKEN); nothing was checked.", file=sys.stderr)
         return 1
 
     try:
         result = svix_service.migrate_legacy_user_channels(dry_run=args.dry_run)
     except Exception as exc:
-        print(f"FAILED: {type(exc).__name__}: {exc}. Endpoints already migrated stay migrated; rerun the script.")
+        print(
+            f"FAILED: {type(exc).__name__}: {exc}. Endpoints already migrated stay migrated; rerun the script.",
+            file=sys.stderr,
+        )
         return 1
 
     mode = "dry run — nothing changed" if args.dry_run else "applied"

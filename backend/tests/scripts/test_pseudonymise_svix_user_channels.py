@@ -61,7 +61,7 @@ def test_a_svix_failure_exits_non_zero(capsys: pytest.CaptureFixture[str]) -> No
         patch.object(script.svix_service, "migrate_legacy_user_channels", side_effect=httpx.ConnectError("svix down")),
     ):
         assert script.main([]) == 1
-    assert "rerun" in capsys.readouterr().out.lower()
+    assert "rerun" in capsys.readouterr().err.lower()
 
 
 def test_svix_not_configured_exits_non_zero() -> None:

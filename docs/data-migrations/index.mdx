@@ -52,5 +52,5 @@ docker compose exec app uv run python scripts/data_migrations/<script_name>.py
 ```
 
 <Warning>
-Scripts write directly to the database. There is no automatic rollback. Take a database snapshot before running against production.
+Scripts write directly to the database (the Svix user-channel migration writes to Svix instead). There is no automatic rollback. Take a database snapshot before running against production.
 </Warning>

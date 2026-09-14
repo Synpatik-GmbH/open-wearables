@@ -123,6 +123,7 @@
               "data-migrations/backfill-garmin-sleep-end-datetime",
               "data-migrations/backfill-sleep-scores",
               "data-migrations/normalize-body-fat-percentage",
+              "data-migrations/pseudonymise-svix-user-channels",
               "data-migrations/relabel-oura-hrv-sdnn-to-rmssd"
             ]
           },
