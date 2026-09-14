@@ -90,9 +90,10 @@ class TestEventId:
 
 
 class TestKeySeparation:
-    """The pseudonym secret must not be the JWT signing key, and the two pseudonyms must not share
-    a key: event-id digests are returned to API callers, so under a shared key they would be HMAC
-    outputs of the key that signs every access token."""
+    """The pseudonym secret must not be the JWT signing key: event-id digests are returned to API
+    callers, so under that key they would be HMAC outputs of the key that signs every access token.
+    (The event-id and channel keys are derived under distinct contexts and hash functions; that
+    separation is by construction and not pinned by a test here.)"""
 
     def test_default_secret_is_derived_and_is_not_secret_key(self) -> None:
         s = Settings(secret_key="the-jwt-signing-key")

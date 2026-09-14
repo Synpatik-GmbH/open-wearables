@@ -466,7 +466,7 @@ Omit the field entirely to receive all event types.
 Pass `user_id` to scope an endpoint to events for a single user. All other users' events are silently dropped before delivery.
 
 <Note>
-Open Wearables never gives Svix a readable user id. Each message's user channel is stored in Svix as an opaque, per-user token, and the endpoints and messages APIs translate it back, so you keep seeing `user_id` and `user.<uuid>` channels in responses. An endpoint created with a `user_id` before this change keeps reporting its filter; save its `user_id` again to move it to the opaque form, which is what new messages carry. The change reaches delivery only after Svix refreshes its cached endpoint configuration, so events sent immediately after the save may still use the old filter (in a local svix-server v1.69.0 test, an event sent 40 seconds later was routed correctly).
+Open Wearables never gives Svix a readable user id. Each message's user channel is stored in Svix as an opaque, per-user token, and the endpoints and messages APIs translate it back, so you keep seeing `user_id` and `user.<uuid>` channels in responses. Endpoints scoped to a user before this change are moved to the opaque form automatically when the API starts, so their filter keeps matching new messages. Svix applies a changed endpoint only after refreshing its cached configuration, so an event sent in the moments right after startup may still be routed by the old filter.
 </Note>
 
 ```bash
@@ -563,7 +563,7 @@ The `eventId` returned by `GET /api/v1/webhooks/messages` and by endpoint attemp
 **Two situations deliver a logical event a second time**, with a new `svix-id`, so deduplicate on your own data as well as on `svix-id`:
 
 - **Upgrading to pseudonymous event ids.** An event first sent under the old readable id is not recognised when the same logical event is sent again after the upgrade, so it is delivered once more.
-- **Rotating `SVIX_PSEUDONYM_SECRET`.** Every digest changes, so events sent before the rotation stop deduplicating against new ones. Rotation also changes every user channel: an endpoint scoped to a user receives nothing until its `user_id` is saved again. Set the secret explicitly before the first event in production, and rotate it only deliberately.
+- **Rotating `SVIX_PSEUDONYM_SECRET`.** Every digest changes, so events sent before the rotation stop deduplicating against new ones. Rotation also changes every user channel: an endpoint scoped to a user receives nothing, and reports `user_id` as `null` as if it were unscoped, until its `user_id` is saved again. Set the secret explicitly before the first event in production, and rotate it only deliberately.
 </Warning>
 
 ---
