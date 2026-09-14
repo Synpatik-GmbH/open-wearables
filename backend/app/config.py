@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import warnings
 from datetime import timedelta
 from functools import lru_cache
@@ -249,16 +251,22 @@ class Settings(BaseSettings):
     def webhook_priority_event_set(self) -> frozenset[str]:
         return frozenset(e.strip() for e in self.webhook_priority_events.split(",") if e.strip())
 
-    # Key for the HMAC applied to the Svix event id.  Derived from secret_key if not set.
-    # Rotating it changes every future digest, so events already in Svix stop deduplicating
-    # against new ones.  That only matters within the Celery retry window, but rotate
-    # deliberately rather than incidentally.
-    svix_event_id_secret: SecretStr | None = None
+    # Root secret for the pseudonyms written into Svix: the event-id digest and the user channel
+    # (see app/services/outgoing_webhooks/pseudonyms.py).  When unset it is DERIVED from
+    # secret_key under a fixed context — never equal to it, because event-id digests are returned
+    # to API callers and must not be HMAC outputs of the key that signs access tokens.
+    # Set it explicitly in production before the first event.  Rotating it changes every
+    # pseudonym: events already in Svix stop deduplicating against new ones, and an endpoint
+    # filtered on a user stops receiving until its user_id is saved again.
+    svix_pseudonym_secret: SecretStr | None = None
 
     @model_validator(mode="after")
-    def derive_svix_event_id_secret(self) -> "Settings":
-        if self.svix_event_id_secret is None or self.svix_event_id_secret.get_secret_value() == "":
-            self.svix_event_id_secret = SecretStr(self.secret_key)
+    def derive_svix_pseudonym_secret(self) -> "Settings":
+        if self.svix_pseudonym_secret is None or self.svix_pseudonym_secret.get_secret_value() == "":
+            derived = hmac.new(
+                self.secret_key.encode(), b"open-wearables/svix/pseudonym-secret/v1", hashlib.sha256
+            ).hexdigest()
+            self.svix_pseudonym_secret = SecretStr(derived)
         return self
 
     @model_validator(mode="after")

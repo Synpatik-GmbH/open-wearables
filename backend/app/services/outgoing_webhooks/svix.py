@@ -10,8 +10,6 @@ Responsibilities:
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import logging
 from typing import Any
 from uuid import UUID
@@ -40,6 +38,7 @@ from svix.api.errors.http_error import HttpError
 from app.config import settings
 from app.constants.webhooks.test_payloads import get_test_payload
 from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEventType
+from app.services.outgoing_webhooks import pseudonyms
 from app.utils.sentry_helpers import log_and_capture_error
 
 logger = logging.getLogger(__name__)
@@ -47,40 +46,11 @@ logger = logging.getLogger(__name__)
 # Fixed org UID used for this self-hosted instance.
 _SVIX_ORG_ID = "org_openwearables"
 
-# Svix channel prefix used to scope messages and endpoint subscriptions per user.
-# Each emitted message is tagged with "user.{user_id}".
+# Svix channels scope messages and endpoint subscriptions per user.  Each emitted message is
+# tagged with the user's pseudonymous channel (pseudonyms.user_channel), never a readable id.
 # An endpoint without a channel filter receives ALL messages (all users).
-# An endpoint with channels=["user.X"] receives only messages for user X.
+# An endpoint with the user's channel receives only messages for that user.
 # Svix allows up to 5 channels per message; we always send exactly one.
-_USER_CHANNEL_PREFIX = "user."
-
-
-def _hash_event_id(raw: str | None) -> str | None:
-    """Return a keyed digest of the event id, or None when the caller supplied none.
-
-    The event id is hashed because the readable form embedded a user identifier, provider,
-    metric and an ingestion window in a table that has no expiry on the deployed server
-    version.
-
-    The digest is deterministic for a given secret and a given input, so the same logical
-    event still collides in Svix and is still rejected with a 409, which is what keeps the
-    Celery retry in :func:`send` from double-sending.  Hex output satisfies the Svix
-    eventId constraints (``^[a-zA-Z0-9\\-_.]+$``, max 256 characters).
-    """
-    if raw is None:
-        return None
-    assert settings.svix_event_id_secret is not None  # derived from secret_key at startup
-    return hmac.new(
-        settings.svix_event_id_secret.get_secret_value().encode(),
-        raw.encode(),
-        hashlib.sha256,
-    ).hexdigest()
-
-
-def _user_channels(user_id: UUID | None) -> list[str] | None:
-    if user_id is None:
-        return None
-    return [f"{_USER_CHANNEL_PREFIX}{user_id}"]
 
 
 def user_id_from_endpoint(ep: EndpointOut) -> UUID | None:
@@ -88,11 +58,9 @@ def user_id_from_endpoint(ep: EndpointOut) -> UUID | None:
     if not ep.channels:
         return None
     for ch in ep.channels:
-        if ch.startswith(_USER_CHANNEL_PREFIX):
-            try:
-                return UUID(ch[len(_USER_CHANNEL_PREFIX) :])
-            except ValueError:
-                pass
+        user_id = pseudonyms.user_id_from_channel(ch)
+        if user_id is not None:
+            return user_id
     return None
 
 
@@ -183,7 +151,7 @@ def send(
         return None
     assert _client is not None
     app_id = str(developer_id)
-    event_id = _hash_event_id(idempotency_key)
+    event_id = pseudonyms.hash_event_id(idempotency_key)
     try:
         return _client.message.create(
             app_id,
@@ -240,7 +208,7 @@ def create_endpoint(
     }
     if filter_types is not None:
         endpoint_data["filter_types"] = filter_types
-    channels = _user_channels(user_id)
+    channels = pseudonyms.user_channels(user_id)
     if channels is not None:
         endpoint_data["channels"] = channels
     return _client.endpoint.create(
@@ -324,7 +292,7 @@ def patch_endpoint(
     if filter_types is not None:
         patch_data["filter_types"] = filter_types
     if user_id is not None:
-        patch_data["channels"] = _user_channels(user_id)
+        patch_data["channels"] = pseudonyms.user_channels(user_id)
     elif clear_user_id:
         # Svix requires null (not []) to remove the channel filter entirely.
         patch_data["channels"] = None
@@ -394,7 +362,7 @@ def send_test_message(app_id: str, endpoint_id: str, event_type: str) -> Message
             MessageIn(
                 event_type=event_type,
                 payload=get_test_payload(event_type),
-                event_id=_hash_event_id(f"test.{endpoint_id}.{event_type}"),
+                event_id=pseudonyms.hash_event_id(f"test.{endpoint_id}.{event_type}"),
                 payload_retention_period=settings.svix_payload_retention_days,
             ),
         )

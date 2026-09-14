@@ -10,6 +10,7 @@ Covers:
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -23,6 +24,7 @@ from svix.api.errors.http_error import HttpError
 from app.config import settings
 from app.integrations.celery.tasks.emit_webhook_event_task import emit_webhook_event
 from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEventType
+from app.services.outgoing_webhooks import pseudonyms
 from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.events import (
     SVIX_MAX_SAMPLES_PER_EVENT,
@@ -361,28 +363,11 @@ class TestSvixEventIdHashing:
         ".2026-09-12T12_37_09_00_00.2026-09-12T12_57_13_00_00.series.heart_rate.created"
     )
 
-    def test_digest_is_deterministic(self) -> None:
-        """Dedup depends on the same logical event producing the same id every time."""
-        assert svix_service._hash_event_id(self.RAW) == svix_service._hash_event_id(self.RAW)
-
-    def test_different_events_differ(self) -> None:
-        assert svix_service._hash_event_id("sleep.created.a") != svix_service._hash_event_id("sleep.created.b")
-
-    def test_none_passes_through(self) -> None:
-        """Callers that supply no idempotency key must not get one invented."""
-        assert svix_service._hash_event_id(None) is None
-
     def test_digest_carries_no_identifiers(self) -> None:
-        digest = svix_service._hash_event_id(self.RAW)
+        digest = pseudonyms.hash_event_id(self.RAW)
         assert digest is not None
         for leaked in ("11de240a", "apple", "heart_rate", "2026-09-12", "timeseries"):
             assert leaked not in digest
-
-    def test_digest_satisfies_svix_event_id_constraints(self) -> None:
-        digest = svix_service._hash_event_id(self.RAW)
-        assert digest is not None
-        assert re.fullmatch(r"[a-zA-Z0-9\-_.]+", digest)
-        assert 1 <= len(digest) <= 256
 
     def test_send_hashes_the_idempotency_key(self) -> None:
         mock_client = MagicMock()
@@ -390,8 +375,85 @@ class TestSvixEventIdHashing:
             svix_service.send("workout.created", str(uuid4()), {"data": {}}, idempotency_key=self.RAW)
 
         message_in = mock_client.message.create.call_args[0][1]
-        assert message_in.event_id == svix_service._hash_event_id(self.RAW)
+        assert message_in.event_id == pseudonyms.hash_event_id(self.RAW)
         assert self.RAW not in (message_in.event_id or "")
+
+
+# ---------------------------------------------------------------------------
+# User channels: Svix never receives a readable user id
+# ---------------------------------------------------------------------------
+
+
+class TestUserChannelsReachSvixAsPseudonyms:
+    """``message.channels`` persists on the Svix message row with no expiry, beside ``uid``. The
+    event-id hash alone left the user id readable there on every message."""
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_an_emitted_event_carries_the_pseudonymous_channel(self, mock_task: MagicMock) -> None:
+        uid = uuid4()
+        on_connection_created(
+            user_id=uid,
+            provider="garmin",
+            connection_id=uuid4(),
+            connected_at="2026-01-01T12:00:00+00:00",
+        )
+        channels = mock_task.delay.call_args.kwargs["channels"]
+        assert channels == [pseudonyms.user_channel(uid)]
+        assert str(uid) not in repr(channels)
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_a_fast_lane_event_carries_the_pseudonymous_channel(self, mock_task: MagicMock) -> None:
+        uid = uuid4()
+        on_workout_created(
+            record_id=uuid4(),
+            user_id=uid,
+            provider="garmin",
+            device="Forerunner 255",
+            workout_type="RUNNING",
+            start_time="2026-01-01T00:00:00",
+            end_time="2026-01-01T01:00:00",
+            zone_offset="+01:00",
+            duration_seconds=3600,
+            calories_kcal=450.0,
+            distance_meters=10000.0,
+            avg_heart_rate_bpm=155,
+            max_heart_rate_bpm=178,
+            elevation_gain_meters=120.0,
+            avg_pace_sec_per_km=360,
+        )
+        channels = mock_task.apply_async.call_args.kwargs["kwargs"]["channels"]
+        assert channels == [pseudonyms.user_channel(uid)]
+
+    def test_no_module_builds_a_readable_user_channel(self) -> None:
+        """Every user channel must come from ``pseudonyms.user_channel``. Scans the app package
+        rather than a hand-written list of emitters, so a new emitter is covered by default."""
+        app_root = Path(svix_service.__file__).resolve().parents[2]
+        readable = re.compile(r"""f?["']user\.(\{|["'])""")
+        offenders = [
+            f"{path.relative_to(app_root)}:{n}"
+            for path in sorted(app_root.rglob("*.py"))
+            if path.name != "pseudonyms.py"
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if readable.search(line)
+        ]
+        assert offenders == []
+
+    def test_create_and_update_endpoint_send_the_pseudonymous_channel(self) -> None:
+        uid = uuid4()
+        client = MagicMock()
+        with patch.object(svix_service, "_client", client):
+            svix_service.create_endpoint("app", "https://example.com/wh", user_id=uid)
+            svix_service.patch_endpoint("app", "ep_1", user_id=uid)
+
+        created = client.endpoint.create.call_args[0][1]
+        patched = client.endpoint.patch.call_args[0][2]
+        assert created.channels == [pseudonyms.user_channel(uid)]
+        assert patched.channels == [pseudonyms.user_channel(uid)]
+
+    def test_an_endpoint_reports_its_user_filter(self) -> None:
+        uid = uuid4()
+        ep = MagicMock(channels=[pseudonyms.user_channel(uid)])
+        assert svix_service.user_id_from_endpoint(ep) == uid
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +642,36 @@ class TestOutgoingWebhooksAPI:
         )
         assert resp.status_code == 200
         assert "message_id" in resp.json()
+
+    def test_messages_list_returns_readable_channels(
+        self,
+        client: TestClient,
+        db: Session,
+        mock_svix: MagicMock,
+    ) -> None:
+        """Svix holds the pseudonym; the developer's own API keeps returning ``user.<uuid>``."""
+        developer = DeveloperFactory()
+        token = create_access_token(developer.id)
+        uid = uuid4()
+        mock_svix.list_messages.return_value = MagicMock(
+            data=[
+                MagicMock(
+                    id="msg_1",
+                    event_type="workout.created",
+                    event_id="d" * 64,
+                    timestamp=MagicMock(isoformat=lambda: "2026-01-01T00:00:00+00:00"),
+                    channels=[pseudonyms.user_channel(uid)],
+                    tags=None,
+                )
+            ],
+            done=True,
+            iterator=None,
+            prev_iterator=None,
+        )
+
+        resp = client.get("/api/v1/webhooks/messages", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        assert resp.json()["data"][0]["channels"] == [f"user.{uid}"]
 
     def test_endpoints_require_auth(self, client: TestClient) -> None:
         resp = client.get("/api/v1/webhooks/endpoints")
