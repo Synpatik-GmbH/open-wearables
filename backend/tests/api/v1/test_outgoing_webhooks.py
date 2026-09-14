@@ -9,6 +9,8 @@ Covers:
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -16,12 +18,14 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy.orm import Session
 from svix.api.errors.http_error import HttpError
 
 from app.config import settings
 from app.integrations.celery.tasks.emit_webhook_event_task import emit_webhook_event
 from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEventType
+from app.services.outgoing_webhooks import pseudonyms
 from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.events import (
     SVIX_MAX_SAMPLES_PER_EVENT,
@@ -348,6 +352,240 @@ class TestHasEndpoints:
 
 
 # ---------------------------------------------------------------------------
+# Svix event id hashing
+# ---------------------------------------------------------------------------
+
+
+class TestSvixEventIdHashing:
+    # The readable form was e.g.
+    # "timeseries.<user-uuid>.apple.heart_rate.2026-09-12T12_37_09_00_00.<...>.series.heart_rate.created"
+    RAW = (
+        "timeseries.11de240a-4e95-4eed-ae00-983f34dcbd3b.apple.heart_rate"
+        ".2026-09-12T12_37_09_00_00.2026-09-12T12_57_13_00_00.series.heart_rate.created"
+    )
+
+    def test_digest_carries_no_identifiers(self) -> None:
+        digest = pseudonyms.hash_event_id(self.RAW)
+        assert digest is not None
+        for leaked in ("11de240a", "apple", "heart_rate", "2026-09-12", "timeseries"):
+            assert leaked not in digest
+
+    def test_send_hashes_the_idempotency_key(self) -> None:
+        mock_client = MagicMock()
+        with patch.object(svix_service, "_client", mock_client):
+            svix_service.send("workout.created", str(uuid4()), {"data": {}}, idempotency_key=self.RAW)
+
+        message_in = mock_client.message.create.call_args[0][1]
+        assert message_in.event_id == pseudonyms.hash_event_id(self.RAW)
+        assert self.RAW not in (message_in.event_id or "")
+
+
+# ---------------------------------------------------------------------------
+# User channels: Svix never receives a readable user id
+# ---------------------------------------------------------------------------
+
+
+class TestUserChannelsReachSvixAsPseudonyms:
+    """``message.channels`` persists on the Svix message row with no expiry, beside ``uid``. The
+    event-id hash alone left the user id readable there on every message."""
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_an_emitted_event_carries_the_pseudonymous_channel(self, mock_task: MagicMock) -> None:
+        uid = uuid4()
+        on_connection_created(
+            user_id=uid,
+            provider="garmin",
+            connection_id=uuid4(),
+            connected_at="2026-01-01T12:00:00+00:00",
+        )
+        channels = mock_task.delay.call_args.kwargs["channels"]
+        assert channels == [pseudonyms.user_channel(uid)]
+        assert str(uid) not in repr(channels)
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_a_fast_lane_event_carries_the_pseudonymous_channel(self, mock_task: MagicMock) -> None:
+        uid = uuid4()
+        on_workout_created(
+            record_id=uuid4(),
+            user_id=uid,
+            provider="garmin",
+            device="Forerunner 255",
+            workout_type="RUNNING",
+            start_time="2026-01-01T00:00:00",
+            end_time="2026-01-01T01:00:00",
+            zone_offset="+01:00",
+            duration_seconds=3600,
+            calories_kcal=450.0,
+            distance_meters=10000.0,
+            avg_heart_rate_bpm=155,
+            max_heart_rate_bpm=178,
+            elevation_gain_meters=120.0,
+            avg_pace_sec_per_km=360,
+        )
+        channels = mock_task.apply_async.call_args.kwargs["kwargs"]["channels"]
+        assert channels == [pseudonyms.user_channel(uid)]
+
+    def test_no_module_builds_a_readable_user_channel(self) -> None:
+        """Every user channel must come from ``pseudonyms``. Rather than matching the ways a
+        channel could be CONSTRUCTED (which always misses one), this flags every ``"user.``
+        string literal and every use of ``USER_CHANNEL_PREFIX`` outside ``pseudonyms.py``, scanning
+        the app package so a new module is covered by default. Exemptions are exact literals that
+        are provably not channels."""
+        app_root = Path(svix_service.__file__).resolve().parents[2]
+        exempt = {("app/mappings.py", '"user.id"')}  # SQLAlchemy ForeignKey target, not a channel
+        literal = re.compile(r"""(["'])user\.[^"']*\1|(["'])user\.""")
+        offenders = []
+        for path in sorted(app_root.rglob("*.py")):
+            rel = str(path.relative_to(app_root.parent))
+            if path.name == "pseudonyms.py":
+                continue
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                hits = [m.group(0) for m in literal.finditer(line)]
+                hits = [h for h in hits if (rel, h) not in exempt]
+                if hits or "USER_CHANNEL_PREFIX" in line:
+                    offenders.append(f"{rel}:{n}: {line.strip()}")
+        assert offenders == []
+
+    def test_create_and_update_endpoint_send_the_pseudonymous_channel(self) -> None:
+        uid = uuid4()
+        client = MagicMock()
+        with patch.object(svix_service, "_client", client):
+            svix_service.create_endpoint("app", "https://example.com/wh", user_id=uid)
+            svix_service.patch_endpoint("app", "ep_1", user_id=uid)
+
+        created = client.endpoint.create.call_args[0][1]
+        patched = client.endpoint.patch.call_args[0][2]
+        assert created.channels == [pseudonyms.user_channel(uid)]
+        assert patched.channels == [pseudonyms.user_channel(uid)]
+
+    @pytest.mark.parametrize("form", ["legacy", "pseudonymous"])
+    def test_send_never_hands_svix_a_readable_user_channel(self, form: str) -> None:
+        """The Svix boundary pseudonymises, not only the producers.
+
+        A Celery job enqueued by the previous release (or by an old producer during a rolling
+        deploy) still carries ``user.<uuid>``; the worker passes it straight to ``send``. Whatever
+        form arrives, Svix must receive the pseudonymous channel — and an already-pseudonymous one
+        must pass through unchanged, not be encrypted twice.
+        """
+        uid = uuid4()
+        incoming = f"user.{uid}" if form == "legacy" else pseudonyms.user_channel(uid)
+        client = MagicMock()
+        with patch.object(svix_service, "_client", client):
+            svix_service.send("workout.created", str(uuid4()), {"data": {}}, channels=[incoming, "project_123"])
+
+        sent = client.message.create.call_args[0][1].channels
+        assert sent == [pseudonyms.user_channel(uid), "project_123"]
+        assert str(uid) not in repr(sent)
+
+    def test_a_job_queued_by_the_previous_release_reaches_svix_pseudonymised(self) -> None:
+        """End to end through the real emit task with the kwargs an old producer enqueued."""
+        uid = uuid4()
+        client = MagicMock()
+        client.endpoint.list.return_value = MagicMock(data=[MagicMock()])
+        client.message.create.return_value = MagicMock(id="msg_1")
+        with (
+            patch.object(svix_service, "_client", client),
+            patch("app.integrations.celery.tasks.emit_webhook_event_task.developer_service") as devs,
+        ):
+            devs.crud.get_all.return_value = [MagicMock(id=uuid4(), email="dev@test.com")]
+            emit_webhook_event(
+                "workout.created",
+                {"type": "workout.created", "data": {}},
+                channels=[f"user.{uid}"],
+                idempotency_key=f"workout.created.{uuid4()}",
+            )
+
+        sent = client.message.create.call_args[0][1].channels
+        assert sent == [pseudonyms.user_channel(uid)]
+
+    @staticmethod
+    def _page(items: list, done: bool = True, iterator: str | None = None) -> MagicMock:
+        return MagicMock(data=items, done=done, iterator=iterator)
+
+    def test_the_migration_rewrites_only_readable_user_channels(self) -> None:
+        """A user-scoped endpoint created before pseudonymisation filters on ``user.<uuid>``, which
+        no new message carries: it would silently receive nothing while the API still reported the
+        filter. The one-shot migration rewrites it; every other endpoint is left alone."""
+        uid = uuid4()
+        legacy = MagicMock(id="ep_legacy", channels=[f"user.{uid}"])
+        mixed = MagicMock(id="ep_mixed", channels=[f"user.{uid}", "project_1"])
+        already = MagicMock(id="ep_new", channels=[pseudonyms.user_channel(uid)])
+        unscoped = MagicMock(id="ep_all", channels=None)
+        other = MagicMock(id="ep_other", channels=["project_1"])
+        foreign = MagicMock(id="ep_foreign", channels=[pseudonyms.user_channel(uid, secret=SecretStr("old-key"))])
+        client = MagicMock()
+        client.application.list.return_value = self._page([MagicMock(id="app_1")])
+        client.endpoint.list.return_value = self._page([legacy, mixed, already, unscoped, other, foreign])
+
+        with patch.object(svix_service, "_client", client):
+            result = svix_service.migrate_legacy_user_channels()
+
+        patched = {c.args[1]: c.args[2].channels for c in client.endpoint.patch.call_args_list}
+        assert patched == {
+            "ep_legacy": [pseudonyms.user_channel(uid)],
+            "ep_mixed": [pseudonyms.user_channel(uid), "project_1"],
+        }
+        assert (result.applications, result.endpoints, result.legacy, result.migrated) == (1, 6, 2, 2)
+
+    def test_a_dry_run_counts_without_patching(self) -> None:
+        uid = uuid4()
+        client = MagicMock()
+        client.application.list.return_value = self._page([MagicMock(id="app_1")])
+        client.endpoint.list.return_value = self._page([MagicMock(id="ep_1", channels=[f"user.{uid}"])])
+        with patch.object(svix_service, "_client", client):
+            result = svix_service.migrate_legacy_user_channels(dry_run=True)
+        assert (result.legacy, result.migrated) == (1, 0)
+        client.endpoint.patch.assert_not_called()
+
+    def test_the_migration_follows_every_page(self) -> None:
+        uid = uuid4()
+        client = MagicMock()
+        client.application.list.side_effect = [
+            self._page([MagicMock(id="app_1")], done=False, iterator="a2"),
+            self._page([MagicMock(id="app_2")]),
+        ]
+        client.endpoint.list.side_effect = [
+            self._page([], done=False, iterator="e2"),
+            self._page([MagicMock(id="ep_1", channels=[f"user.{uid}"])]),
+            self._page([MagicMock(id="ep_2", channels=[f"user.{uid}"])]),
+        ]
+        with patch.object(svix_service, "_client", client):
+            assert svix_service.migrate_legacy_user_channels().migrated == 2
+        assert [c.args[1] for c in client.endpoint.patch.call_args_list] == ["ep_1", "ep_2"]
+
+    def test_a_failing_migration_raises_rather_than_reporting_nothing_to_do(self) -> None:
+        """A Svix outage must not read as "0 legacy endpoints". The caller (the script) turns the
+        exception into a non-zero exit so the operator reruns it."""
+        client = MagicMock()
+        client.application.list.side_effect = httpx.ConnectError("svix down")
+        with patch.object(svix_service, "_client", client), pytest.raises(httpx.ConnectError):
+            svix_service.migrate_legacy_user_channels()
+
+    def test_the_api_does_not_run_the_migration_at_startup(self) -> None:
+        """It is a one-shot operator step, not startup work: startup must not wait on Svix for it."""
+        import asyncio
+
+        from app import main
+
+        with (
+            patch.object(main.svix_service, "register_event_types"),
+            patch.object(main.svix_service, "migrate_legacy_user_channels") as migration,
+        ):
+
+            async def run() -> None:
+                async with main._lifespan(main.api):
+                    pass
+
+            asyncio.run(run())
+        migration.assert_not_called()
+
+    def test_an_endpoint_reports_its_user_filter(self) -> None:
+        uid = uuid4()
+        ep = MagicMock(channels=[pseudonyms.user_channel(uid)])
+        assert svix_service.user_id_from_endpoint(ep) == uid
+
+
+# ---------------------------------------------------------------------------
 # emit_webhook_event Celery task (unit, Svix mocked)
 # ---------------------------------------------------------------------------
 
@@ -533,6 +771,36 @@ class TestOutgoingWebhooksAPI:
         )
         assert resp.status_code == 200
         assert "message_id" in resp.json()
+
+    def test_messages_list_returns_readable_channels(
+        self,
+        client: TestClient,
+        db: Session,
+        mock_svix: MagicMock,
+    ) -> None:
+        """Svix holds the pseudonym; the developer's own API keeps returning ``user.<uuid>``."""
+        developer = DeveloperFactory()
+        token = create_access_token(developer.id)
+        uid = uuid4()
+        mock_svix.list_messages.return_value = MagicMock(
+            data=[
+                MagicMock(
+                    id="msg_1",
+                    event_type="workout.created",
+                    event_id="d" * 64,
+                    timestamp=MagicMock(isoformat=lambda: "2026-01-01T00:00:00+00:00"),
+                    channels=[pseudonyms.user_channel(uid)],
+                    tags=None,
+                )
+            ],
+            done=True,
+            iterator=None,
+            prev_iterator=None,
+        )
+
+        resp = client.get("/api/v1/webhooks/messages", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        assert resp.json()["data"][0]["channels"] == [f"user.{uid}"]
 
     def test_endpoints_require_auth(self, client: TestClient) -> None:
         resp = client.get("/api/v1/webhooks/endpoints")
