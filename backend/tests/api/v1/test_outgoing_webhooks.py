@@ -13,9 +13,11 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
+from svix.api.errors.http_error import HttpError
 
 from app.config import settings
 from app.integrations.celery.tasks.emit_webhook_event_task import emit_webhook_event
@@ -272,6 +274,76 @@ class TestSvixPayloadRetention:
         # svix-server rejects anything below 5 days with a 422, and accepts but silently
         # ignores payloadRetentionHours, so 5 days is the shortest retention it will honour.
         assert settings.svix_payload_retention_days == 5
+
+
+# ---------------------------------------------------------------------------
+# has_endpoints: which lookup failures may skip a developer
+# ---------------------------------------------------------------------------
+
+
+class TestHasEndpoints:
+    """Only a lookup that PROVES no endpoint exists may skip the developer.
+
+    A skip acknowledges the Celery task with nothing sent and no retry, so a lookup that
+    merely failed must fall through to ``send`` — which owns the delivery-failure contract —
+    rather than turning a transient error into a silently dropped event.
+    """
+
+    @staticmethod
+    def _client_listing(result: object) -> MagicMock:
+        client = MagicMock()
+        if isinstance(result, BaseException):
+            client.endpoint.list.side_effect = result
+        else:
+            client.endpoint.list.return_value = result
+        return client
+
+    def test_an_application_with_endpoints_has_endpoints(self) -> None:
+        client = self._client_listing(MagicMock(data=[MagicMock()]))
+        with patch.object(svix_service, "_client", client):
+            assert svix_service.has_endpoints(str(uuid4())) is True
+
+    def test_an_application_with_no_endpoints_is_skipped(self) -> None:
+        client = self._client_listing(MagicMock(data=[]))
+        with patch.object(svix_service, "_client", client):
+            assert svix_service.has_endpoints(str(uuid4())) is False
+
+    def test_an_application_that_was_never_created_is_skipped(self) -> None:
+        client = self._client_listing(HttpError("not_found", "no app", 404))
+        with patch.object(svix_service, "_client", client):
+            assert svix_service.has_endpoints(str(uuid4())) is False
+
+    def test_an_unreachable_svix_does_not_skip_the_developer(self) -> None:
+        client = self._client_listing(httpx.ConnectError("connection refused"))
+        with patch.object(svix_service, "_client", client):
+            assert svix_service.has_endpoints(str(uuid4())) is True
+
+    def test_any_other_lookup_failure_does_not_skip_the_developer(self) -> None:
+        client = self._client_listing(HttpError("server_error", "boom", 500))
+        with (
+            patch.object(svix_service, "_client", client),
+            patch.object(svix_service, "log_and_capture_error") as capture,
+        ):
+            assert svix_service.has_endpoints(str(uuid4())) is True
+        capture.assert_called_once()
+
+    def test_a_transient_lookup_failure_still_sends_the_event(self) -> None:
+        """End to end through the real emit task: the lookup fails to connect, Svix recovers,
+        and the event must still be sent rather than counted as skipped."""
+        dev = MagicMock(id=uuid4(), email="dev@test.com")
+        client = MagicMock()
+        client.endpoint.list.side_effect = httpx.ConnectError("blip")
+        client.message.create.return_value = MagicMock(id="msg_1")
+        with (
+            patch.object(svix_service, "_client", client),
+            patch("app.integrations.celery.tasks.emit_webhook_event_task.developer_service") as devs,
+        ):
+            devs.crud.get_all.return_value = [dev]
+            result = emit_webhook_event("workout.created", {"type": "workout.created", "data": {}})
+
+        assert result["skipped"] == 0
+        assert result["sent"] == 1
+        assert client.message.create.call_count == 1
 
 
 # ---------------------------------------------------------------------------

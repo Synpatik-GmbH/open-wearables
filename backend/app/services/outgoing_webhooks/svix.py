@@ -38,6 +38,7 @@ from svix.api.errors.http_error import HttpError
 from app.config import settings
 from app.constants.webhooks.test_payloads import get_test_payload
 from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEventType
+from app.utils.sentry_helpers import log_and_capture_error
 
 logger = logging.getLogger(__name__)
 
@@ -231,9 +232,13 @@ def has_endpoints(app_id: str) -> bool:
 
     The emit task uses this to skip developers who never registered an endpoint,
     so no payload is stored for an application that could not deliver it anyway.
-    A 404 means the application was never created, which implies no endpoint.
-    On any other failure we fall back to the previous behaviour and let
-    :func:`send` run, so a lookup outage never silently discards an event.
+
+    Only an answer that PROVES there is no endpoint returns False: an empty list, or a
+    404 (the application was never created). A skip acknowledges the task with nothing
+    sent and no retry, so every lookup that merely failed — Svix unreachable included —
+    returns True and lets :func:`send` run. ``send`` owns the delivery-failure contract;
+    deciding it here as well would turn a transient lookup error, which could clear
+    before the message request, into a silently dropped event.
     """
     if not is_enabled():
         return False
@@ -241,16 +246,15 @@ def has_endpoints(app_id: str) -> bool:
     try:
         return bool(_client.endpoint.list(app_id).data)
     except httpx.ConnectError:
-        # Same contract as send(): when Svix is unreachable nothing can be delivered.
-        logger.warning("Svix server unreachable — skipping endpoint lookup for app=%s", app_id)
-        return False
+        logger.warning("Svix server unreachable during endpoint lookup for app=%s; deferring to send", app_id)
+        return True
     except HttpError as exc:
         if exc.status_code == 404:
             return False
-        logger.exception("Failed to list endpoints for app=%s; assuming it has endpoints", app_id)
+        log_and_capture_error(exc, logger, f"Failed to list endpoints for app={app_id}; assuming it has endpoints")
         return True
-    except Exception:
-        logger.exception("Failed to list endpoints for app=%s; assuming it has endpoints", app_id)
+    except Exception as exc:
+        log_and_capture_error(exc, logger, f"Failed to list endpoints for app={app_id}; assuming it has endpoints")
         return True
 
 
