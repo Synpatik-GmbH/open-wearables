@@ -38,6 +38,7 @@ from svix.api.errors.http_error import HttpError
 from app.config import settings
 from app.constants.webhooks.test_payloads import get_test_payload
 from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEventType
+from app.utils.sentry_helpers import log_and_capture_error
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +167,7 @@ def send(
                 payload=payload,
                 event_id=idempotency_key,
                 channels=channels or None,
+                payload_retention_period=settings.svix_payload_retention_days,
             ),
         )
     except httpx.ConnectError:
@@ -223,6 +225,42 @@ def create_endpoint(
 def list_endpoints(app_id: str) -> ListResponseEndpointOut:
     assert _client is not None
     return _client.endpoint.list(app_id)
+
+
+def has_endpoints(app_id: str) -> bool:
+    """Return True when the developer's Svix application has at least one endpoint.
+
+    The emit task uses this to skip developers who never registered an endpoint,
+    so no payload is stored for an application that could not deliver it anyway.
+
+    Only an answer that PROVES there is no endpoint returns False: an empty list, or a
+    404 (the application was never created). A skip acknowledges the task with nothing
+    sent and no retry, so every lookup that merely failed — Svix unreachable included —
+    returns True and lets :func:`send` run. ``send`` owns the delivery-failure contract;
+    deciding it here as well would turn a transient lookup error, which could clear
+    before the message request, into a silently dropped event.
+    """
+    if not is_enabled():
+        return False
+    assert _client is not None
+    try:
+        return bool(_client.endpoint.list(app_id).data)
+    except httpx.ConnectError as exc:
+        log_and_capture_error(
+            exc,
+            logger,
+            f"Svix server unreachable during endpoint lookup for app={app_id}; deferring to send",
+            level="warning",
+        )
+        return True
+    except HttpError as exc:
+        if exc.status_code == 404:
+            return False
+        log_and_capture_error(exc, logger, f"Failed to list endpoints for app={app_id}; assuming it has endpoints")
+        return True
+    except Exception as exc:
+        log_and_capture_error(exc, logger, f"Failed to list endpoints for app={app_id}; assuming it has endpoints")
+        return True
 
 
 def get_endpoint(app_id: str, endpoint_id: str) -> EndpointOut:
@@ -330,6 +368,7 @@ def send_test_message(app_id: str, endpoint_id: str, event_type: str) -> Message
                 event_type=event_type,
                 payload=get_test_payload(event_type),
                 event_id=f"test.{endpoint_id}.{event_type}",
+                payload_retention_period=settings.svix_payload_retention_days,
             ),
         )
     except Exception:

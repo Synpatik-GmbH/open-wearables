@@ -33,15 +33,16 @@ def emit_webhook_event(
     channels: list[str] | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
-    """Send a webhook event to every developer's Svix application.
+    """Send a webhook event to every developer that has a registered endpoint.
 
-    In a single-developer self-hosted deployment this broadcasts to one
-    application.  Multi-developer scoping (developer_id on User) can be
-    added later to narrow the audience.
+    Developers without an endpoint are skipped: Svix would store the payload
+    for an application with nowhere to deliver it, so each such account added
+    another stored copy of every event.  Skipping them also means no Svix
+    application is created for an account that never asked for webhooks.
     """
     if not svix_service.is_enabled():
         logger.debug("Svix is not configured — skipping webhook dispatch for event %s", event_type)
-        return {"event_type": event_type, "sent": 0, "errors": []}
+        return {"event_type": event_type, "sent": 0, "skipped": 0, "errors": []}
 
     with SessionLocal() as db:
         page_size = 100
@@ -55,12 +56,18 @@ def emit_webhook_event(
             offset += page_size
 
     sent = 0
+    skipped = 0
     errors: list[str] = []
     for dev in developers:
-        svix_service.ensure_application(str(dev.id), dev.email)
+        app_id = str(dev.id)
+        # The application is created when the developer registers an endpoint,
+        # so having an endpoint implies the application already exists.
+        if not svix_service.has_endpoints(app_id):
+            skipped += 1
+            continue
         result = svix_service.send(
             event_type,
-            str(dev.id),
+            app_id,
             payload,
             channels=channels,
             idempotency_key=idempotency_key,
@@ -68,7 +75,7 @@ def emit_webhook_event(
         if result is not None:
             sent += 1
         else:
-            errors.append(str(dev.id))
+            errors.append(app_id)
 
     if errors:
         exc = RuntimeError(
@@ -82,4 +89,4 @@ def emit_webhook_event(
         )
         raise self.retry(exc=exc)
 
-    return {"event_type": event_type, "sent": sent, "errors": errors}
+    return {"event_type": event_type, "sent": sent, "skipped": skipped, "errors": errors}

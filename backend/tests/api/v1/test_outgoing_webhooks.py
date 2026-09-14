@@ -13,12 +13,16 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
+from svix.api.errors.http_error import HttpError
 
+from app.config import settings
 from app.integrations.celery.tasks.emit_webhook_event_task import emit_webhook_event
 from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEventType
+from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.events import (
     SVIX_MAX_SAMPLES_PER_EVENT,
     _dispatch,
@@ -252,6 +256,98 @@ class TestWebhookEmit:
 
 
 # ---------------------------------------------------------------------------
+# Svix payload retention
+# ---------------------------------------------------------------------------
+
+
+class TestSvixPayloadRetention:
+    def test_send_sets_payload_retention_period(self) -> None:
+        """Every emitted message must carry an explicit retention window."""
+        mock_client = MagicMock()
+        with patch.object(svix_service, "_client", mock_client):
+            svix_service.send("workout.created", str(uuid4()), {"data": {}})
+
+        message_in = mock_client.message.create.call_args[0][1]
+        assert message_in.payload_retention_period == settings.svix_payload_retention_days
+
+
+# ---------------------------------------------------------------------------
+# has_endpoints: which lookup failures may skip a developer
+# ---------------------------------------------------------------------------
+
+
+class TestHasEndpoints:
+    """Only a lookup that PROVES no endpoint exists may skip the developer.
+
+    A skip acknowledges the Celery task with nothing sent and no retry, so a lookup that
+    merely failed must fall through to ``send`` — which owns the delivery-failure contract —
+    rather than turning a transient error into a silently dropped event.
+    """
+
+    @staticmethod
+    def _client_listing(result: object) -> MagicMock:
+        client = MagicMock()
+        if isinstance(result, BaseException):
+            client.endpoint.list.side_effect = result
+        else:
+            client.endpoint.list.return_value = result
+        return client
+
+    def test_an_application_with_endpoints_has_endpoints(self) -> None:
+        client = self._client_listing(MagicMock(data=[MagicMock()]))
+        with patch.object(svix_service, "_client", client):
+            assert svix_service.has_endpoints(str(uuid4())) is True
+
+    def test_an_application_with_no_endpoints_is_skipped(self) -> None:
+        client = self._client_listing(MagicMock(data=[]))
+        with patch.object(svix_service, "_client", client):
+            assert svix_service.has_endpoints(str(uuid4())) is False
+
+    def test_an_application_that_was_never_created_is_skipped(self) -> None:
+        client = self._client_listing(HttpError("not_found", "no app", 404))
+        with patch.object(svix_service, "_client", client):
+            assert svix_service.has_endpoints(str(uuid4())) is False
+
+    def test_an_unreachable_svix_does_not_skip_the_developer(self) -> None:
+        client = self._client_listing(httpx.ConnectError("connection refused"))
+        with (
+            patch.object(svix_service, "_client", client),
+            patch.object(svix_service, "log_and_capture_error") as capture,
+        ):
+            assert svix_service.has_endpoints(str(uuid4())) is True
+        # Swallowed, so it must still reach Sentry (backend/AGENTS.md): a recurring outage
+        # during the lookup is otherwise visible only in the application log.
+        capture.assert_called_once()
+
+    def test_any_other_lookup_failure_does_not_skip_the_developer(self) -> None:
+        client = self._client_listing(HttpError("server_error", "boom", 500))
+        with (
+            patch.object(svix_service, "_client", client),
+            patch.object(svix_service, "log_and_capture_error") as capture,
+        ):
+            assert svix_service.has_endpoints(str(uuid4())) is True
+        capture.assert_called_once()
+
+    def test_a_transient_lookup_failure_still_sends_the_event(self) -> None:
+        """End to end through the real emit task: the lookup fails to connect, Svix recovers,
+        and the event must still be sent rather than counted as skipped."""
+        dev = MagicMock(id=uuid4(), email="dev@test.com")
+        client = MagicMock()
+        client.endpoint.list.side_effect = httpx.ConnectError("blip")
+        client.message.create.return_value = MagicMock(id="msg_1")
+        with (
+            patch.object(svix_service, "_client", client),
+            patch("app.integrations.celery.tasks.emit_webhook_event_task.developer_service") as devs,
+        ):
+            devs.crud.get_all.return_value = [dev]
+            result = emit_webhook_event("workout.created", {"type": "workout.created", "data": {}})
+
+        assert result["skipped"] == 0
+        assert result["sent"] == 1
+        assert client.message.create.call_count == 1
+
+
+# ---------------------------------------------------------------------------
 # emit_webhook_event Celery task (unit, Svix mocked)
 # ---------------------------------------------------------------------------
 
@@ -259,7 +355,7 @@ class TestWebhookEmit:
 class TestEmitWebhookEventTask:
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.svix_service")
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.developer_service")
-    def test_sends_to_all_developers(
+    def test_sends_to_developers_with_endpoints(
         self,
         mock_dev_service: MagicMock,
         mock_svix: MagicMock,
@@ -267,6 +363,7 @@ class TestEmitWebhookEventTask:
         dev1 = MagicMock(id=uuid4(), email="dev1@test.com")
         dev2 = MagicMock(id=uuid4(), email="dev2@test.com")
         mock_dev_service.crud.get_all.return_value = [dev1, dev2]
+        mock_svix.has_endpoints.return_value = True
         mock_svix.send.return_value = MagicMock(id="msg_123")
 
         result = emit_webhook_event(
@@ -275,8 +372,33 @@ class TestEmitWebhookEventTask:
         )
 
         assert result["sent"] == 2
-        assert mock_svix.ensure_application.call_count == 2
+        assert result["skipped"] == 0
         assert mock_svix.send.call_count == 2
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.svix_service")
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.developer_service")
+    def test_skips_developers_without_endpoints(
+        self,
+        mock_dev_service: MagicMock,
+        mock_svix: MagicMock,
+    ) -> None:
+        with_ep = MagicMock(id=uuid4(), email="with@test.com")
+        without_ep = MagicMock(id=uuid4(), email="without@test.com")
+        mock_dev_service.crud.get_all.return_value = [with_ep, without_ep]
+        mock_svix.has_endpoints.side_effect = lambda app_id: app_id == str(with_ep.id)
+        mock_svix.send.return_value = MagicMock(id="msg_123")
+
+        result = emit_webhook_event(
+            "workout.created",
+            {"type": "workout.created", "data": {}},
+        )
+
+        assert result["sent"] == 1
+        assert result["skipped"] == 1
+        assert mock_svix.send.call_count == 1
+        assert mock_svix.send.call_args[0][1] == str(with_ep.id)
+        # No Svix application is created for an account that never registered an endpoint.
+        assert mock_svix.ensure_application.call_count == 0
 
 
 # ---------------------------------------------------------------------------

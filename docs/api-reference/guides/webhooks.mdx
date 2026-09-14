@@ -595,7 +595,12 @@ Open Wearables (via Svix) retries failed deliveries automatically with exponenti
 
 <AccordionGroup>
   <Accordion title="Retry schedule">
-    Svix retries each failed message at increasing intervals. If all retries are exhausted the message is marked as failed in delivery history — you can inspect it and manually trigger a resend from the Svix dashboard.
+    Svix retries each failed message at increasing intervals. If all retries are exhausted the message is marked as failed in delivery history — you can inspect it and manually trigger a resend from the Svix dashboard, for as long as the message's payload is retained (see **Payload retention**).
+  </Accordion>
+  <Accordion title="Payload retention">
+    Svix keeps each message's payload for **5 days** by default, then expires it. After that the payload can no longer be viewed and the message cannot be resent. The full retry schedule completes in about 27 hours 35 minutes, well inside the window.
+
+    Self-hosted deployments set the period with `SVIX_PAYLOAD_RETENTION_DAYS`, which accepts **5 to 90** days; a value outside that range fails startup. Shorter periods are not possible: the Svix server's floor is 5 days. If you need an event for longer, persist it when your endpoint receives it.
   </Accordion>
   <Accordion title="Expected endpoint behaviour">
     - Respond with a `2xx` status code as quickly as possible (before doing any heavy processing).
@@ -618,7 +623,7 @@ curl "http://localhost:8000/api/v1/webhooks/endpoints/ep_2t8Q4Xv9mNkRpLzYoB3cW7/
   -H "Authorization: Bearer YOUR_JWT_TOKEN"
 ```
 
-Each attempt includes the HTTP status code returned by your server and the timestamp of the attempt.
+Each attempt includes the HTTP status code returned by your server and the timestamp of the attempt. Once a message is older than the payload retention period (5 days by default) its payload has expired and it cannot be resent.
 
 ### View all sent messages
 
