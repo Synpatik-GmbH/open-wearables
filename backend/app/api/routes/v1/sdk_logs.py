@@ -34,13 +34,15 @@ def submit_sdk_logs(
     provider = (body.provider or "unknown").lower()
     event_types = [e.eventType for e in body.events]
 
+    # No user_id: this line is the only durable trace of this endpoint (the body is
+    # dropped while raw payload storage is disabled), so keeping it free of personal
+    # data keeps the whole log retention window free of it. Correlate on batch_id.
     log_structured(
         logger,
         "info",
         "SDK log events received",
         action="sdk_logs_received",
         batch_id=batch_id,
-        user_id=user_id,
         provider=provider,
         event_count=len(body.events),
         event_types=event_types,
