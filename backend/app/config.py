@@ -222,10 +222,11 @@ class Settings(BaseSettings):
     # [5, 300, 1800, 7200, 18000, 36000, 36000] seconds); the platform floor for payload
     # retention is 5 days; 5 days is therefore the shortest retention Svix will honour and
     # remains far inside the one-month erasure response window.
-    # Svix accepts 5 to 90 here and rejects anything outside that range with a 422.
+    # Svix accepts 5 to 90 here and rejects anything outside that range with a 422 on every
+    # message, so the bounds are enforced at startup rather than discovered at delivery time.
     # Note: the API also has a payloadRetentionHours field, which svix-server accepts with a
     # 202 and then ignores, so sub-day retention is not expressible against this platform.
-    svix_payload_retention_days: int = 5
+    svix_payload_retention_days: int = Field(default=5, ge=5, le=90)
 
     # Outgoing-webhook fast lane: event types listed here are enqueued on the
     # dedicated "webhook_sync" queue so they can never queue behind bulk /

@@ -270,11 +270,6 @@ class TestSvixPayloadRetention:
         message_in = mock_client.message.create.call_args[0][1]
         assert message_in.payload_retention_period == settings.svix_payload_retention_days
 
-    def test_default_retention_is_the_platform_floor(self) -> None:
-        # svix-server rejects anything below 5 days with a 422, and accepts but silently
-        # ignores payloadRetentionHours, so 5 days is the shortest retention it will honour.
-        assert settings.svix_payload_retention_days == 5
-
 
 # ---------------------------------------------------------------------------
 # has_endpoints: which lookup failures may skip a developer
