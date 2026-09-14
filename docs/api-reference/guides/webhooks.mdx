@@ -466,7 +466,7 @@ Omit the field entirely to receive all event types.
 Pass `user_id` to scope an endpoint to events for a single user. All other users' events are silently dropped before delivery.
 
 <Note>
-Open Wearables never gives Svix a readable user id. Each message's user channel is stored in Svix as an opaque, per-user token, and the endpoints and messages APIs translate it back, so you keep seeing `user_id` and `user.<uuid>` channels in responses. An endpoint created with a `user_id` before this change keeps reporting its filter; save its `user_id` again to move it to the opaque form, which is what new messages carry.
+Open Wearables never gives Svix a readable user id. Each message's user channel is stored in Svix as an opaque, per-user token, and the endpoints and messages APIs translate it back, so you keep seeing `user_id` and `user.<uuid>` channels in responses. An endpoint created with a `user_id` before this change keeps reporting its filter; save its `user_id` again to move it to the opaque form, which is what new messages carry. The change reaches delivery only after Svix refreshes its cached endpoint configuration, so events sent immediately after the save may still use the old filter (in a local svix-server v1.69.0 test, an event sent 40 seconds later was routed correctly).
 </Note>
 
 ```bash
