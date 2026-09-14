@@ -11,6 +11,7 @@ Responsibilities:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
@@ -120,43 +121,53 @@ def register_event_types() -> None:
                 logger.exception("Failed to register/update event type %s", evt.value)
 
 
-def migrate_legacy_user_channels() -> int:
-    """Rewrite every endpoint channel still in the readable ``user.<uuid>`` form; return the count.
+@dataclass(frozen=True)
+class LegacyChannelMigration:
+    """What one run of :func:`migrate_legacy_user_channels` saw and did."""
+
+    applications: int
+    endpoints: int
+    legacy: int
+    migrated: int
+
+
+def migrate_legacy_user_channels(*, dry_run: bool = False) -> LegacyChannelMigration:
+    """Rewrite every endpoint channel still in the readable ``user.<uuid>`` form.
 
     An endpoint scoped to a user before pseudonymisation filters on ``user.<uuid>``, and no message
     carries that any more, so it would silently receive nothing while the API still reported its
-    filter.  Runs at API startup and is idempotent: an endpoint already pseudonymous, unscoped, on
-    a non-user channel, or on a token under a previous key is left alone.  A failure is captured
-    and never blocks startup.
+    filter.  This is a ONE-SHOT operator step, run once per environment after upgrading
+    (``scripts/data_migrations/pseudonymise_svix_user_channels.py``), not startup work.
+
+    Idempotent: an endpoint already pseudonymous, unscoped, on a non-user channel, or on a token
+    under a previous key is left alone, so a rerun migrates only what is still readable.  Any Svix
+    failure PROPAGATES: an outage must not be reported as "nothing to migrate".
     """
-    if not is_enabled():
-        return 0
     assert _client is not None
-    migrated = 0
-    try:
-        app_iterator: str | None = None
-        while True:
-            apps = _client.application.list(ApplicationListOptions(limit=250, iterator=app_iterator))
-            for app in apps.data:
-                ep_iterator: str | None = None
-                while True:
-                    endpoints = _client.endpoint.list(app.id, EndpointListOptions(limit=250, iterator=ep_iterator))
-                    for ep in endpoints.data:
-                        target = pseudonyms.pseudonymous_channels(ep.channels)
-                        if ep.channels and target != list(ep.channels):
+    applications = endpoints = legacy = migrated = 0
+    app_iterator: str | None = None
+    while True:
+        apps = _client.application.list(ApplicationListOptions(limit=250, iterator=app_iterator))
+        for app in apps.data:
+            applications += 1
+            ep_iterator: str | None = None
+            while True:
+                page = _client.endpoint.list(app.id, EndpointListOptions(limit=250, iterator=ep_iterator))
+                for ep in page.data:
+                    endpoints += 1
+                    target = pseudonyms.pseudonymous_channels(ep.channels)
+                    if ep.channels and target != list(ep.channels):
+                        legacy += 1
+                        if not dry_run:
                             _client.endpoint.patch(app.id, ep.id, EndpointPatch.model_validate({"channels": target}))
                             migrated += 1
-                    if endpoints.done:
-                        break
-                    ep_iterator = endpoints.iterator
-            if apps.done:
-                break
-            app_iterator = apps.iterator
-    except Exception as exc:
-        log_and_capture_error(exc, logger, "Failed to migrate legacy Svix user channels")
-    if migrated:
-        logger.info("Migrated %d Svix endpoint(s) from readable to pseudonymous user channels", migrated)
-    return migrated
+                if page.done:
+                    break
+                ep_iterator = page.iterator
+        if apps.done:
+            break
+        app_iterator = apps.iterator
+    return LegacyChannelMigration(applications=applications, endpoints=endpoints, legacy=legacy, migrated=migrated)
 
 
 def ensure_application(developer_id: str, developer_email: str) -> str:

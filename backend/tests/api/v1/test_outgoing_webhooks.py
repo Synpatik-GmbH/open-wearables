@@ -38,10 +38,6 @@ from app.services.outgoing_webhooks.events import (
 from app.utils.security import create_access_token
 from tests.factories import DeveloperFactory
 
-# Captured at import, before the session-wide conftest fixture replaces it with a mock for every
-# TestClient startup: the sweep's own tests must exercise the real function.
-_migrate_legacy_user_channels = svix_service.migrate_legacy_user_channels
-
 # ---------------------------------------------------------------------------
 # WebhookEventType enum
 # ---------------------------------------------------------------------------
@@ -506,10 +502,10 @@ class TestUserChannelsReachSvixAsPseudonyms:
     def _page(items: list, done: bool = True, iterator: str | None = None) -> MagicMock:
         return MagicMock(data=items, done=done, iterator=iterator)
 
-    def test_the_startup_sweep_rewrites_only_readable_user_channels(self) -> None:
+    def test_the_migration_rewrites_only_readable_user_channels(self) -> None:
         """A user-scoped endpoint created before pseudonymisation filters on ``user.<uuid>``, which
         no new message carries: it would silently receive nothing while the API still reported the
-        filter. The sweep rewrites it; every other endpoint is left alone."""
+        filter. The one-shot migration rewrites it; every other endpoint is left alone."""
         uid = uuid4()
         legacy = MagicMock(id="ep_legacy", channels=[f"user.{uid}"])
         mixed = MagicMock(id="ep_mixed", channels=[f"user.{uid}", "project_1"])
@@ -522,16 +518,26 @@ class TestUserChannelsReachSvixAsPseudonyms:
         client.endpoint.list.return_value = self._page([legacy, mixed, already, unscoped, other, foreign])
 
         with patch.object(svix_service, "_client", client):
-            migrated = _migrate_legacy_user_channels()
+            result = svix_service.migrate_legacy_user_channels()
 
         patched = {c.args[1]: c.args[2].channels for c in client.endpoint.patch.call_args_list}
         assert patched == {
             "ep_legacy": [pseudonyms.user_channel(uid)],
             "ep_mixed": [pseudonyms.user_channel(uid), "project_1"],
         }
-        assert migrated == 2
+        assert (result.applications, result.endpoints, result.legacy, result.migrated) == (1, 6, 2, 2)
 
-    def test_the_startup_sweep_follows_every_page(self) -> None:
+    def test_a_dry_run_counts_without_patching(self) -> None:
+        uid = uuid4()
+        client = MagicMock()
+        client.application.list.return_value = self._page([MagicMock(id="app_1")])
+        client.endpoint.list.return_value = self._page([MagicMock(id="ep_1", channels=[f"user.{uid}"])])
+        with patch.object(svix_service, "_client", client):
+            result = svix_service.migrate_legacy_user_channels(dry_run=True)
+        assert (result.legacy, result.migrated) == (1, 0)
+        client.endpoint.patch.assert_not_called()
+
+    def test_the_migration_follows_every_page(self) -> None:
         uid = uuid4()
         client = MagicMock()
         client.application.list.side_effect = [
@@ -544,27 +550,26 @@ class TestUserChannelsReachSvixAsPseudonyms:
             self._page([MagicMock(id="ep_2", channels=[f"user.{uid}"])]),
         ]
         with patch.object(svix_service, "_client", client):
-            assert _migrate_legacy_user_channels() == 2
+            assert svix_service.migrate_legacy_user_channels().migrated == 2
         assert [c.args[1] for c in client.endpoint.patch.call_args_list] == ["ep_1", "ep_2"]
 
-    def test_a_failing_sweep_never_blocks_startup_and_reaches_sentry(self) -> None:
+    def test_a_failing_migration_raises_rather_than_reporting_nothing_to_do(self) -> None:
+        """A Svix outage must not read as "0 legacy endpoints". The caller (the script) turns the
+        exception into a non-zero exit so the operator reruns it."""
         client = MagicMock()
         client.application.list.side_effect = httpx.ConnectError("svix down")
-        with (
-            patch.object(svix_service, "_client", client),
-            patch.object(svix_service, "log_and_capture_error") as capture,
-        ):
-            assert _migrate_legacy_user_channels() == 0
-        capture.assert_called_once()
+        with patch.object(svix_service, "_client", client), pytest.raises(httpx.ConnectError):
+            svix_service.migrate_legacy_user_channels()
 
-    def test_the_api_runs_the_sweep_at_startup(self) -> None:
+    def test_the_api_does_not_run_the_migration_at_startup(self) -> None:
+        """It is a one-shot operator step, not startup work: startup must not wait on Svix for it."""
         import asyncio
 
         from app import main
 
         with (
             patch.object(main.svix_service, "register_event_types"),
-            patch.object(main.svix_service, "migrate_legacy_user_channels") as sweep,
+            patch.object(main.svix_service, "migrate_legacy_user_channels") as migration,
         ):
 
             async def run() -> None:
@@ -572,7 +577,7 @@ class TestUserChannelsReachSvixAsPseudonyms:
                     pass
 
             asyncio.run(run())
-        sweep.assert_called_once()
+        migration.assert_not_called()
 
     def test_an_endpoint_reports_its_user_filter(self) -> None:
         uid = uuid4()
