@@ -39,6 +39,7 @@ for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
 @asynccontextmanager
 async def _lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
     svix_service.register_event_types()
+    svix_service.migrate_legacy_user_channels()
     yield
 
 

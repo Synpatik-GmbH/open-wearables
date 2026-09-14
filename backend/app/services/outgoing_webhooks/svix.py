@@ -18,7 +18,9 @@ import httpx
 from jose import jwt
 from svix.api import (
     ApplicationIn,
+    ApplicationListOptions,
     EndpointIn,
+    EndpointListOptions,
     EndpointOut,
     EndpointPatch,
     EventTypeIn,
@@ -116,6 +118,45 @@ def register_event_types() -> None:
                 _client.event_type.update(evt.value, EventTypeUpdate(description=description))
             except Exception:
                 logger.exception("Failed to register/update event type %s", evt.value)
+
+
+def migrate_legacy_user_channels() -> int:
+    """Rewrite every endpoint channel still in the readable ``user.<uuid>`` form; return the count.
+
+    An endpoint scoped to a user before pseudonymisation filters on ``user.<uuid>``, and no message
+    carries that any more, so it would silently receive nothing while the API still reported its
+    filter.  Runs at API startup and is idempotent: an endpoint already pseudonymous, unscoped, on
+    a non-user channel, or on a token under a previous key is left alone.  A failure is captured
+    and never blocks startup.
+    """
+    if not is_enabled():
+        return 0
+    assert _client is not None
+    migrated = 0
+    try:
+        app_iterator: str | None = None
+        while True:
+            apps = _client.application.list(ApplicationListOptions(limit=250, iterator=app_iterator))
+            for app in apps.data:
+                ep_iterator: str | None = None
+                while True:
+                    endpoints = _client.endpoint.list(app.id, EndpointListOptions(limit=250, iterator=ep_iterator))
+                    for ep in endpoints.data:
+                        target = pseudonyms.pseudonymous_channels(ep.channels)
+                        if ep.channels and target != list(ep.channels):
+                            _client.endpoint.patch(app.id, ep.id, EndpointPatch.model_validate({"channels": target}))
+                            migrated += 1
+                    if endpoints.done:
+                        break
+                    ep_iterator = endpoints.iterator
+            if apps.done:
+                break
+            app_iterator = apps.iterator
+    except Exception as exc:
+        log_and_capture_error(exc, logger, "Failed to migrate legacy Svix user channels")
+    if migrated:
+        logger.info("Migrated %d Svix endpoint(s) from readable to pseudonymous user channels", migrated)
+    return migrated
 
 
 def ensure_application(developer_id: str, developer_email: str) -> str:

@@ -214,7 +214,10 @@ def flush_redis(_redis_url: str) -> Generator[None, None, None]:
 def mock_svix_lifespan() -> Generator[MagicMock, None, None]:
     """Prevent register_event_types() from making ~170 HTTP calls to Svix on
     every TestClient lifespan startup during tests."""
-    with patch("app.services.outgoing_webhooks.svix.register_event_types") as mock:
+    with (
+        patch("app.services.outgoing_webhooks.svix.register_event_types") as mock,
+        patch("app.services.outgoing_webhooks.svix.migrate_legacy_user_channels"),
+    ):
         yield mock
 
 
