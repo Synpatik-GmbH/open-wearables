@@ -245,8 +245,13 @@ def has_endpoints(app_id: str) -> bool:
     assert _client is not None
     try:
         return bool(_client.endpoint.list(app_id).data)
-    except httpx.ConnectError:
-        logger.warning("Svix server unreachable during endpoint lookup for app=%s; deferring to send", app_id)
+    except httpx.ConnectError as exc:
+        log_and_capture_error(
+            exc,
+            logger,
+            f"Svix server unreachable during endpoint lookup for app={app_id}; deferring to send",
+            level="warning",
+        )
         return True
     except HttpError as exc:
         if exc.status_code == 404:

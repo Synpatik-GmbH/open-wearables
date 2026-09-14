@@ -310,8 +310,14 @@ class TestHasEndpoints:
 
     def test_an_unreachable_svix_does_not_skip_the_developer(self) -> None:
         client = self._client_listing(httpx.ConnectError("connection refused"))
-        with patch.object(svix_service, "_client", client):
+        with (
+            patch.object(svix_service, "_client", client),
+            patch.object(svix_service, "log_and_capture_error") as capture,
+        ):
             assert svix_service.has_endpoints(str(uuid4())) is True
+        # Swallowed, so it must still reach Sentry (backend/AGENTS.md): a recurring outage
+        # during the lookup is otherwise visible only in the application log.
+        capture.assert_called_once()
 
     def test_any_other_lookup_failure_does_not_skip_the_developer(self) -> None:
         client = self._client_listing(HttpError("server_error", "boom", 500))
