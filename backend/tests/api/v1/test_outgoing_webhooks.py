@@ -450,6 +450,46 @@ class TestUserChannelsReachSvixAsPseudonyms:
         assert created.channels == [pseudonyms.user_channel(uid)]
         assert patched.channels == [pseudonyms.user_channel(uid)]
 
+    @pytest.mark.parametrize("form", ["legacy", "pseudonymous"])
+    def test_send_never_hands_svix_a_readable_user_channel(self, form: str) -> None:
+        """The Svix boundary pseudonymises, not only the producers.
+
+        A Celery job enqueued by the previous release (or by an old producer during a rolling
+        deploy) still carries ``user.<uuid>``; the worker passes it straight to ``send``. Whatever
+        form arrives, Svix must receive the pseudonymous channel — and an already-pseudonymous one
+        must pass through unchanged, not be encrypted twice.
+        """
+        uid = uuid4()
+        incoming = f"user.{uid}" if form == "legacy" else pseudonyms.user_channel(uid)
+        client = MagicMock()
+        with patch.object(svix_service, "_client", client):
+            svix_service.send("workout.created", str(uuid4()), {"data": {}}, channels=[incoming, "project_123"])
+
+        sent = client.message.create.call_args[0][1].channels
+        assert sent == [pseudonyms.user_channel(uid), "project_123"]
+        assert str(uid) not in repr(sent)
+
+    def test_a_job_queued_by_the_previous_release_reaches_svix_pseudonymised(self) -> None:
+        """End to end through the real emit task with the kwargs an old producer enqueued."""
+        uid = uuid4()
+        client = MagicMock()
+        client.endpoint.list.return_value = MagicMock(data=[MagicMock()])
+        client.message.create.return_value = MagicMock(id="msg_1")
+        with (
+            patch.object(svix_service, "_client", client),
+            patch("app.integrations.celery.tasks.emit_webhook_event_task.developer_service") as devs,
+        ):
+            devs.crud.get_all.return_value = [MagicMock(id=uuid4(), email="dev@test.com")]
+            emit_webhook_event(
+                "workout.created",
+                {"type": "workout.created", "data": {}},
+                channels=[f"user.{uid}"],
+                idempotency_key=f"workout.created.{uuid4()}",
+            )
+
+        sent = client.message.create.call_args[0][1].channels
+        assert sent == [pseudonyms.user_channel(uid)]
+
     def test_an_endpoint_reports_its_user_filter(self) -> None:
         uid = uuid4()
         ep = MagicMock(channels=[pseudonyms.user_channel(uid)])

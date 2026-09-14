@@ -159,7 +159,10 @@ def send(
                 event_type=event_type,
                 payload=payload,
                 event_id=event_id,
-                channels=channels or None,
+                # Pseudonymised HERE as well as at the producers: a job enqueued by an earlier
+                # release still carries the readable user.<uuid>, and this is the last point
+                # before Svix stores it permanently.
+                channels=pseudonyms.pseudonymous_channels(channels) or None,
                 payload_retention_period=settings.svix_payload_retention_days,
             ),
         )

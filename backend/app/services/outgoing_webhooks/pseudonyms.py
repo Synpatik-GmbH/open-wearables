@@ -104,6 +104,23 @@ def user_id_from_channel(channel: str, *, secret: SecretStr | None = None) -> UU
         return None
 
 
+def pseudonymous_channels(channels: list[str] | None) -> list[str] | None:
+    """Channels as Svix must receive them: every user channel in its pseudonymous form.
+
+    Applied at the Svix boundary, not only by producers, because a Celery job enqueued by an
+    earlier release still carries the readable ``user.<uuid>``.  Idempotent: an already
+    pseudonymous channel decrypts to its user and re-encrypts to the same token; a channel naming
+    no user passes through unchanged.
+    """
+    if channels is None:
+        return None
+    out: list[str] = []
+    for channel in channels:
+        user_id = user_id_from_channel(channel)
+        out.append(user_channel(user_id) if user_id is not None else channel)
+    return out
+
+
 def readable_channels(channels: list[str] | None) -> list[str] | None:
     """Channels as the developer API reports them: user channels decoded to ``user.<uuid>``."""
     if channels is None:
