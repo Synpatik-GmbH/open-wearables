@@ -122,32 +122,53 @@ class TestRefreshToken:
     def test_refresh_token_rotation_invalidates_old_token(
         self, client: TestClient, db: Session, api_v1_prefix: str
     ) -> None:
-        """Old refresh token should be invalid after rotation."""
-        # Arrange
+        """An SDK token stops working once its successor has been used (fork spec D-05).
+
+        Upstream rejected it straight after rotation; a reply the phone never applied then
+        locked the phone out for good. The old token now keeps its successor until that is used.
+        """
         user = UserFactory()
         old_refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, "test_app")
 
-        # Act - refresh once to rotate
-        response = client.post(
-            f"{api_v1_prefix}/token/refresh",
-            json={"refresh_token": old_refresh_token},
-        )
-        assert response.status_code == 200
-        new_refresh_token = response.json()["refresh_token"]
+        first = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": old_refresh_token})
+        assert first.status_code == 200
+        new_refresh_token = first.json()["refresh_token"]
 
-        # Assert - old token should be invalid
-        response = client.post(
-            f"{api_v1_prefix}/token/refresh",
-            json={"refresh_token": old_refresh_token},
-        )
+        second = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": new_refresh_token})
+        assert second.status_code == 200
+
+        response = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": old_refresh_token})
         assert response.status_code == 401
 
-        # Assert - new token should work
-        response = client.post(
-            f"{api_v1_prefix}/token/refresh",
-            json={"refresh_token": new_refresh_token},
-        )
-        assert response.status_code == 200
+    def test_developer_refresh_token_rotation_invalidates_old_token(
+        self, client: TestClient, db: Session, api_v1_prefix: str
+    ) -> None:
+        """Developer tokens keep upstream's strict rotation (fork spec D-04)."""
+        developer = DeveloperFactory()
+        old_refresh_token = refresh_token_service.create_developer_refresh_token(db, developer.id)
+
+        first = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": old_refresh_token})
+        assert first.status_code == 200
+
+        response = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": old_refresh_token})
+        assert response.status_code == 401
+
+    def test_second_mint_for_same_user_and_app_revokes_the_first_token(
+        self, client: TestClient, db: Session, api_v1_prefix: str
+    ) -> None:
+        """POST /users/{id}/token revokes earlier SDK chains for that user and app (fork spec D-11)."""
+        developer = DeveloperFactory()
+        application = ApplicationFactory(developer=developer, app_secret="test_app_secret")
+        user = UserFactory()
+        credentials = {"app_id": application.app_id, "app_secret": "test_app_secret"}
+
+        first = client.post(f"{api_v1_prefix}/users/{user.id}/token", json=credentials)
+        assert first.status_code == 200
+        second = client.post(f"{api_v1_prefix}/users/{user.id}/token", json=credentials)
+        assert second.status_code == 200
+
+        response = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": first.json()["refresh_token"]})
+        assert response.status_code == 401
 
 
 class TestRevokeRefreshToken:

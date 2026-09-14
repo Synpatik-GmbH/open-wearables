@@ -69,6 +69,12 @@ When a user wants to connect their health data, your backend should:
 2. Call Open Wearables API at [`POST /api/v1/users/{user_id}/token`](/api-reference/mobile-sdk/create-user-token) with your App credentials
 3. Return the `access_token` and `refresh_token` to the mobile app
 
+<Warning>
+  Issuing a token revokes every refresh token still live for that user and application. A
+  second call — including a provisioning retry — disconnects the device currently holding a
+  token, and that device must re-authenticate to resume syncing.
+</Warning>
+
 <Tabs>
   <Tab title="Node.js">
 ```javascript

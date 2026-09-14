@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
     token_lifetime: int = 3600
+    # How long a superseded SDK refresh token may still be exchanged for its unused successor
+    # (fork spec 2026-09-11, D-05). Positive whole seconds; default 7 days (Q-01).
+    sdk_refresh_grace_seconds: int = 604800
 
     # VALIDATION SETTINGS
     min_password_length: int = 8
@@ -282,6 +285,13 @@ class Settings(BaseSettings):
         if isinstance(v, str) and not v.strip():
             return None
         return parse_duration(str(v))  # "2d" / "20h" / "1d12h" → timedelta (fail fast at startup)
+
+    @field_validator("sdk_refresh_grace_seconds")
+    @classmethod
+    def _validate_sdk_refresh_grace_seconds(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("SDK_REFRESH_GRACE_SECONDS must be a positive number of seconds")
+        return v
 
     def oauth_redirect_uri(self, provider: ProviderName) -> str:
         """Build OAuth redirect URI for a provider.

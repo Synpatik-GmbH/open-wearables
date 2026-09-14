@@ -1,6 +1,8 @@
 import secrets
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from logging import Logger, getLogger
+from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -12,27 +14,70 @@ from app.repositories.refresh_token_repository import refresh_token_repository
 from app.schemas.auth import TokenResponse, TokenType
 from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.security import create_access_token
+from app.utils.structured_logging import log_structured
+
+# D-08 (fork spec 2026-09-11): the strings the committed stuck-client query filters on.
+REFRESH_ACTION_ROTATED = "refresh_token_rotated"
+REFRESH_ACTION_GRACE_REISSUED = "refresh_token_grace_reissued"
+REFRESH_ACTION_REJECTED = "refresh_token_rejected"
+REFRESH_REASON_UNKNOWN = "unknown"
+REFRESH_REASON_REVOKED = "revoked"
+REFRESH_REASON_SUCCESSOR_USED = "rotated_successor_used"
+REFRESH_REASON_PAST_GRACE = "rotated_past_grace"
+# Built from the names above, and every rejection emits through those same names: the emitted set and
+# this tuple are one thing, so a reason the committed query does not know cannot be added silently.
+REFRESH_REJECT_REASONS: tuple[str, ...] = (
+    REFRESH_REASON_UNKNOWN,
+    REFRESH_REASON_REVOKED,
+    REFRESH_REASON_SUCCESSOR_USED,
+    REFRESH_REASON_PAST_GRACE,
+)
 
 
 class RefreshTokenService:
     """Service for managing refresh tokens."""
 
-    def __init__(self, log: Logger) -> None:
+    def __init__(self, log: Logger, now: Callable[[], datetime] | None = None) -> None:
         self.logger = log
         self.repo = refresh_token_repository
+        self._now: Callable[[], datetime] = now or (lambda: datetime.now(timezone.utc))
 
     @staticmethod
     def _generate_refresh_token_id() -> str:
         """Generate an opaque refresh token ID with rt- prefix."""
         return f"rt-{secrets.token_hex(16)}"
 
-    def create_sdk_refresh_token(self, db_session: DbSession, user_id: UUID, app_id: str) -> str:
+    @staticmethod
+    def _unauthorized() -> HTTPException:
+        return HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or revoked refresh token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    @staticmethod
+    def _sdk_token_response(user_id: UUID, app_id: str, refresh_token: str) -> TokenResponse:
+        return TokenResponse(
+            access_token=create_sdk_user_token(app_id=app_id, user_id=str(user_id)),
+            token_type="bearer",
+            refresh_token=refresh_token,
+            expires_in=settings.access_token_expire_minutes * 60,
+        )
+
+    def _log_refresh(self, action: str, **fields: Any) -> None:
+        """Exactly one D-08 line per SDK refresh that returns 200 or 401; bare JSON on stdout at info."""
+        log_structured(self.logger, "info", action, action=action, **fields)
+
+    def create_sdk_refresh_token(
+        self, db_session: DbSession, user_id: UUID, app_id: str, rotated_from: str | None = None
+    ) -> str:
         """Create a refresh token for an SDK token.
 
         Args:
             db_session: Database session
             user_id: The OpenWearables User ID
             app_id: The application ID that created the token
+            rotated_from: The token this one replaces, when created by rotation (fork spec D-03)
 
         Returns:
             The refresh token string (rt-{hex})
@@ -47,10 +92,21 @@ class RefreshTokenService:
             created_at=datetime.now(timezone.utc),
             last_used_at=None,
             revoked_at=None,
+            rotated_from=rotated_from,
         )
         self.repo.create(db_session, token)
         self.logger.debug(f"Created SDK refresh token for user {user_id}, app {app_id}")
         return token_id
+
+    def mint_sdk_refresh_token(self, db_session: DbSession, user_id: UUID, app_id: str) -> str:
+        """Fresh SDK mint: revoke the user's earlier live SDK tokens for this app, then create one.
+
+        Calibra is one phone per account (fork spec D-11): a reconnect means "this phone is the one".
+        Runs under the (user, app) lock so a concurrent rotation cannot slip a successor past it (D-06).
+        """
+        self.repo.lock_user_app(db_session, user_id, app_id)
+        self.repo.revoke_live_sdk_tokens(db_session, user_id, app_id, self._now())
+        return self.create_sdk_refresh_token(db_session, user_id, app_id)  # one commit for both
 
     def create_developer_refresh_token(self, db_session: DbSession, developer_id: UUID) -> str:
         """Create a refresh token for a developer token.
@@ -80,43 +136,80 @@ class RefreshTokenService:
     def refresh_token(self, db_session: DbSession, refresh_token_str: str) -> TokenResponse:
         """Exchange a refresh token for a new access token.
 
-        Implements refresh token rotation: the old refresh token is revoked and
-        a new one is issued with each refresh request.
-
-        Args:
-            db_session: Database session
-            refresh_token_str: The refresh token string
-
-        Returns:
-            TokenResponse with new access token and new refresh token
+        SDK tokens follow the fork spec 2026-09-11 (INV-01): serialised per (user, app), linked
+        rotation. Developer tokens keep upstream's strict rotation unchanged (D-04).
 
         Raises:
-            HTTPException: If the refresh token is invalid or revoked
+            HTTPException: 401 if the refresh token is invalid or revoked
         """
+        first_read = self.repo.get_by_id(db_session, refresh_token_str)
+        if first_read is None:
+            self._log_refresh(REFRESH_ACTION_REJECTED, reason=REFRESH_REASON_UNKNOWN)
+            raise self._unauthorized()
+        if first_read.token_type != TokenType.SDK:
+            return self._refresh_non_sdk(db_session, refresh_token_str)
+        return self._refresh_sdk(db_session, first_read)
+
+    def _refresh_sdk(self, db_session: DbSession, first_read: RefreshToken) -> TokenResponse:
+        """SDK branch of INV-01. Primitives are captured before any commit (attributes expire on commit)."""
+        token_id = first_read.id
+        user_id = first_read.user_id
+        app_id = first_read.app_id
+        self.repo.lock_user_app(db_session, user_id, app_id)  # ty:ignore[invalid-argument-type]
+        token = self.repo.get_by_id(db_session, token_id)
+        if token is None:
+            db_session.commit()  # nothing written; ends the transaction, releasing the lock
+            self._log_refresh(
+                REFRESH_ACTION_REJECTED,
+                reason=REFRESH_REASON_UNKNOWN,
+                user_id=user_id,
+                token_type=TokenType.SDK,
+            )
+            raise self._unauthorized()
+        if token.revoked_at is None:
+            self.repo.mark_revoked(token, self._now())
+            # create_sdk_refresh_token commits once: the revoke above and the successor insert together
+            successor_id = self.create_sdk_refresh_token(
+                db_session,
+                user_id=user_id,  # ty:ignore[invalid-argument-type]
+                app_id=app_id,  # ty:ignore[invalid-argument-type]
+                rotated_from=token_id,
+            )
+            self._log_refresh(REFRESH_ACTION_ROTATED, user_id=user_id, token_type=TokenType.SDK)
+            return self._sdk_token_response(user_id, app_id, successor_id)  # ty:ignore[invalid-argument-type]
+        # token was revoked. Only a rotation leaves a successor naming it (D-03).
+        successor = self.repo.get_successor(db_session, token_id)
+        rotated_age = self._now() - token.revoked_at
+        if successor is None:
+            reason = REFRESH_REASON_REVOKED
+        elif successor.revoked_at is not None:
+            reason = REFRESH_REASON_SUCCESSOR_USED
+        elif rotated_age > timedelta(seconds=settings.sdk_refresh_grace_seconds):
+            reason = REFRESH_REASON_PAST_GRACE
+        else:
+            successor_id = successor.id
+            db_session.commit()  # grace writes nothing (INV-04); ends the transaction, releasing the lock
+            self._log_refresh(
+                REFRESH_ACTION_GRACE_REISSUED,
+                user_id=user_id,
+                token_type=TokenType.SDK,
+                rotated_age_seconds=int(rotated_age.total_seconds()),
+            )
+            return self._sdk_token_response(user_id, app_id, successor_id)  # ty:ignore[invalid-argument-type]
+        db_session.commit()
+        self._log_refresh(REFRESH_ACTION_REJECTED, reason=reason, user_id=user_id, token_type=TokenType.SDK)
+        raise self._unauthorized()
+
+    def _refresh_non_sdk(self, db_session: DbSession, refresh_token_str: str) -> TokenResponse:
+        """Upstream behaviour for developer tokens, unchanged (fork spec D-04)."""
         token = self.repo.get_valid_token(db_session, refresh_token_str)
         if not token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or revoked refresh token",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
+            raise self._unauthorized()
 
         # Revoke the old refresh token (rotation)
         self.repo.revoke_token(db_session, token)
 
-        # Generate new access token and refresh token based on token type
-        if token.token_type == TokenType.SDK:
-            access_token = create_sdk_user_token(
-                app_id=token.app_id,  # ty:ignore[invalid-argument-type]
-                user_id=str(token.user_id),
-            )
-            new_refresh_token = self.create_sdk_refresh_token(
-                db_session,
-                user_id=token.user_id,  # ty:ignore[invalid-argument-type]
-                app_id=token.app_id,  # ty:ignore[invalid-argument-type]
-            )
-            self.logger.debug(f"Refreshed SDK token for user {token.user_id} (rotated)")
-        elif token.token_type == TokenType.DEVELOPER:
+        if token.token_type == TokenType.DEVELOPER:
             access_token = create_access_token(subject=str(token.developer_id))
             new_refresh_token = self.create_developer_refresh_token(
                 db_session,
@@ -139,23 +232,43 @@ class RefreshTokenService:
     def revoke_token(self, db_session: DbSession, refresh_token_str: str) -> bool:
         """Revoke a refresh token.
 
-        Args:
-            db_session: Database session
-            refresh_token_str: The refresh token string
-
-        Returns:
-            True if the token was revoked, False if not found
+        For an SDK token that was rotated and whose successor is unrevoked, the successor is revoked
+        instead (fork spec INV-03): otherwise a phone that missed a rotation reply and then logged out
+        would leave its successor live. Developer tokens keep upstream behaviour (D-04).
 
         Raises:
-            HTTPException: If the refresh token is not found
+            HTTPException: 404 if there is nothing to revoke
         """
+        first_read = self.repo.get_by_id(db_session, refresh_token_str)
+        if first_read is None:
+            raise self._not_found()
+        if first_read.token_type != TokenType.SDK:
+            return self._revoke_non_sdk(db_session, refresh_token_str)
+        token_id = first_read.id
+        self.repo.lock_user_app(db_session, first_read.user_id, first_read.app_id)  # ty:ignore[invalid-argument-type]
+        token = self.repo.get_by_id(db_session, token_id)
+        if token is None:
+            db_session.commit()
+            raise self._not_found()
+        if token.revoked_at is None:
+            self.repo.revoke_token(db_session, token)  # commits
+            return True
+        successor = self.repo.get_successor(db_session, token_id)
+        if successor is None or successor.revoked_at is not None:
+            db_session.commit()
+            raise self._not_found()
+        self.repo.revoke_token(db_session, successor)  # commits
+        return True
+
+    @staticmethod
+    def _not_found() -> HTTPException:
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Refresh token not found")
+
+    def _revoke_non_sdk(self, db_session: DbSession, refresh_token_str: str) -> bool:
+        """Upstream behaviour for developer tokens, unchanged (fork spec D-04)."""
         token = self.repo.get_valid_token(db_session, refresh_token_str)
         if not token:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Refresh token not found",
-            )
-
+            raise self._not_found()
         self.repo.revoke_token(db_session, token)
         self.logger.debug(f"Revoked refresh token {refresh_token_str[:10]}...")
         return True
