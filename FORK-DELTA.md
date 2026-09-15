@@ -18,13 +18,13 @@ the-momentum (upstream)  ──tag──►  main            (pristine mirror, f
 ```
 
 - Production is built by `calibra-ow-deploy/.github/workflows/deploy-openwearables.yml`
-  from `OW_REPO = Synpatik-GmbH/open-wearables` at the tag in `OW_REF` (currently `0.5.2-syn.7`).
+  from `OW_REPO = Synpatik-GmbH/open-wearables` at the tag in `OW_REF` (currently `0.6.2-syn.8`).
 - Deploys always reference an **immutable tag**, never a branch head.
 
 ## Current base
 
 - **Now on: 0.6.2** (`a07818f`) — upgraded from 0.5.2 (`a2060c7`) on 2026-07-07.
-- `release/0.6.2-syn` = 6 commits on the 0.6.2 mirror; tag `0.6.2-syn.1` pending deploy.
+- `release/0.6.2-syn` = the 0.6.2 mirror plus the delta below; latest tag `0.6.2-syn.8`, deployed to dev 2026-09-15.
 
 ---
 
