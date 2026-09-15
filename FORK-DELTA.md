@@ -51,7 +51,8 @@ These are genuinely Synaptik-specific and will never be upstreamed. **The reconc
 checklist for any upgrade is: confirm each of these still applies and still behaves.**
 
 Commit hashes below are the **current `release/0.6.2-syn`** shas (update each upgrade).
-Multi-commit deltas cite the **merge** commit and its PR number.
+A row that gives a PR number cites that PR's **merge** commit; a row without one cites the fix
+commit itself.
 
 🔒 marks a **data-protection control** — something the DPIA states as operating. Its row says what
 breaks if it is dropped, because the consequence is not "a feature is missing": the deployment stops
