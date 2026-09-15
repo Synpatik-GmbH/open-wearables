@@ -323,6 +323,10 @@ OpenWearablesHealthSDK.shared.signIn(
 
 When you provide a `refreshToken`, the SDK automatically handles 401 responses by refreshing the access token and retrying the request. No additional configuration is needed.
 
+<Note>
+  **A deleted user's session cannot be refreshed.** SDK tokens are valid only while their user exists in Open Wearables. After the user is deleted, every `/sdk/` request with their access token returns `401`, and the automatic refresh also returns `401` because deleting a user removes their refresh tokens. An API key sent with the same request does not rescue the token. Treat a `401` from the refresh itself as terminal: stop syncing and get new credentials from your backend instead of retrying.
+</Note>
+
 You can also update tokens manually if needed:
 
 ```swift

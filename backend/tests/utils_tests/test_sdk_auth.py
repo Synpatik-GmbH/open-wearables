@@ -13,6 +13,7 @@ from app.config import settings
 from app.services import user_service
 from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.auth import get_current_developer, get_sdk_auth
+from app.utils.security import create_access_token
 from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
 
 SDK_AUTH_REQUIRED = "Authentication required: provide SDK token or API key"
@@ -103,8 +104,6 @@ class TestSDKTokenBlockedFromDeveloperEndpoints:
     @pytest.mark.asyncio
     async def test_developer_token_accepted_by_get_current_developer(self, db: Session) -> None:
         """Developer tokens should still work with get_current_developer."""
-        from app.utils.security import create_access_token
-
         developer = DeveloperFactory()
         dev_token = create_access_token(subject=str(developer.id))
 
@@ -184,8 +183,6 @@ class TestGetSDKAuthSubjectMustExist:
 
     @pytest.mark.asyncio
     async def test_non_sdk_jwt_still_falls_through_to_api_key(self, db: Session) -> None:
-        from app.utils.security import create_access_token
-
         api_key = ApiKeyFactory()
         developer_token = create_access_token(subject=str(DeveloperFactory().id))
 

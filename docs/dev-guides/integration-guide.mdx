@@ -149,7 +149,7 @@ curl -X POST http://localhost:8000/api/v1/sdk/users/{user_id}/sync/samsung \
 </Warning>
 
 <Note>
-SDK tokens are **only valid for `/sdk/` endpoints**. All other API endpoints will return 401 for SDK tokens. Use API keys for those endpoints. The `user_id` in the URL must match the user the token was issued for.
+SDK tokens are **only valid for `/sdk/` endpoints**. All other API endpoints will return 401 for SDK tokens. Use API keys for those endpoints. The `user_id` in the URL must match the user the token was issued for, and that user must still exist: after the user is deleted the token returns 401 on every `/sdk/` endpoint, refresh fails too, and an API key sent alongside does not rescue it.
 </Note>
 
 ---

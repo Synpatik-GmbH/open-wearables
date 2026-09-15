@@ -31,6 +31,8 @@ from app.services.apple.healthkit.sleep_service import (
     finish_sleep,
     handle_sleep_data,
 )
+from app.services.sdk_token_service import create_sdk_user_token
+from tests.factories import UserFactory
 
 
 def _dt(iso: str) -> datetime:
@@ -638,9 +640,6 @@ class TestSDKSyncEndpointSleep:
         db: Session,
     ) -> None:
         """Endpoint should validate payload with 'sleeping' stage (older Apple Watch)."""
-        from app.services.sdk_token_service import create_sdk_user_token
-        from tests.factories import UserFactory
-
         user_id = str(uuid4())
         UserFactory(id=UUID(user_id))
         token = create_sdk_user_token("test_app", user_id)
@@ -665,9 +664,6 @@ class TestSDKSyncEndpointSleep:
         db: Session,
     ) -> None:
         """Endpoint should validate payload with detailed sleep stages."""
-        from app.services.sdk_token_service import create_sdk_user_token
-        from tests.factories import UserFactory
-
         user_id = str(uuid4())
         UserFactory(id=UUID(user_id))
         token = create_sdk_user_token("test_app", user_id)

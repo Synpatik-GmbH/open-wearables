@@ -77,7 +77,7 @@ The SDK uses a secure token-based authentication flow that keeps your App creden
 1. **App credentials stay on your backend** - `app_id` and `app_secret` are never exposed to mobile apps
 2. **Short-lived access tokens** - Generated server-to-server via `POST /api/v1/users/{user_id}/token`, forwarded to the mobile SDK
 3. **Secure credential storage** - iOS Keychain / Android EncryptedSharedPreferences
-4. **Automatic token refresh** - SDK can automatically refresh expired tokens using the `refresh_token`
+4. **Automatic token refresh** - SDK can automatically refresh expired tokens using the `refresh_token`. Tokens stop working, refresh included, once their user is deleted
 5. **API key auth** - Alternative for internal tools (not recommended for production)
 
 <Warning>
