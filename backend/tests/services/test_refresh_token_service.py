@@ -13,6 +13,7 @@ from app.config import settings
 from app.models import RefreshToken
 from app.repositories.refresh_token_repository import refresh_token_repository
 from app.schemas.auth import TokenType
+from app.services import user_service
 from app.services.refresh_token_service import refresh_token_service
 from tests.factories import DeveloperFactory, UserFactory
 
@@ -447,3 +448,28 @@ class TestSdkMintRevokesEarlierChains:
         with pytest.raises(HTTPException) as exc_info:
             refresh_token_service.refresh_token(db, old)
         assert exc_info.value.status_code == 401
+
+
+class TestRefreshAfterUserDeletion:
+    """INV-02: deleting an OW user makes every one of their SDK refresh tokens fail."""
+
+    def test_refresh_succeeds_while_user_exists(self, db: Session) -> None:
+        user = UserFactory()
+        token = refresh_token_service.create_sdk_refresh_token(db, user.id, "app_inv02")
+
+        result = refresh_token_service.refresh_token(db, token)
+
+        assert result.refresh_token != token
+
+    def test_refresh_fails_after_user_is_deleted(self, db: Session) -> None:
+        user = UserFactory()
+        token = refresh_token_service.create_sdk_refresh_token(db, user.id, "app_inv02")
+
+        user_service.delete(db, user.id)
+        db.expire_all()
+
+        with pytest.raises(HTTPException) as exc_info:
+            refresh_token_service.refresh_token(db, token)
+
+        assert exc_info.value.status_code == 401
+        assert db.scalar(select(RefreshToken).where(RefreshToken.id == token)) is None
