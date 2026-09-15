@@ -73,6 +73,7 @@ keywords: ["open wearables api errors", "health api error handling", "wearable a
 **Solution:** Complete the OAuth flow first:
 ```bash
 GET /api/v1/oauth/garmin/authorize?user_id={user_id}
+X-Open-Wearables-API-Key: YOUR_API_KEY
 ```
 
 ### Token Expired
@@ -96,6 +97,7 @@ Or:
 **Solution:** User needs to reconnect via OAuth:
 ```bash
 GET /api/v1/oauth/garmin/authorize?user_id={user_id}
+X-Open-Wearables-API-Key: YOUR_API_KEY
 ```
 
 ### Provider Doesn't Support OAuth
