@@ -2,13 +2,15 @@
 
 from collections.abc import Generator
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 import pytest
 from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
 
+from app.services import user_service
 from app.services.sdk_token_service import create_sdk_user_token
-from tests.factories import ApiKeyFactory, DeveloperFactory
+from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
 from tests.utils import developer_auth_headers
 
 
@@ -28,6 +30,7 @@ class TestSDKSyncWithSDKToken:
     ) -> None:
         """SDK token should be accepted for apple-health-sdk sync."""
         user_id = "123e4567-e89b-12d3-a456-426614174000"
+        UserFactory(id=UUID(user_id))
         token = create_sdk_user_token("app_123", user_id)
 
         response = client.post(
@@ -157,3 +160,29 @@ class TestSDKTokenBlockedElsewhere:
         )
 
         assert response.status_code == 200
+
+
+class TestSDKSyncDeletedUser:
+    """INV-01: a deleted user's SDK token never reaches the route or Celery."""
+
+    def test_deleted_user_token_returns_401_and_enqueues_nothing(
+        self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
+    ) -> None:
+        user = UserFactory()
+        user_id = str(user.id)
+        token = create_sdk_user_token("app_123", user_id)
+        user_service.delete(db, user.id)
+
+        response = client.post(
+            f"{api_v1_prefix}/sdk/users/{user_id}/sync/",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "provider": "apple",
+                "sdkVersion": "1.0.0",
+                "syncTimestamp": "2021-01-01T00:00:00Z",
+                "data": {"records": [], "sleep": [], "workouts": []},
+            },
+        )
+
+        assert response.status_code == 401
+        mock_celery_tasks.delay.assert_not_called()

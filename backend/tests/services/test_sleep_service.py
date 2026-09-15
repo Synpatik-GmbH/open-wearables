@@ -11,7 +11,7 @@ Apple Watch sleep data patterns:
 
 from datetime import datetime
 from unittest.mock import MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.orm import Session
@@ -639,8 +639,10 @@ class TestSDKSyncEndpointSleep:
     ) -> None:
         """Endpoint should validate payload with 'sleeping' stage (older Apple Watch)."""
         from app.services.sdk_token_service import create_sdk_user_token
+        from tests.factories import UserFactory
 
         user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
         token = create_sdk_user_token("test_app", user_id)
 
         with patch("app.api.routes.v1.sdk_sync.process_sdk_upload") as mock_task:
@@ -664,8 +666,10 @@ class TestSDKSyncEndpointSleep:
     ) -> None:
         """Endpoint should validate payload with detailed sleep stages."""
         from app.services.sdk_token_service import create_sdk_user_token
+        from tests.factories import UserFactory
 
         user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
         token = create_sdk_user_token("test_app", user_id)
 
         with patch("app.api.routes.v1.sdk_sync.process_sdk_upload") as mock_task:
