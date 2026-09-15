@@ -14,7 +14,7 @@ from app.schemas.model_crud.data_priority import (
     ProviderSettingRead,
     ProviderSettingUpdate,
 )
-from app.services import DeveloperDep, user_connection_service
+from app.services import ApiKeyDep, DeveloperDep, user_connection_service
 from app.services.provider_settings_service import ProviderSettingsService
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
@@ -45,6 +45,9 @@ def get_oauth_strategy(provider: ProviderName) -> BaseProviderStrategy:
 )
 def authorize_provider(
     provider: ProviderName,
+    # Fork delta: upstream leaves this unauthenticated, which lets any caller
+    # bind a wearable to any user_id. See FORK-DELTA.md.
+    _api_key: ApiKeyDep,
     user_id: Annotated[UUID, Query(description="User ID to connect")],
     redirect_uri: Annotated[str | None, Query(description="Optional redirect URI after authorization")] = None,
 ):
