@@ -15,6 +15,7 @@ from uuid import UUID
 from app.config import settings
 from app.constants.webhooks.events import SERIES_TYPE_TO_GRANULAR_EVENT, SERIES_TYPE_TO_GROUP_EVENT
 from app.schemas.webhooks.event_types import WebhookEventType
+from app.services.outgoing_webhooks import pseudonyms
 from app.services.outgoing_webhooks import svix as svix_service
 
 logger = logging.getLogger(__name__)
@@ -125,7 +126,7 @@ def on_workout_created(
             },
         },
         idempotency_key=f"workout.created.{record_id}",
-        channels=[f"user.{user_id}"],
+        channels=pseudonyms.user_channels(user_id),
     )
 
 
@@ -163,7 +164,7 @@ def on_menstrual_cycle_created(
             },
         },
         idempotency_key=f"menstrual_cycle.created.{record_id}",
-        channels=[f"user.{user_id}"],
+        channels=pseudonyms.user_channels(user_id),
     )
 
 
@@ -199,7 +200,7 @@ def on_sleep_created(
             },
         },
         idempotency_key=f"sleep.created.{record_id}",
-        channels=[f"user.{user_id}"],
+        channels=pseudonyms.user_channels(user_id),
     )
 
 
@@ -244,7 +245,7 @@ def on_timeseries_batch_saved(
             event_type,
             {"type": event_type, "data": payload_data},
             idempotency_key=_safe_key(f"{ikey}.{event_type}"),
-            channels=[f"user.{user_id}"],
+            channels=pseudonyms.user_channels(user_id),
         )
 
     if len(samples) <= SVIX_MAX_SAMPLES_PER_EVENT:
@@ -305,7 +306,7 @@ def on_connection_created(
             },
         },
         idempotency_key=f"connection.created.{user_id}.{provider}",
-        channels=[f"user.{user_id}"],
+        channels=pseudonyms.user_channels(user_id),
     )
 
 
@@ -335,7 +336,7 @@ def on_connection_revoked(
             },
         },
         idempotency_key=f"connection.revoked.{user_id}.{provider}.{revoked_at}",
-        channels=[f"user.{user_id}"],
+        channels=pseudonyms.user_channels(user_id),
     )
 
 
@@ -362,7 +363,7 @@ def on_sync_started(
             },
         },
         idempotency_key=f"sync.started.{run_id}",
-        channels=[f"user.{user_id}"],
+        channels=pseudonyms.user_channels(user_id),
     )
 
 
@@ -393,7 +394,7 @@ def on_sync_completed(
             },
         },
         idempotency_key=f"sync.completed.{run_id}",
-        channels=[f"user.{user_id}"],
+        channels=pseudonyms.user_channels(user_id),
     )
 
 
@@ -422,5 +423,5 @@ def on_sync_failed(
             },
         },
         idempotency_key=f"sync.failed.{run_id}",
-        channels=[f"user.{user_id}"],
+        channels=pseudonyms.user_channels(user_id),
     )

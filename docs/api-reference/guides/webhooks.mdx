@@ -465,6 +465,10 @@ Omit the field entirely to receive all event types.
 
 Pass `user_id` to scope an endpoint to events for a single user. All other users' events are silently dropped before delivery.
 
+<Note>
+Open Wearables never gives Svix a readable user id. Each message's user channel is stored in Svix as an opaque, per-user token, and the endpoints and messages APIs translate it back, so you keep seeing `user_id` and `user.<uuid>` channels in responses. **Upgrading a self-hosted installation:** an endpoint scoped to a user before this change still filters on the readable channel and receives nothing until migrated. Run [the Svix user-channel migration](/data-migrations/pseudonymise-svix-user-channels) once — `docker compose exec app uv run python scripts/data_migrations/pseudonymise_svix_user_channels.py --dry-run` to see how many exist, then without `--dry-run` to migrate them. It is idempotent, and exits non-zero if Svix could not be reached, in which case rerun it. Svix applies a changed endpoint only after refreshing its cached configuration, so an event sent in the moments right after the migration may still be routed by the old filter.
+</Note>
+
 ```bash
 curl -X POST "http://localhost:8000/api/v1/webhooks/endpoints" \
   -H "Authorization: Bearer YOUR_JWT_TOKEN" \
@@ -553,6 +557,15 @@ Every delivery includes three headers that let you confirm the payload was sent 
 
 The `svix-id` header is stable across retries — the same logical event always carries the same ID. Store received IDs and skip duplicates to make your handler idempotent.
 
+The `eventId` returned by `GET /api/v1/webhooks/messages` and by endpoint attempts is an **opaque digest**, not a readable key. It is deterministic, so Svix still rejects a second send of the same logical event, but it cannot be decoded and should not be parsed.
+
+<Warning>
+**Two situations deliver a logical event a second time**, with a new `svix-id`, so deduplicate on your own data as well as on `svix-id`:
+
+- **Upgrading to pseudonymous event ids.** An event first sent under the old readable id is not recognised when the same logical event is sent again after the upgrade, so it is delivered once more.
+- **Rotating `SVIX_PSEUDONYM_SECRET`.** Every digest changes, so events sent before the rotation stop deduplicating against new ones. Rotation also changes every user channel: an endpoint scoped to a user receives nothing, and reports `user_id` as `null` as if it were unscoped, until its `user_id` is saved again. Set the secret explicitly before the first event in production, and rotate it only deliberately.
+</Warning>
+
 ---
 
 ## Managing Endpoints
@@ -595,7 +608,12 @@ Open Wearables (via Svix) retries failed deliveries automatically with exponenti
 
 <AccordionGroup>
   <Accordion title="Retry schedule">
-    Svix retries each failed message at increasing intervals. If all retries are exhausted the message is marked as failed in delivery history — you can inspect it and manually trigger a resend from the Svix dashboard.
+    Svix retries each failed message at increasing intervals. If all retries are exhausted the message is marked as failed in delivery history — you can inspect it and manually trigger a resend from the Svix dashboard, for as long as the message's payload is retained (see **Payload retention**).
+  </Accordion>
+  <Accordion title="Payload retention">
+    Svix keeps each message's payload for **5 days** by default, then expires it. After that the payload can no longer be viewed and the message cannot be resent. The full retry schedule completes in about 27 hours 35 minutes, well inside the window.
+
+    Self-hosted deployments set the period with `SVIX_PAYLOAD_RETENTION_DAYS`, which accepts **5 to 90** days; a value outside that range fails startup. Shorter periods are not possible: the Svix server's floor is 5 days. If you need an event for longer, persist it when your endpoint receives it.
   </Accordion>
   <Accordion title="Expected endpoint behaviour">
     - Respond with a `2xx` status code as quickly as possible (before doing any heavy processing).
@@ -618,7 +636,7 @@ curl "http://localhost:8000/api/v1/webhooks/endpoints/ep_2t8Q4Xv9mNkRpLzYoB3cW7/
   -H "Authorization: Bearer YOUR_JWT_TOKEN"
 ```
 
-Each attempt includes the HTTP status code returned by your server and the timestamp of the attempt.
+Each attempt includes the HTTP status code returned by your server and the timestamp of the attempt. Once a message is older than the payload retention period (5 days by default) its payload has expired and it cannot be resent.
 
 ### View all sent messages
 

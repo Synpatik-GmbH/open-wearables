@@ -7,12 +7,14 @@ from jose import JWTError, jwt
 
 from app.config import settings
 from app.database import DbSession
-from app.models import Developer
+from app.models import Developer, User
 from app.repositories.developer_repository import DeveloperRepository
+from app.repositories.user_repository import UserRepository
 from app.schemas.auth import SDKAuthContext
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 developer_repository = DeveloperRepository(Developer)
+user_repository = UserRepository(User)
 
 
 async def get_current_developer(
@@ -94,6 +96,22 @@ DeveloperDep = Annotated[Developer, Depends(get_current_developer)]
 DeveloperOptionalDep = Annotated[Developer | None, Depends(get_current_developer_optional)]
 
 
+def _sdk_auth_required() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication required: provide SDK token or API key",
+    )
+
+
+def _parse_sdk_subject(sub: object) -> UUID | None:
+    if not isinstance(sub, str) or not sub:
+        return None
+    try:
+        return UUID(sub)
+    except ValueError:
+        return None
+
+
 async def get_sdk_auth(
     db: DbSession,
     token: Annotated[str | None, Depends(oauth2_scheme)] = None,
@@ -113,30 +131,29 @@ async def get_sdk_auth(
     # Try SDK user token first
     if token:
         try:
-            payload = jwt.decode(
-                token,
-                settings.secret_key,
-                algorithms=[settings.algorithm],
-            )
-            if payload.get("scope") == "sdk":
-                sub = payload.get("sub")
-                return SDKAuthContext(
-                    auth_type="sdk_token",
-                    user_id=UUID(sub) if sub else None,
-                    app_id=payload.get("app_id"),
-                )
+            payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
         except JWTError:
-            pass  # Fall through to API key check
+            payload = None  # Fall through to API key check
+
+        if payload is not None and payload.get("scope") == "sdk":
+            # Fork delta (2.41.9.1): a decodable SDK token is a credential only while its
+            # user exists. A deleted user's token is rejected here, never rescued by an API
+            # key, and a lookup failure propagates. See FORK-DELTA.md.
+            user_id = _parse_sdk_subject(payload.get("sub"))
+            if user_id is None or user_repository.get(db, user_id) is None:
+                raise _sdk_auth_required()
+            return SDKAuthContext(
+                auth_type="sdk_token",
+                user_id=user_id,
+                app_id=payload.get("app_id"),
+            )
 
     # Fall back to API key (backwards compatibility)
     if x_open_wearables_api_key:
         api_key = api_key_service.validate_api_key(db, x_open_wearables_api_key)
         return SDKAuthContext(auth_type="api_key", api_key_id=api_key.id)
 
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Authentication required: provide SDK token or API key",
-    )
+    raise _sdk_auth_required()
 
 
 SDKAuthDep = Annotated[SDKAuthContext, Depends(get_sdk_auth)]

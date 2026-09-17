@@ -1,6 +1,7 @@
 from datetime import datetime
 
-from sqlalchemy.orm import Mapped
+from sqlalchemy import ForeignKey, String
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import BaseDbModel
 from app.mappings import FKDeveloper, FKUser, Indexed, PrimaryKey, str_64
@@ -28,3 +29,9 @@ class RefreshToken(BaseDbModel):
 
     last_used_at: Mapped[datetime | None]
     revoked_at: Mapped[datetime | None]
+
+    # Set on a successor only: the token this one replaced by rotation. Unique, so one token can
+    # never have two successors (fork spec 2026-09-11, INV-02). Null on every minted token.
+    rotated_from: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("refresh_token.id", ondelete="SET NULL"), unique=True, nullable=True
+    )

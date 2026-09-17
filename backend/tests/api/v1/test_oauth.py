@@ -13,22 +13,82 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from tests.factories import DeveloperFactory
-from tests.utils import developer_auth_headers
+from app.integrations.redis_client import get_redis_client
+from tests.factories import ApiKeyFactory, DeveloperFactory
+from tests.utils import api_key_headers, developer_auth_headers
+
+
+def _oauth_state_keys() -> list[str]:
+    return list(get_redis_client().scan_iter("oauth_state:*"))
 
 
 class TestOAuthAuthorizeEndpoint:
     """Test suite for OAuth authorization endpoint."""
 
+    def test_authorize_requires_authentication(self, client: TestClient, db: Session) -> None:
+        """A request with no credential is rejected and mints no OAuth state."""
+        # Act
+        response = client.get(
+            "/api/v1/oauth/garmin/authorize",
+            params={"user_id": str(uuid4())},
+        )
+
+        # Assert
+        assert response.status_code == 401
+        assert _oauth_state_keys() == []
+
+    def test_authorize_rejects_invalid_api_key(self, client: TestClient, db: Session) -> None:
+        """A request with an unknown API key is rejected and mints no OAuth state."""
+        # Act
+        response = client.get(
+            "/api/v1/oauth/garmin/authorize",
+            params={"user_id": str(uuid4())},
+            headers=api_key_headers("sk-not-a-real-key"),
+        )
+
+        # Assert
+        assert response.status_code == 401
+        assert _oauth_state_keys() == []
+
+    def test_authorize_rejects_unauthenticated_redirect_uri(self, client: TestClient, db: Session) -> None:
+        """An unauthenticated caller cannot plant a redirect_uri for the callback to follow."""
+        # Act
+        response = client.get(
+            "/api/v1/oauth/garmin/authorize",
+            params={"user_id": str(uuid4()), "redirect_uri": "https://attacker.example/steal"},
+        )
+
+        # Assert
+        assert response.status_code == 401
+        assert _oauth_state_keys() == []
+
+    def test_authorize_accepts_developer_jwt(self, client: TestClient, db: Session) -> None:
+        """A developer JWT is an accepted credential."""
+        # Arrange
+        developer = DeveloperFactory()
+
+        # Act
+        response = client.get(
+            "/api/v1/oauth/garmin/authorize",
+            params={"user_id": str(uuid4())},
+            headers=developer_auth_headers(developer.id),
+        )
+
+        # Assert
+        assert response.status_code == 200
+        assert len(_oauth_state_keys()) == 1
+
     def test_authorize_provider_success(self, client: TestClient, db: Session) -> None:
         """Test successfully initiating OAuth flow for a provider."""
         # Arrange
         user_id = uuid4()
+        headers = api_key_headers(ApiKeyFactory().id)
 
         # Act
         response = client.get(
             "/api/v1/oauth/garmin/authorize",
             params={"user_id": str(user_id)},
+            headers=headers,
         )
 
         # Assert
@@ -39,12 +99,14 @@ class TestOAuthAuthorizeEndpoint:
         assert isinstance(data["authorization_url"], str)
         assert isinstance(data["state"], str)
         assert len(data["state"]) > 0
+        assert _oauth_state_keys() == [f"oauth_state:{data['state']}"]
 
     def test_authorize_provider_with_redirect_uri(self, client: TestClient, db: Session) -> None:
         """Test OAuth flow with optional redirect URI."""
         # Arrange
         user_id = uuid4()
         redirect_uri = "https://myapp.com/oauth/callback"
+        headers = api_key_headers(ApiKeyFactory().id)
 
         # Act
         response = client.get(
@@ -53,6 +115,7 @@ class TestOAuthAuthorizeEndpoint:
                 "user_id": str(user_id),
                 "redirect_uri": redirect_uri,
             },
+            headers=headers,
         )
 
         # Assert
@@ -66,12 +129,14 @@ class TestOAuthAuthorizeEndpoint:
         # Arrange
         user_id = uuid4()
         providers = ["garmin", "polar", "suunto"]
+        headers = api_key_headers(ApiKeyFactory().id)
 
         for provider in providers:
             # Act
             response = client.get(
                 f"/api/v1/oauth/{provider}/authorize",
                 params={"user_id": str(user_id)},
+                headers=headers,
             )
 
             # Assert
@@ -83,7 +148,10 @@ class TestOAuthAuthorizeEndpoint:
     def test_authorize_missing_user_id(self, client: TestClient, db: Session) -> None:
         """Test authorization without user_id parameter."""
         # Act
-        response = client.get("/api/v1/oauth/garmin/authorize")
+        response = client.get(
+            "/api/v1/oauth/garmin/authorize",
+            headers=api_key_headers(ApiKeyFactory().id),
+        )
 
         # Assert
         assert response.status_code == 400
@@ -94,6 +162,7 @@ class TestOAuthAuthorizeEndpoint:
         response = client.get(
             "/api/v1/oauth/garmin/authorize",
             params={"user_id": "not-a-uuid"},
+            headers=api_key_headers(ApiKeyFactory().id),
         )
 
         # Assert
@@ -108,6 +177,7 @@ class TestOAuthAuthorizeEndpoint:
         response = client.get(
             "/api/v1/oauth/invalid-provider/authorize",
             params={"user_id": str(user_id)},
+            headers=api_key_headers(ApiKeyFactory().id),
         )
 
         # Assert
@@ -118,14 +188,16 @@ class TestOAuthAuthorizeEndpoint:
         # Arrange
         user_id = uuid4()
 
-        # Act - Try to authorize with "apple" which uses file import, not OAuth
+        # Act - Try to authorize with "apple" which uses file import, not OAuth.
+        # Authenticated, so the rejection is the provider check and not the credential check.
         response = client.get(
             "/api/v1/oauth/apple/authorize",
             params={"user_id": str(user_id)},
+            headers=api_key_headers(ApiKeyFactory().id),
         )
 
-        # Assert - Should fail because apple doesn't have OAuth
-        assert response.status_code in [400, 401, 422]
+        # Assert
+        assert response.status_code == 400
 
 
 class TestOAuthProvidersEndpoint:

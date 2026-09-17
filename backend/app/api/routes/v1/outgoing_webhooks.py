@@ -29,6 +29,7 @@ from app.schemas.webhooks.endpoints import (
 )
 from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, EVENT_TYPE_GROUPS, WebhookEventType
 from app.services import DeveloperDep
+from app.services.outgoing_webhooks import pseudonyms
 from app.services.outgoing_webhooks import svix as svix_service
 
 router = APIRouter()
@@ -138,7 +139,7 @@ def list_messages(
                 eventType=m.event_type,
                 eventId=m.event_id,
                 timestamp=m.timestamp.isoformat(),
-                channels=m.channels,
+                channels=pseudonyms.readable_channels(m.channels),
                 tags=m.tags,
             )
             for m in result.data
@@ -206,7 +207,7 @@ def list_endpoint_attempts(
                     eventType=msg_map[a.msg_id].event_type,
                     eventId=msg_map[a.msg_id].event_id,
                     timestamp=msg_map[a.msg_id].timestamp.isoformat(),
-                    channels=msg_map[a.msg_id].channels,
+                    channels=pseudonyms.readable_channels(msg_map[a.msg_id].channels),
                     tags=msg_map[a.msg_id].tags,
                     payload=msg_map[a.msg_id].payload,
                 )

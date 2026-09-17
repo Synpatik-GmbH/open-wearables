@@ -11,6 +11,7 @@ Responsibilities:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
@@ -18,7 +19,9 @@ import httpx
 from jose import jwt
 from svix.api import (
     ApplicationIn,
+    ApplicationListOptions,
     EndpointIn,
+    EndpointListOptions,
     EndpointOut,
     EndpointPatch,
     EventTypeIn,
@@ -38,24 +41,19 @@ from svix.api.errors.http_error import HttpError
 from app.config import settings
 from app.constants.webhooks.test_payloads import get_test_payload
 from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEventType
+from app.services.outgoing_webhooks import pseudonyms
+from app.utils.sentry_helpers import log_and_capture_error
 
 logger = logging.getLogger(__name__)
 
 # Fixed org UID used for this self-hosted instance.
 _SVIX_ORG_ID = "org_openwearables"
 
-# Svix channel prefix used to scope messages and endpoint subscriptions per user.
-# Each emitted message is tagged with "user.{user_id}".
+# Svix channels scope messages and endpoint subscriptions per user.  Each emitted message is
+# tagged with the user's pseudonymous channel (pseudonyms.user_channel), never a readable id.
 # An endpoint without a channel filter receives ALL messages (all users).
-# An endpoint with channels=["user.X"] receives only messages for user X.
+# An endpoint with the user's channel receives only messages for that user.
 # Svix allows up to 5 channels per message; we always send exactly one.
-_USER_CHANNEL_PREFIX = "user."
-
-
-def _user_channels(user_id: UUID | None) -> list[str] | None:
-    if user_id is None:
-        return None
-    return [f"{_USER_CHANNEL_PREFIX}{user_id}"]
 
 
 def user_id_from_endpoint(ep: EndpointOut) -> UUID | None:
@@ -63,11 +61,9 @@ def user_id_from_endpoint(ep: EndpointOut) -> UUID | None:
     if not ep.channels:
         return None
     for ch in ep.channels:
-        if ch.startswith(_USER_CHANNEL_PREFIX):
-            try:
-                return UUID(ch[len(_USER_CHANNEL_PREFIX) :])
-            except ValueError:
-                pass
+        user_id = pseudonyms.user_id_from_channel(ch)
+        if user_id is not None:
+            return user_id
     return None
 
 
@@ -125,6 +121,55 @@ def register_event_types() -> None:
                 logger.exception("Failed to register/update event type %s", evt.value)
 
 
+@dataclass(frozen=True)
+class LegacyChannelMigration:
+    """What one run of :func:`migrate_legacy_user_channels` saw and did."""
+
+    applications: int
+    endpoints: int
+    legacy: int
+    migrated: int
+
+
+def migrate_legacy_user_channels(*, dry_run: bool = False) -> LegacyChannelMigration:
+    """Rewrite every endpoint channel still in the readable ``user.<uuid>`` form.
+
+    An endpoint scoped to a user before pseudonymisation filters on ``user.<uuid>``, and no message
+    carries that any more, so it would silently receive nothing while the API still reported its
+    filter.  This is a ONE-SHOT operator step, run once per environment after upgrading
+    (``scripts/data_migrations/pseudonymise_svix_user_channels.py``), not startup work.
+
+    Idempotent: an endpoint already pseudonymous, unscoped, on a non-user channel, or on a token
+    under a previous key is left alone, so a rerun migrates only what is still readable.  Any Svix
+    failure PROPAGATES: an outage must not be reported as "nothing to migrate".
+    """
+    assert _client is not None
+    applications = endpoints = legacy = migrated = 0
+    app_iterator: str | None = None
+    while True:
+        apps = _client.application.list(ApplicationListOptions(limit=250, iterator=app_iterator))
+        for app in apps.data:
+            applications += 1
+            ep_iterator: str | None = None
+            while True:
+                page = _client.endpoint.list(app.id, EndpointListOptions(limit=250, iterator=ep_iterator))
+                for ep in page.data:
+                    endpoints += 1
+                    target = pseudonyms.pseudonymous_channels(ep.channels)
+                    if ep.channels and target != list(ep.channels):
+                        legacy += 1
+                        if not dry_run:
+                            _client.endpoint.patch(app.id, ep.id, EndpointPatch.model_validate({"channels": target}))
+                            migrated += 1
+                if page.done:
+                    break
+                ep_iterator = page.iterator
+        if apps.done:
+            break
+        app_iterator = apps.iterator
+    return LegacyChannelMigration(applications=applications, endpoints=endpoints, legacy=legacy, migrated=migrated)
+
+
 def ensure_application(developer_id: str, developer_email: str) -> str:
     """Return the Svix application UID for a developer, creating it lazily.
 
@@ -158,14 +203,19 @@ def send(
         return None
     assert _client is not None
     app_id = str(developer_id)
+    event_id = pseudonyms.hash_event_id(idempotency_key)
     try:
         return _client.message.create(
             app_id,
             MessageIn(
                 event_type=event_type,
                 payload=payload,
-                event_id=idempotency_key,
-                channels=channels or None,
+                event_id=event_id,
+                # Pseudonymised HERE as well as at the producers: a job enqueued by an earlier
+                # release still carries the readable user.<uuid>, and this is the last point
+                # before Svix stores it permanently.
+                channels=pseudonyms.pseudonymous_channels(channels) or None,
+                payload_retention_period=settings.svix_payload_retention_days,
             ),
         )
     except httpx.ConnectError:
@@ -179,9 +229,11 @@ def send(
         if exc.status_code == 409:
             # Svix deduplication: the same event_id was already delivered.
             # Treat as success so the Celery task does not retry.
+            # Log the digest, not the readable key, so the identifiers this change removes
+            # from Svix are not reintroduced through the log.
             logger.debug(
                 "Svix duplicate event_id=%s already delivered (409), skipping",
-                idempotency_key,
+                event_id,
             )
             return True  # ty:ignore[invalid-return-type]
         logger.exception("Failed to send webhook event=%s to app=%s", event_type, app_id)
@@ -211,7 +263,7 @@ def create_endpoint(
     }
     if filter_types is not None:
         endpoint_data["filter_types"] = filter_types
-    channels = _user_channels(user_id)
+    channels = pseudonyms.user_channels(user_id)
     if channels is not None:
         endpoint_data["channels"] = channels
     return _client.endpoint.create(
@@ -223,6 +275,42 @@ def create_endpoint(
 def list_endpoints(app_id: str) -> ListResponseEndpointOut:
     assert _client is not None
     return _client.endpoint.list(app_id)
+
+
+def has_endpoints(app_id: str) -> bool:
+    """Return True when the developer's Svix application has at least one endpoint.
+
+    The emit task uses this to skip developers who never registered an endpoint,
+    so no payload is stored for an application that could not deliver it anyway.
+
+    Only an answer that PROVES there is no endpoint returns False: an empty list, or a
+    404 (the application was never created). A skip acknowledges the task with nothing
+    sent and no retry, so every lookup that merely failed — Svix unreachable included —
+    returns True and lets :func:`send` run. ``send`` owns the delivery-failure contract;
+    deciding it here as well would turn a transient lookup error, which could clear
+    before the message request, into a silently dropped event.
+    """
+    if not is_enabled():
+        return False
+    assert _client is not None
+    try:
+        return bool(_client.endpoint.list(app_id).data)
+    except httpx.ConnectError as exc:
+        log_and_capture_error(
+            exc,
+            logger,
+            f"Svix server unreachable during endpoint lookup for app={app_id}; deferring to send",
+            level="warning",
+        )
+        return True
+    except HttpError as exc:
+        if exc.status_code == 404:
+            return False
+        log_and_capture_error(exc, logger, f"Failed to list endpoints for app={app_id}; assuming it has endpoints")
+        return True
+    except Exception as exc:
+        log_and_capture_error(exc, logger, f"Failed to list endpoints for app={app_id}; assuming it has endpoints")
+        return True
 
 
 def get_endpoint(app_id: str, endpoint_id: str) -> EndpointOut:
@@ -259,7 +347,7 @@ def patch_endpoint(
     if filter_types is not None:
         patch_data["filter_types"] = filter_types
     if user_id is not None:
-        patch_data["channels"] = _user_channels(user_id)
+        patch_data["channels"] = pseudonyms.user_channels(user_id)
     elif clear_user_id:
         # Svix requires null (not []) to remove the channel filter entirely.
         patch_data["channels"] = None
@@ -329,7 +417,8 @@ def send_test_message(app_id: str, endpoint_id: str, event_type: str) -> Message
             MessageIn(
                 event_type=event_type,
                 payload=get_test_payload(event_type),
-                event_id=f"test.{endpoint_id}.{event_type}",
+                event_id=pseudonyms.hash_event_id(f"test.{endpoint_id}.{event_type}"),
+                payload_retention_period=settings.svix_payload_retention_days,
             ),
         )
     except Exception:

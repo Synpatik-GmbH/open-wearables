@@ -1,12 +1,14 @@
 """Tests for SDK logs endpoint."""
 
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
 
+from app.services import user_service
 from app.services.sdk_token_service import create_sdk_user_token
-from tests.factories import ApiKeyFactory
+from tests.factories import ApiKeyFactory, UserFactory
 
 USER_ID = "123e4567-e89b-12d3-a456-426614174000"
 ENDPOINT = "/api/v1/sdk/users/{user_id}/logs"
@@ -137,6 +139,7 @@ class TestSDKLogsHappyPath:
 class TestSDKLogsAuth:
     @patch("app.api.routes.v1.sdk_logs.store_raw_payload")
     def test_sdk_token_accepted(self, mock_store: MagicMock, client: TestClient, db: Session) -> None:
+        UserFactory(id=UUID(USER_ID))
         token = create_sdk_user_token("app_123", USER_ID)
         response = client.post(
             _url(),
@@ -164,6 +167,7 @@ class TestSDKLogsAuth:
 
     @patch("app.api.routes.v1.sdk_logs.store_raw_payload")
     def test_token_user_id_mismatch_returns_403(self, mock_store: MagicMock, client: TestClient, db: Session) -> None:
+        UserFactory(id=UUID("00000000-0000-0000-0000-000000000000"))
         token = create_sdk_user_token("app_123", "00000000-0000-0000-0000-000000000000")
         response = client.post(
             _url(),
@@ -171,6 +175,21 @@ class TestSDKLogsAuth:
             json=_payload(DEVICE_STATE_EVENT),
         )
         assert response.status_code == 403
+
+    @patch("app.api.routes.v1.sdk_logs.store_raw_payload")
+    def test_deleted_user_token_returns_401(self, mock_store: MagicMock, client: TestClient, db: Session) -> None:
+        user = UserFactory()
+        token = create_sdk_user_token("app_123", str(user.id))
+        user_service.delete(db, user.id)
+
+        response = client.post(
+            ENDPOINT.format(user_id=str(user.id)),
+            headers={"Authorization": f"Bearer {token}"},
+            json=_payload(DEVICE_STATE_EVENT),
+        )
+
+        assert response.status_code == 401
+        mock_store.assert_not_called()
 
 
 class TestSDKLogsValidation:

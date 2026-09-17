@@ -70,6 +70,12 @@ When a user wants to connect their health data, your backend should:
 2. Call Open Wearables API at [`POST /api/v1/users/{user_id}/token`](/api-reference/mobile-sdk/create-user-token) with your App credentials
 3. Return the `access_token` and `refresh_token` to the mobile app
 
+<Warning>
+  Issuing a token revokes every refresh token still live for that user and application. A
+  second call — including a provisioning retry — disconnects the device currently holding a
+  token, and that device must re-authenticate to resume syncing.
+</Warning>
+
 <Tabs>
   <Tab title="Node.js">
 ```javascript
@@ -299,6 +305,10 @@ sdk.signIn(
 ### Automatic Token Refresh
 
 When you provide a `refreshToken`, the SDK automatically handles 401 responses by refreshing the access token and retrying the request.
+
+<Note>
+  **A deleted user's session cannot be refreshed.** SDK tokens are valid only while their user exists in Open Wearables. After the user is deleted, every `/sdk/` request with their access token returns `401`, and the automatic refresh also returns `401` because deleting a user removes their refresh tokens. An API key sent with the same request does not rescue the token. Treat a `401` from the refresh itself as terminal: stop syncing and get new credentials from your backend instead of retrying.
+</Note>
 
 You can also update tokens manually:
 

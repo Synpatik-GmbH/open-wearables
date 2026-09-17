@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import warnings
 from datetime import timedelta
 from functools import lru_cache
@@ -63,6 +65,9 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
     token_lifetime: int = 3600
+    # How long a superseded SDK refresh token may still be exchanged for its unused successor
+    # (fork spec 2026-09-11, D-05). Positive whole seconds; default 7 days (Q-01).
+    sdk_refresh_grace_seconds: int = 604800
 
     # VALIDATION SETTINGS
     min_password_length: int = 8
@@ -214,6 +219,16 @@ class Settings(BaseSettings):
     svix_jwt_secret: SecretStr | None = None
     # Bearer token for the Svix API.  If unset, auto-generated from svix_jwt_secret at startup.
     svix_auth_token: SecretStr | None = None
+    # How long Svix keeps the message payload before expiring it, in days.
+    # The delivery retry tail is 27h 35m (the sum of retry_schedule
+    # [5, 300, 1800, 7200, 18000, 36000, 36000] seconds); the platform floor for payload
+    # retention is 5 days; 5 days is therefore the shortest retention Svix will honour and
+    # remains far inside the one-month erasure response window.
+    # Svix accepts 5 to 90 here and rejects anything outside that range with a 422 on every
+    # message, so the bounds are enforced at startup rather than discovered at delivery time.
+    # Note: the API also has a payloadRetentionHours field, which svix-server accepts with a
+    # 202 and then ignores, so sub-day retention is not expressible against this platform.
+    svix_payload_retention_days: int = Field(default=5, ge=5, le=90)
 
     # Outgoing-webhook fast lane: event types listed here are enqueued on the
     # dedicated "webhook_sync" queue so they can never queue behind bulk /
@@ -235,6 +250,24 @@ class Settings(BaseSettings):
     @property
     def webhook_priority_event_set(self) -> frozenset[str]:
         return frozenset(e.strip() for e in self.webhook_priority_events.split(",") if e.strip())
+
+    # Root secret for the pseudonyms written into Svix: the event-id digest and the user channel
+    # (see app/services/outgoing_webhooks/pseudonyms.py).  When unset it is DERIVED from
+    # secret_key under a fixed context — never equal to it, because event-id digests are returned
+    # to API callers and must not be HMAC outputs of the key that signs access tokens.
+    # Set it explicitly in production before the first event.  Rotating it changes every
+    # pseudonym: events already in Svix stop deduplicating against new ones, and an endpoint
+    # filtered on a user stops receiving until its user_id is saved again.
+    svix_pseudonym_secret: SecretStr | None = None
+
+    @model_validator(mode="after")
+    def derive_svix_pseudonym_secret(self) -> "Settings":
+        if self.svix_pseudonym_secret is None or self.svix_pseudonym_secret.get_secret_value() == "":
+            derived = hmac.new(
+                self.secret_key.encode(), b"open-wearables/svix/pseudonym-secret/v1", hashlib.sha256
+            ).hexdigest()
+            self.svix_pseudonym_secret = SecretStr(derived)
+        return self
 
     @model_validator(mode="after")
     def derive_svix_jwt_secret(self) -> "Settings":
@@ -282,6 +315,13 @@ class Settings(BaseSettings):
         if isinstance(v, str) and not v.strip():
             return None
         return parse_duration(str(v))  # "2d" / "20h" / "1d12h" → timedelta (fail fast at startup)
+
+    @field_validator("sdk_refresh_grace_seconds")
+    @classmethod
+    def _validate_sdk_refresh_grace_seconds(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("SDK_REFRESH_GRACE_SECONDS must be a positive number of seconds")
+        return v
 
     def oauth_redirect_uri(self, provider: ProviderName) -> str:
         """Build OAuth redirect URI for a provider.

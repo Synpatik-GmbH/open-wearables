@@ -299,4 +299,4 @@ If the SSE stream disconnects (network error, server restart, or a `5xx` respons
 
 ## Retention
 
-All sync status data is held in Redis with a 24-hour TTL. For long-term audit, subscribe to the corresponding [`sync.started` / `sync.completed` / `sync.failed`](/api-reference/guides/webhooks) outgoing webhooks, which are persisted by Svix.
+All sync status data is held in Redis with a 24-hour TTL. For a longer record, subscribe to the corresponding [`sync.started` / `sync.completed` / `sync.failed`](/api-reference/guides/webhooks) outgoing webhooks and store them when they arrive. Svix keeps webhook payloads only for the configured retention period — 5 days by default, at most 90 (see [Payload retention](/api-reference/guides/webhooks#delivery-and-retries)) — so it is not a long-term audit store.
