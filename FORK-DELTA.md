@@ -113,6 +113,17 @@ Upstream OW has no write path for `personal_record` (only seed data writes it).
 
 ---
 
+## Upstream behaviour the adapter depends on (not a delta)
+
+This is upstream code we do not change, but the .NET adapter breaks if an upgrade removes it,
+so **an upgrade that changes it is a breaking change for the adapter**.
+
+| Upstream behaviour | Where (at `release/0.6.2-syn`) | Why the adapter needs it |
+|---|---|---|
+| **`users.external_user_id` is settable on `POST /api/v1/users`, filterable on `GET /api/v1/users?external_user_id=`, unique, and returned in `UserRead`** (the model both of those routes respond with) | `models/user.py:19` (`Unique`), `schemas/model_crud/user_management/user.py:71` (`UserCreate`), `:46` (`UserQueryParams`) and `:61` (`UserRead`), `repositories/user_repository.py:67-68`, `api/routes/v1/users.py:19` and `:57` (both `response_model` `UserRead`) | Since calibra-adapter 2.41.13 (PR #329, 2026-09-28), `POST /account/register` finds or creates each person's OW user **by `external_user_id` = the Calibra user id**, never by email. It also reads the field **back** from both responses and accepts only an exact match. Losing any of the four properties makes register fail closed: the create field, the filter, uniqueness, or the field in `UserRead`. Every new account then ends `partial` and logs `Event=ow_stamp_mismatch`, so no new user gets an OW user. Upstream already marks the field **deprecated** (`schemas/model_crud/user_management/user.py:10-15`, "only works as a filter on GET /users"), and it was still present on upstream `main` at `3e3f81c9`, 2026-09-28. Spec: calibra-adapter `docs/superpowers/specs/2026-09-25-2.41.13-register-ow-user-binding-design.md` §5.5, D-01, D-04. |
+
+---
+
 ## Superseded by upstream — DROPPED at 0.6.2 (executed 2026-07-07)
 
 Reimplemented independently upstream; not carried forward. See the outcome section above.
@@ -165,6 +176,7 @@ git switch release/<prev>-syn
 git switch -c release/<new>-syn
 git merge main                        # rerere replays known resolutions
 #   Walk the "durable delta" table; re-check each item still applies + behaves.
+#   Walk "Upstream behaviour the adapter depends on"; if any row changed, stop: it is an adapter change first.
 ```
 
 ### 3. Prove it
