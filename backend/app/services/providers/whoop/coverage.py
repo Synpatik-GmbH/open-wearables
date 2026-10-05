@@ -15,6 +15,7 @@ TIMESERIES: frozenset[SeriesType] = frozenset(
         SeriesType.height,  # /v2/user/measurement/body
         SeriesType.weight,  # /v2/user/measurement/body
         SeriesType.respiratory_rate,  # Synaptik: respiratory_rate written in save_sleep_data (Thread 14f)
+        SeriesType.active_energy,  # /v2/cycle, daily total from kilojoule
     }
 )
 
@@ -27,6 +28,7 @@ WORKOUT_FIELDS: frozenset[str] = frozenset(
         "distance",
         "total_elevation_gain",
         "moving_time_seconds",
+        "hr_zones",
     }
 )
 

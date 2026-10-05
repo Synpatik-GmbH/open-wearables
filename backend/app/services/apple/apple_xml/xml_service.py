@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from logging import Logger
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, BinaryIO, Generator
 from uuid import UUID, uuid4
 from xml.etree import ElementTree as ET
 
@@ -29,8 +29,8 @@ from app.utils.structured_logging import log_structured
 
 
 class XMLService:
-    def __init__(self, path: Path, log: Logger):
-        self.xml_path: Path = path
+    def __init__(self, source: str | Path | BinaryIO, log: Logger):
+        self.xml_source = source
         self.chunk_size: int = settings.xml_chunk_size
         self.log: Logger = log
         self.stats: XMLParseStats = XMLParseStats()
@@ -139,11 +139,11 @@ class XMLService:
 
         return SourceInfo(
             name=raw_fields.get("name"),
-            device_id=raw_fields.get("device"),  # ty:ignore[unknown-argument]
-            device_model=raw_fields.get("model"),  # ty:ignore[unknown-argument]
-            device_manufacturer=raw_fields.get("manufacturer"),  # ty:ignore[unknown-argument]
-            device_hardware_version=raw_fields.get("hardware"),  # ty:ignore[unknown-argument]
-            device_software_version=raw_fields.get("software"),  # ty:ignore[unknown-argument]
+            device_id=raw_fields.get("device"),
+            device_model=raw_fields.get("model"),
+            device_manufacturer=raw_fields.get("manufacturer"),
+            device_hardware_version=raw_fields.get("hardware"),
+            device_software_version=raw_fields.get("software"),
         )
 
     def _normalize_sleep_record(self, document: dict[str, Any]) -> SleepRecord | None:
@@ -348,7 +348,7 @@ class XMLService:
         # Reset stats for this parse run
         self.stats = XMLParseStats()
 
-        for event, elem in ET.iterparse(self.xml_path, events=("end",)):
+        for event, elem in ET.iterparse(self.xml_source, events=("end",)):
             if elem.tag == "Record" and event == "end":
                 if len(workouts) + len(time_series_records) + len(sleep_records) >= self.chunk_size:
                     self.log.info(

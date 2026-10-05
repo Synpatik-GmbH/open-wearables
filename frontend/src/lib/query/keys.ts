@@ -31,12 +31,10 @@ export const queryKeys = {
     detail: (id: string) => [...queryKeys.apiKeys.details(), id] as const,
   },
 
-  credentials: {
-    all: ['credentials'] as const,
-    lists: () => [...queryKeys.credentials.all, 'list'] as const,
-    list: () => [...queryKeys.credentials.lists()] as const,
-    details: () => [...queryKeys.credentials.all, 'detail'] as const,
-    detail: (id: string) => [...queryKeys.credentials.details(), id] as const,
+  applications: {
+    all: ['applications'] as const,
+    lists: () => [...queryKeys.applications.all, 'list'] as const,
+    list: () => [...queryKeys.applications.lists()] as const,
   },
 
   automations: {
@@ -182,6 +180,9 @@ export const queryKeys = {
   meta: {
     all: ['meta'] as const,
     coverage: () => [...queryKeys.meta.all, 'coverage'] as const,
+  },
+  config: {
+    all: ['config'] as const,
   },
 
   syncStatus: {

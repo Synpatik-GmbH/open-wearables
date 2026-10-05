@@ -13,6 +13,7 @@ from typing import Any
 from uuid import UUID
 
 from app.config import settings
+from app.constants.devices_map import resolve_device_name
 from app.constants.webhooks.events import SERIES_TYPE_TO_GRANULAR_EVENT, SERIES_TYPE_TO_GROUP_EVENT
 from app.schemas.webhooks.event_types import WebhookEventType
 from app.services.outgoing_webhooks import pseudonyms
@@ -181,6 +182,10 @@ def on_sleep_created(
     efficiency_percent: float | None = None,
     stages: dict[str, int | None] | None = None,
     is_nap: bool | None = None,
+    source_app: str | None = None,
+    device_type: str | None = None,
+    sleep_duration_seconds: float | None = None,
+    sleep_stage_intervals: list[dict[str, Any]] | None = None,
 ) -> None:
     _dispatch(
         WebhookEventType.SLEEP_CREATED,
@@ -193,9 +198,17 @@ def on_sleep_created(
                 "end_time": end_time,
                 "zone_offset": zone_offset,
                 "duration_seconds": duration_seconds,
-                "source": {"provider": provider, "device": device},
+                "sleep_duration_seconds": sleep_duration_seconds,
+                "source": {
+                    "provider": provider,
+                    "source": source_app,
+                    "device": device,
+                    "device_type": device_type,
+                    "device_name": resolve_device_name(device),
+                },
                 "efficiency_percent": efficiency_percent,
                 "stages": stages,
+                "sleep_stage_intervals": sleep_stage_intervals,
                 "is_nap": is_nap,
             },
         },
@@ -305,7 +318,7 @@ def on_connection_created(
                 "connected_at": connected_at,
             },
         },
-        idempotency_key=f"connection.created.{user_id}.{provider}",
+        idempotency_key=_safe_key(f"connection.created.{user_id}.{provider}.{connected_at}"),
         channels=pseudonyms.user_channels(user_id),
     )
 
@@ -335,7 +348,7 @@ def on_connection_revoked(
                 "revoked_at": revoked_at,
             },
         },
-        idempotency_key=f"connection.revoked.{user_id}.{provider}.{revoked_at}",
+        idempotency_key=_safe_key(f"connection.revoked.{user_id}.{provider}.{revoked_at}"),
         channels=pseudonyms.user_channels(user_id),
     )
 

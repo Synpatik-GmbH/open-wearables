@@ -10,6 +10,7 @@ Covers:
 from __future__ import annotations
 
 import re
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -31,12 +32,16 @@ from app.services.outgoing_webhooks.events import (
     SVIX_MAX_SAMPLES_PER_EVENT,
     _dispatch,
     on_connection_created,
+    on_connection_revoked,
     on_sleep_created,
     on_timeseries_batch_saved,
     on_workout_created,
 )
 from app.utils.security import create_access_token
 from tests.factories import DeveloperFactory
+
+# Svix eventId charset: colons/plus signs from ISO 8601 timestamps must not survive.
+_SVIX_ID_SAFE_RE = re.compile(r"^[a-zA-Z0-9\-_.]+$")
 
 # ---------------------------------------------------------------------------
 # WebhookEventType enum
@@ -59,6 +64,12 @@ class TestWebhookEventTypes:
 
 
 class TestWebhookEmit:
+    @pytest.fixture(autouse=True)
+    def _webhooks_enabled(self) -> Generator[None, None, None]:
+        # Dispatch only fires when webhooks are enabled; these tests assert it does.
+        with patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=True):
+            yield
+
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
     def test_on_workout_created_dispatches(self, mock_task: MagicMock) -> None:
         uid = uuid4()
@@ -106,6 +117,12 @@ class TestWebhookEmit:
             efficiency_percent=85.0,
             stages={"deep_minutes": 90, "rem_minutes": 60, "light_minutes": 120, "awake_minutes": 10},
             is_nap=False,
+            source_app="oura",
+            device_type="ring",
+            sleep_duration_seconds=27000,
+            sleep_stage_intervals=[
+                {"stage": "light", "start_time": "2026-01-01T22:00:00", "end_time": "2026-01-01T22:30:00"}
+            ],
         )
         mock_task.apply_async.assert_called_once()
         call = mock_task.apply_async.call_args
@@ -114,6 +131,11 @@ class TestWebhookEmit:
         assert args[0] == "sleep.created"
         assert args[1]["data"]["efficiency_percent"] == 85.0
         assert args[1]["data"]["stages"]["deep_minutes"] == 90
+        assert args[1]["data"]["sleep_duration_seconds"] == 27000
+        assert args[1]["data"]["sleep_stage_intervals"][0]["stage"] == "light"
+        assert args[1]["data"]["source"]["source"] == "oura"
+        assert args[1]["data"]["source"]["device_type"] == "ring"
+        assert args[1]["data"]["source"]["device_name"] == "Oura Ring Gen3"
 
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
     def test_on_timeseries_batch_saved_dispatches(self, mock_task: MagicMock) -> None:
@@ -246,6 +268,30 @@ class TestWebhookEmit:
         assert args[0][0] == "connection.created"
         assert args[0][1]["data"]["provider"] == "garmin"
         assert args[0][1]["data"]["connection_id"] == str(cid)
+        # connected_at's colons/offset must not leak into the Svix event_id
+        assert _SVIX_ID_SAFE_RE.match(args.kwargs["idempotency_key"])
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_on_connection_revoked_dispatches(self, mock_task: MagicMock) -> None:
+        uid = uuid4()
+        cid = uuid4()
+        on_connection_revoked(
+            user_id=uid,
+            provider="garmin",
+            connection_id=cid,
+            reason="refresh_failed",
+            revoked_at="2026-01-01T12:00:00.123456+00:00",
+        )
+        mock_task.delay.assert_called_once()
+        args = mock_task.delay.call_args
+        assert args[0][0] == "connection.revoked"
+        assert args[0][1]["data"]["provider"] == "garmin"
+        assert args[0][1]["data"]["reason"] == "refresh_failed"
+        # revoked_at is an isoformat() timestamp - colons/offset must be sanitized
+        idempotency_key = args.kwargs["idempotency_key"]
+        assert _SVIX_ID_SAFE_RE.match(idempotency_key)
+        assert ":" not in idempotency_key
+        assert "+" not in idempotency_key
 
     def test_dispatch_swallows_broker_error(self) -> None:
         """_dispatch silently drops the event when Celery is unreachable."""
@@ -257,6 +303,20 @@ class TestWebhookEmit:
             mock_task.apply_async.side_effect = ConnectionError("Redis not available")
             # Should NOT raise
             _dispatch("workout.created", {"type": "workout.created", "data": {}})
+
+    def test_dispatch_skipped_when_webhooks_disabled(self) -> None:
+        """With OUTGOING_WEBHOOKS_ENABLED off, nothing is enqueued."""
+        with (
+            patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=False),
+            patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event") as mock_task,
+        ):
+            on_connection_created(
+                user_id=uuid4(),
+                provider="garmin",
+                connection_id=uuid4(),
+                connected_at="2026-01-01T12:00:00+00:00",
+            )
+            mock_task.delay.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +449,12 @@ class TestUserChannelsReachSvixAsPseudonyms:
     """``message.channels`` persists on the Svix message row with no expiry, beside ``uid``. The
     event-id hash alone left the user id readable there on every message."""
 
+    @pytest.fixture(autouse=True)
+    def _webhooks_enabled(self) -> Generator[None, None, None]:
+        # Dispatch only fires when webhooks are enabled; these tests assert it does.
+        with patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=True):
+            yield
+
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
     def test_an_emitted_event_carries_the_pseudonymous_channel(self, mock_task: MagicMock) -> None:
         uid = uuid4()
@@ -432,7 +498,10 @@ class TestUserChannelsReachSvixAsPseudonyms:
         the app package so a new module is covered by default. Exemptions are exact literals that
         are provably not channels."""
         app_root = Path(svix_service.__file__).resolve().parents[2]
-        exempt = {("app/mappings.py", '"user.id"')}  # SQLAlchemy ForeignKey target, not a channel
+        exempt = {
+            ("app/mappings.py", '"user.id"'),  # SQLAlchemy ForeignKey target, not a channel
+            ("app/config.py", '"user.info,user.metrics,user.activity"'),  # Withings OAuth scopes
+        }
         literal = re.compile(r"""(["'])user\.[^"']*\1|(["'])user\.""")
         offenders = []
         for path in sorted(app_root.rglob("*.py")):
@@ -864,6 +933,12 @@ class TestWebhookPrioritySettings:
 
 
 class TestPriorityQueueRouting:
+    @pytest.fixture(autouse=True)
+    def _webhooks_enabled(self) -> Generator[None, None, None]:
+        # Dispatch only fires when webhooks are enabled; these tests assert it does.
+        with patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=True):
+            yield
+
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
     def test_priority_event_routes_to_webhook_sync(self, mock_task: MagicMock) -> None:
         _dispatch("workout.created", {"k": "v"}, idempotency_key="idem-1")
@@ -889,3 +964,134 @@ class TestPriorityQueueRouting:
         assert mock_task.apply_async.call_args.kwargs["queue"] == "webhook_sync"
         _dispatch("workout.created", {"k": "v"})
         mock_task.delay.assert_called_once()  # no longer in the (overridden) set
+
+
+# ---------------------------------------------------------------------------
+# svix_service.create_endpoint / patch_endpoint — filter_types translation
+# ---------------------------------------------------------------------------
+
+
+class TestSvixFilterTypesHandling:
+    """Svix rejects an empty `filter_types` list outright ("eventTypes can't
+    be empty, it must have at least one item"), so an empty selection must be
+    translated to omitting the key (create) or an explicit null (patch)
+    before it reaches the Svix client — never sent through as [].
+    """
+
+    @pytest.fixture
+    def mock_client(self) -> Generator[MagicMock, None, None]:
+        mock = MagicMock()
+        with patch("app.services.outgoing_webhooks.svix._client", mock):
+            yield mock
+
+    @pytest.mark.parametrize("filter_types", [None, []])
+    def test_create_endpoint_omits_filter_types_when_empty(
+        self, mock_client: MagicMock, filter_types: list[str] | None
+    ) -> None:
+        svix_service.create_endpoint("app_1", "https://example.com/wh", filter_types=filter_types)
+
+        sent = mock_client.endpoint.create.call_args.args[1]
+        assert "event_types" not in sent.model_fields_set
+
+    def test_create_endpoint_includes_filter_types_when_populated(self, mock_client: MagicMock) -> None:
+        svix_service.create_endpoint("app_1", "https://example.com/wh", filter_types=["workout.created"])
+
+        sent = mock_client.endpoint.create.call_args.args[1]
+        assert sent.event_types == ["workout.created"]
+
+    def test_patch_endpoint_leaves_filter_types_untouched_when_not_provided(self, mock_client: MagicMock) -> None:
+        svix_service.patch_endpoint("app_1", "ep_1", filter_types=None)
+
+        sent = mock_client.endpoint.patch.call_args.args[2]
+        assert "event_types" not in sent.model_fields_set
+
+    def test_patch_endpoint_clears_filter_types_with_explicit_null(self, mock_client: MagicMock) -> None:
+        svix_service.patch_endpoint("app_1", "ep_1", filter_types=[])
+
+        sent = mock_client.endpoint.patch.call_args.args[2]
+        assert "event_types" in sent.model_fields_set
+        assert sent.event_types is None
+
+    def test_patch_endpoint_sets_filter_types_when_populated(self, mock_client: MagicMock) -> None:
+        svix_service.patch_endpoint("app_1", "ep_1", filter_types=["sleep.created"])
+
+        sent = mock_client.endpoint.patch.call_args.args[2]
+        assert sent.event_types == ["sleep.created"]
+
+
+# ---------------------------------------------------------------------------
+# PATCH /endpoints/{id} — clearing semantics, pinned against regressions
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateEndpointClearingContract:
+    """The two fields clear differently, and both conventions are public API.
+
+    `filter_types`: an empty list clears; an omitted field or an explicit null
+    leaves the current filter alone.
+    `user_id`: an explicit null clears; an omitted field leaves the scope alone.
+
+    The asymmetry is deliberate — external clients already depend on a null
+    `filter_types` being a no-op, so it must never become a second clearing
+    signal.  These tests fail if anyone "harmonises" the two.
+    """
+
+    @pytest.fixture(autouse=True)
+    def mock_svix(self) -> Any:
+        with patch("app.api.routes.v1.outgoing_webhooks.svix_service") as m:
+            m.is_enabled.return_value = True
+            m.ensure_application.return_value = "app_uid_123"
+            m.user_id_from_endpoint.return_value = None
+            m.patch_endpoint.return_value = MagicMock(
+                id="ep_123",
+                url="https://example.com/wh",
+                description="",
+                filter_types=None,
+            )
+            yield m
+
+    def _patch(self, client: TestClient, body: dict[str, Any]) -> Any:
+        token = create_access_token(DeveloperFactory().id)
+        resp = client.patch(
+            "/api/v1/webhooks/endpoints/ep_123",
+            json=body,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        return resp
+
+    @pytest.mark.parametrize(
+        ("body", "expected"),
+        [
+            ({"description": "only the label"}, None),
+            ({"filter_types": None}, None),
+            ({"filter_types": []}, []),
+            ({"filter_types": ["workout.created"]}, ["workout.created"]),
+        ],
+        ids=["omitted", "explicit-null", "empty-list", "populated"],
+    )
+    def test_filter_types_reaches_the_service_verbatim(
+        self,
+        client: TestClient,
+        db: Session,
+        mock_svix: MagicMock,
+        body: dict[str, Any],
+        expected: list[str] | None,
+    ) -> None:
+        self._patch(client, body)
+
+        assert mock_svix.patch_endpoint.call_args.kwargs["filter_types"] == expected
+
+    def test_explicit_null_user_id_clears_the_user_scope(
+        self, client: TestClient, db: Session, mock_svix: MagicMock
+    ) -> None:
+        self._patch(client, {"user_id": None})
+
+        assert mock_svix.patch_endpoint.call_args.kwargs["clear_user_id"] is True
+
+    def test_omitted_user_id_leaves_the_user_scope_untouched(
+        self, client: TestClient, db: Session, mock_svix: MagicMock
+    ) -> None:
+        self._patch(client, {"description": "only the label"})
+
+        assert mock_svix.patch_endpoint.call_args.kwargs["clear_user_id"] is False

@@ -10,7 +10,7 @@ from tests.utils import api_key_headers
 def _headers() -> dict[str, str]:
     developer = DeveloperFactory(email="pr-test@example.com", password="test123")
     api_key = ApiKeyFactory(developer=developer)
-    return api_key_headers(api_key.id)
+    return api_key_headers(api_key.plain_key)
 
 
 class TestUpsertPersonalRecord:

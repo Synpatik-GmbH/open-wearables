@@ -82,7 +82,7 @@ class TestOAuthAuthorizeEndpoint:
         """Test successfully initiating OAuth flow for a provider."""
         # Arrange
         user_id = uuid4()
-        headers = api_key_headers(ApiKeyFactory().id)
+        headers = api_key_headers(ApiKeyFactory().plain_key)
 
         # Act
         response = client.get(
@@ -106,7 +106,7 @@ class TestOAuthAuthorizeEndpoint:
         # Arrange
         user_id = uuid4()
         redirect_uri = "https://myapp.com/oauth/callback"
-        headers = api_key_headers(ApiKeyFactory().id)
+        headers = api_key_headers(ApiKeyFactory().plain_key)
 
         # Act
         response = client.get(
@@ -129,7 +129,7 @@ class TestOAuthAuthorizeEndpoint:
         # Arrange
         user_id = uuid4()
         providers = ["garmin", "polar", "suunto"]
-        headers = api_key_headers(ApiKeyFactory().id)
+        headers = api_key_headers(ApiKeyFactory().plain_key)
 
         for provider in providers:
             # Act
@@ -150,7 +150,7 @@ class TestOAuthAuthorizeEndpoint:
         # Act
         response = client.get(
             "/api/v1/oauth/garmin/authorize",
-            headers=api_key_headers(ApiKeyFactory().id),
+            headers=api_key_headers(ApiKeyFactory().plain_key),
         )
 
         # Assert
@@ -162,7 +162,7 @@ class TestOAuthAuthorizeEndpoint:
         response = client.get(
             "/api/v1/oauth/garmin/authorize",
             params={"user_id": "not-a-uuid"},
-            headers=api_key_headers(ApiKeyFactory().id),
+            headers=api_key_headers(ApiKeyFactory().plain_key),
         )
 
         # Assert
@@ -177,7 +177,7 @@ class TestOAuthAuthorizeEndpoint:
         response = client.get(
             "/api/v1/oauth/invalid-provider/authorize",
             params={"user_id": str(user_id)},
-            headers=api_key_headers(ApiKeyFactory().id),
+            headers=api_key_headers(ApiKeyFactory().plain_key),
         )
 
         # Assert
@@ -193,7 +193,7 @@ class TestOAuthAuthorizeEndpoint:
         response = client.get(
             "/api/v1/oauth/apple/authorize",
             params={"user_id": str(user_id)},
-            headers=api_key_headers(ApiKeyFactory().id),
+            headers=api_key_headers(ApiKeyFactory().plain_key),
         )
 
         # Assert

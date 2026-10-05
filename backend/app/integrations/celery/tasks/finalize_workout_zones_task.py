@@ -28,8 +28,8 @@ from app.models import DataSource, EventRecord
 
 if TYPE_CHECKING:
     from app.models import WorkoutDetails
-from app.services.apple.healthkit.workout_settle import should_emit
 from app.services.event_record_service import event_record_service
+from app.services.sdk.workout_settle import should_emit
 
 logger = getLogger(__name__)
 

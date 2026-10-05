@@ -30,6 +30,8 @@ KQL = (
 def refresh_lines(capsys: pytest.CaptureFixture[str]) -> list[dict]:
     out = capsys.readouterr().out
     lines = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+    for line in lines:
+        line.pop("timestamp", None)  # added to every structured line by upstream 0.9.0
     return [line for line in lines if str(line.get("action", "")).startswith("refresh_token_")]
 
 

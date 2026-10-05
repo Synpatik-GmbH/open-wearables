@@ -8,11 +8,11 @@ from unittest.mock import MagicMock, patch
 
 from sqlalchemy.orm import Session
 
-from app.integrations.celery.tasks.sync_vendor_data_task import (
-    _build_sync_params,
-    sync_vendor_data,
-)
+from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
 from app.schemas.auth import ConnectionStatus
+from app.schemas.sync_status import SyncStatus
+from app.services.sync_coordination import try_become_primary
+from app.utils.sync_params import build_sync_params
 from tests.factories import UserConnectionFactory, UserFactory
 
 
@@ -355,78 +355,77 @@ class TestSyncVendorDataTask:
 
 
 class TestBuildSyncParams:
-    """Test suite for _build_sync_params helper function."""
+    """Test suite for build_sync_params helper function."""
 
-    def test_build_sync_params_suunto(self) -> None:
-        """Test building Suunto-specific parameters."""
-        # Arrange
+    def test_build_sync_params_with_dates(self) -> None:
+        """Both dates are passed through under the canonical keys."""
         start_date = "2025-01-01T00:00:00Z"
         end_date = "2025-12-31T23:59:59Z"
 
-        # Act
-        params = _build_sync_params("suunto", start_date, end_date)
+        params = build_sync_params(start_date, end_date)
 
-        # Assert - Suunto uses generic params (since/until timestamps)
-        assert "since" in params
-        assert "until" in params
-        assert isinstance(params["since"], int)
-        assert isinstance(params["until"], int)
-        assert params["start_date"] == start_date
-        assert params["end_date"] == end_date
-
-    def test_build_sync_params_polar(self) -> None:
-        """Test building Polar-specific parameters."""
-        # Arrange
-        start_date = "2025-01-01T00:00:00Z"
-        end_date = "2025-12-31T23:59:59Z"
-
-        # Act
-        params = _build_sync_params("polar", start_date, end_date)
-
-        # Assert
-        assert params["samples"] is False
-        assert params["zones"] is False
-        assert params["route"] is False
-
-    def test_build_sync_params_garmin(self) -> None:
-        """Test building Garmin-specific parameters."""
-        # Arrange
-        start_date = "2025-01-01T00:00:00Z"
-        end_date = "2025-12-31T23:59:59Z"
-
-        # Act
-        params = _build_sync_params("garmin", start_date, end_date)
-
-        # Assert
-        assert params["summary_start_time"] == start_date
-        assert params["summary_end_time"] == end_date
+        assert params == {"start_date": start_date, "end_date": end_date}
 
     def test_build_sync_params_no_dates(self) -> None:
-        """Test building parameters without date range."""
-        # Act
-        params = _build_sync_params("garmin", None, None)
+        """None in, None out - no provider-specific keys are invented."""
+        params = build_sync_params(None, None)
 
-        # Assert
-        assert "summary_start_time" not in params
-        assert "summary_end_time" not in params
-
-    def test_build_sync_params_suunto_no_start_date(self) -> None:
-        """Test Suunto parameters without start date has no since/until."""
-        # Act
-        params = _build_sync_params("suunto", None, None)
-
-        # Assert - when no dates provided, since/until are not set
-        assert "since" not in params
-        assert "until" not in params
-        assert params["start_date"] is None
-        assert params["end_date"] is None
+        assert params == {"start_date": None, "end_date": None}
 
     def test_build_sync_params_invalid_date_format(self) -> None:
-        """Test handling of invalid date formats."""
-        # Act
-        params = _build_sync_params("garmin", "invalid-date", "2025-12-31T23:59:59Z")
+        """An unparseable date is passed through as-is, not dropped or raised."""
+        params = build_sync_params("invalid-date", "2025-12-31T23:59:59Z")
 
-        # Assert - should not raise error, just skip invalid date
-        assert "summary_end_time" in params
-        # Invalid start date should be skipped
-        assert params.get("summary_start_time") is None or params["summary_start_time"] == "invalid-date"
+        assert params == {"start_date": "invalid-date", "end_date": "2025-12-31T23:59:59Z"}
+
+
+class TestSyncVendorDataLinkedSkip:
+    """A profile that loses the linked-account lock must not look like it synced."""
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_skip_reports_skipped_and_leaves_the_cursor_alone(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        user = UserFactory()
+        holder = UserFactory()
+        provider_user_id = "shared-account-1"
+        connection = UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            status=ConnectionStatus.ACTIVE,
+            provider_user_id=provider_user_id,
+        )
+        # The holder keeps an active connection, so the stale-lock steal path must not fire.
+        UserConnectionFactory(
+            user=holder,
+            provider="garmin",
+            status=ConnectionStatus.ACTIVE,
+            provider_user_id=provider_user_id,
+        )
+        try_become_primary("garmin", provider_user_id, holder.id, scope="pull")
+
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+        mock_strategy = MagicMock()
+        mock_strategy.capabilities.rest_pull = True
+        mock_get_provider.return_value = mock_strategy
+
+        before = connection.last_synced_at
+        with patch("app.integrations.celery.tasks.sync_vendor_data_task.emit_sync_completed") as emit_completed:
+            result = sync_vendor_data(str(user.id))
+
+        assert result["providers_synced"]["garmin"]["params"]["skipped"] is True
+        assert result["errors"] == {}
+        mock_strategy.workouts.load_data.assert_not_called()
+
+        emit_completed.assert_called_once()
+        assert emit_completed.call_args.kwargs["status"] == SyncStatus.SKIPPED
+        assert emit_completed.call_args.kwargs["items_processed"] == 0
+
+        db.refresh(connection)
+        assert connection.last_synced_at == before

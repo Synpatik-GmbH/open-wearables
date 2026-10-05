@@ -44,7 +44,7 @@ class TestSleepSummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/sleep",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
         assert response.status_code == 200
@@ -86,7 +86,7 @@ class TestSleepSummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/sleep",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -149,7 +149,7 @@ class TestSleepSummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/sleep",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -188,7 +188,7 @@ class TestSleepSummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/sleep",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -255,7 +255,7 @@ class TestSleepSummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/sleep",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -276,6 +276,68 @@ class TestSleepSummaryEndpoint:
         assert main_sleep_data["stages"]["light_minutes"] == 210
         assert main_sleep_data["nap_count"] == 1
         assert main_sleep_data["nap_duration_minutes"] == 30
+
+        # total_duration spans main sleep (480) + nap (30)
+        assert main_sleep_data["total_duration_minutes"] == 510
+
+        # Per-session breakdown lists both sessions, sorted by start time
+        sessions = main_sleep_data["sessions"]
+        assert len(sessions) == 2
+        assert sessions[0]["is_nap"] is False
+        assert sessions[0]["duration_minutes"] == 480
+        assert sessions[1]["is_nap"] is True
+        assert sessions[1]["duration_minutes"] == 30
+
+    def test_get_sleep_summary_start_end_anchor_longest_session(self, client: TestClient, db: Session) -> None:
+        """Split-sleep night: start/end anchor on the longest main-sleep session."""
+        user = UserFactory()
+        mapping = DataSourceFactory(user=user)
+
+        # Short fragment: 2am - 3am (1 hour)
+        short_record = EventRecordFactory(
+            mapping=mapping,
+            category="sleep",
+            start_datetime=datetime(2025, 12, 26, 2, 0, 0, tzinfo=timezone.utc),
+            end_datetime=datetime(2025, 12, 26, 3, 0, 0, tzinfo=timezone.utc),
+            duration_seconds=3600,
+        )
+        SleepDetailsFactory(event_record=short_record, sleep_total_duration_minutes=60, is_nap=False)
+
+        # Long fragment: 3:30am - 9:30am (6 hours) — the longest session
+        long_record = EventRecordFactory(
+            mapping=mapping,
+            category="sleep",
+            start_datetime=datetime(2025, 12, 26, 3, 30, 0, tzinfo=timezone.utc),
+            end_datetime=datetime(2025, 12, 26, 9, 30, 0, tzinfo=timezone.utc),
+            duration_seconds=21600,
+            zone_offset="+02:00",
+        )
+        SleepDetailsFactory(event_record=long_record, sleep_total_duration_minutes=360, is_nap=False)
+
+        api_key = ApiKeyFactory()
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/sleep",
+            headers=api_key_headers(api_key.plain_key),
+            params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["data"]) == 1
+        sleep_data = data["data"][0]
+
+        # start/end come from the longest session (3:30 - 9:30), not the min/max span
+        assert sleep_data["start_time"] == "2025-12-26T03:30:00Z"
+        assert sleep_data["end_time"] == "2025-12-26T09:30:00Z"
+        # total still sums both fragments (1h + 6h = 420 min)
+        assert sleep_data["total_duration_minutes"] == 420
+        assert len(sleep_data["sessions"]) == 2
+
+        # zone_offset is surfaced from the longest session; sessions are self-describing.
+        # The short fragment has no offset (None); the long one carries +02:00.
+        assert sleep_data["zone_offset"] == "+02:00"
+        assert sleep_data["sessions"][0]["zone_offset"] is None
+        assert sleep_data["sessions"][1]["zone_offset"] == "+02:00"
 
     def test_get_sleep_summary_no_naps(self, client: TestClient, db: Session) -> None:
         """Test sleep summary returns null for nap fields when no naps exist."""
@@ -301,7 +363,7 @@ class TestSleepSummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/sleep",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -330,7 +392,7 @@ class TestActivitySummaryEndpoint:
 
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -369,7 +431,7 @@ class TestActivitySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -416,7 +478,7 @@ class TestActivitySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -448,7 +510,7 @@ class TestActivitySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -500,7 +562,7 @@ class TestActivitySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -555,7 +617,7 @@ class TestActivitySummaryEndpoint:
 
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(ApiKeyFactory().id),
+            headers=api_key_headers(ApiKeyFactory().plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -579,7 +641,7 @@ class TestActivitySummaryEndpoint:
 
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(ApiKeyFactory().id),
+            headers=api_key_headers(ApiKeyFactory().plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -612,7 +674,7 @@ class TestActivitySummaryEndpoint:
 
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(ApiKeyFactory().id),
+            headers=api_key_headers(ApiKeyFactory().plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -647,7 +709,7 @@ class TestActivitySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-28T00:00:00Z"},
         )
 
@@ -697,7 +759,7 @@ class TestActivitySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -749,7 +811,7 @@ class TestActivitySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -813,7 +875,7 @@ class TestActivitySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -888,7 +950,7 @@ class TestActivitySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -930,7 +992,7 @@ class TestActivitySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/activity",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-27T00:00:00Z"},
         )
 
@@ -978,7 +1040,7 @@ class TestBodySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/body",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
         )
 
         assert response.status_code == 200
@@ -1009,7 +1071,7 @@ class TestBodySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/body",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
         )
 
         assert response.status_code == 200
@@ -1052,7 +1114,7 @@ class TestBodySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/body",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
         )
 
         assert response.status_code == 200
@@ -1102,7 +1164,7 @@ class TestBodySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/body",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"average_period": 7},
         )
 
@@ -1154,7 +1216,7 @@ class TestBodySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/body",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"average_period": 1},
         )
 
@@ -1200,7 +1262,7 @@ class TestBodySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/body",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"latest_window_hours": 4},
         )
 
@@ -1250,7 +1312,7 @@ class TestBodySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/body",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"latest_window_hours": 4},
         )
 
@@ -1289,7 +1351,7 @@ class TestBodySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/body",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"latest_window_hours": 4},
         )
 
@@ -1327,7 +1389,7 @@ class TestBodySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/body",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"latest_window_hours": 4},
         )
 
@@ -1346,7 +1408,7 @@ class TestBodySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/body",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
         )
 
         assert response.status_code == 200
@@ -1382,7 +1444,7 @@ class TestBodySummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/body",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
         )
 
         assert response.status_code == 200
@@ -1418,7 +1480,7 @@ class TestRecoverySummaryEndpoint:
         )
         api_key = ApiKeyFactory()
 
-        response = client.get(self._url(user.id), headers=api_key_headers(api_key.id), params=self.BASE_PARAMS)
+        response = client.get(self._url(user.id), headers=api_key_headers(api_key.plain_key), params=self.BASE_PARAMS)
 
         assert response.status_code == 200
         data = response.json()
@@ -1447,12 +1509,13 @@ class TestRecoverySummaryEndpoint:
         )
         api_key = ApiKeyFactory()
 
-        response = client.get(self._url(user.id), headers=api_key_headers(api_key.id), params=self.BASE_PARAMS)
+        response = client.get(self._url(user.id), headers=api_key_headers(api_key.plain_key), params=self.BASE_PARAMS)
 
         assert response.status_code == 200
         item = response.json()["data"][0]
         assert item["resting_heart_rate_bpm"] == 58
-        assert item["avg_hrv_sdnn_ms"] == 45.5
+        assert item["avg_hrv_rmssd_ms"] == 45.5
+        assert item["avg_hrv_sdnn_ms"] is None
         assert item["avg_spo2_percent"] == 97.0
 
     def test_empty_range_returns_no_data(self, client: TestClient, db: Session) -> None:
@@ -1462,7 +1525,7 @@ class TestRecoverySummaryEndpoint:
 
         response = client.get(
             self._url(user.id),
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2025-12-25T00:00:00Z", "end_date": "2025-12-26T00:00:00Z"},
         )
 
@@ -1484,7 +1547,7 @@ class TestRecoverySummaryEndpoint:
                 recorded_at=datetime(2025, 12, day, 0, 0, 0, tzinfo=timezone.utc),
             )
 
-        response = client.get(self._url(user.id), headers=api_key_headers(api_key.id), params=self.BASE_PARAMS)
+        response = client.get(self._url(user.id), headers=api_key_headers(api_key.plain_key), params=self.BASE_PARAMS)
 
         assert response.status_code == 200
         scores = [item["recovery_score"] for item in response.json()["data"]]
@@ -1521,7 +1584,7 @@ class TestRecoverySummaryEndpoint:
             recorded_at=datetime(2025, 12, 28, 0, 0, 0, tzinfo=timezone.utc),
         )
 
-        response = client.get(self._url(user.id), headers=api_key_headers(api_key.id), params=self.BASE_PARAMS)
+        response = client.get(self._url(user.id), headers=api_key_headers(api_key.plain_key), params=self.BASE_PARAMS)
 
         assert response.status_code == 200
         data = response.json()["data"]
@@ -1542,7 +1605,7 @@ class TestRecoverySummaryEndpoint:
         )
         api_key = ApiKeyFactory()
 
-        response = client.get(self._url(user.id), headers=api_key_headers(api_key.id), params=self.BASE_PARAMS)
+        response = client.get(self._url(user.id), headers=api_key_headers(api_key.plain_key), params=self.BASE_PARAMS)
 
         assert response.status_code == 200
         item = response.json()["data"][0]
@@ -1569,7 +1632,7 @@ class TestRecoverySummaryEndpoint:
 
         response = client.get(
             self._url(user.id),
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2026-01-01T00:00:00Z", "end_date": "2026-01-31T00:00:00Z", "limit": 3},
         )
 
@@ -1578,3 +1641,54 @@ class TestRecoverySummaryEndpoint:
         assert len(data["data"]) == 3
         assert data["pagination"]["has_more"] is True
         assert data["pagination"]["next_cursor"] is not None
+
+
+class TestDataTimelineEndpoint:
+    """Test suite for GET /users/{user_id}/summaries/data/timeline."""
+
+    def _url(self, user_id: object) -> str:
+        return f"/api/v1/users/{user_id}/summaries/data/timeline"
+
+    def test_returns_sparse_daily_buckets_per_provider(self, client: TestClient, db: Session) -> None:
+        user = UserFactory()
+        garmin = DataSourceFactory(user=user, provider=ProviderName.GARMIN)
+        oura = DataSourceFactory(user=user, provider=ProviderName.OURA)
+        hr_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate()
+
+        for hour in (8, 9):
+            DataPointSeriesFactory(
+                data_source=garmin, series_type=hr_type, recorded_at=datetime(2026, 6, 1, hour, tzinfo=timezone.utc)
+            )
+        DataPointSeriesFactory(
+            data_source=garmin, series_type=hr_type, recorded_at=datetime(2026, 6, 3, 8, tzinfo=timezone.utc)
+        )
+        DataPointSeriesFactory(
+            data_source=oura, series_type=hr_type, recorded_at=datetime(2026, 6, 3, 8, tzinfo=timezone.utc)
+        )
+
+        response = client.get(
+            self._url(user.id),
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+            params={"start_date": "2026-06-01", "end_date": "2026-06-08"},
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["bucket"] == "day"
+        assert body["group_by"] == "provider"
+        series = {s["key"]: s for s in body["series"]}
+        # The gap on 2026-06-02 is absent rather than reported as a zero.
+        assert series["garmin"]["buckets"] == [["2026-06-01", 2], ["2026-06-03", 1]]
+        assert series["garmin"]["metric"] == "data_points"
+        assert series["oura"]["buckets"] == [["2026-06-03", 1]]
+
+    def test_unknown_bucket_is_rejected(self, client: TestClient, db: Session) -> None:
+        user = UserFactory()
+
+        response = client.get(
+            self._url(user.id),
+            headers=api_key_headers(ApiKeyFactory().plain_key),
+            params={"bucket": "month"},
+        )
+
+        assert response.status_code == 400

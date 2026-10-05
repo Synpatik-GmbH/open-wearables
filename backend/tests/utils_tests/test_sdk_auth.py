@@ -49,10 +49,10 @@ class TestGetSDKAuth:
         """Valid API key should return SDKAuthContext."""
         api_key = ApiKeyFactory()
 
-        result = await get_sdk_auth(db=db, token=None, x_open_wearables_api_key=api_key.id)
+        result = await get_sdk_auth(db=db, token=None, x_open_wearables_api_key=api_key.plain_key)
 
         assert result.auth_type == "api_key"
-        assert result.api_key_id == api_key.id
+        assert result.api_key_id == str(api_key.id)
 
     @pytest.mark.asyncio
     async def test_no_auth_raises_401(self, db: Session) -> None:
@@ -78,7 +78,7 @@ class TestGetSDKAuth:
         UserFactory(id=UUID(user_id))
         token = create_sdk_user_token("app_123", user_id)
 
-        result = await get_sdk_auth(db=db, token=token, x_open_wearables_api_key=api_key.id)
+        result = await get_sdk_auth(db=db, token=token, x_open_wearables_api_key=api_key.plain_key)
 
         assert result.auth_type == "sdk_token"
         assert str(result.user_id) == user_id
@@ -169,7 +169,7 @@ class TestGetSDKAuthSubjectMustExist:
         user_service.delete(db, user.id)
 
         with pytest.raises(HTTPException) as exc_info:
-            await get_sdk_auth(db=db, token=token, x_open_wearables_api_key=api_key.id)
+            await get_sdk_auth(db=db, token=token, x_open_wearables_api_key=api_key.plain_key)
 
         assert exc_info.value.status_code == 401
 
@@ -177,7 +177,7 @@ class TestGetSDKAuthSubjectMustExist:
     async def test_undecodable_token_still_falls_through_to_api_key(self, db: Session) -> None:
         api_key = ApiKeyFactory()
 
-        result = await get_sdk_auth(db=db, token="not-a-jwt", x_open_wearables_api_key=api_key.id)
+        result = await get_sdk_auth(db=db, token="not-a-jwt", x_open_wearables_api_key=api_key.plain_key)
 
         assert result.auth_type == "api_key"
 
@@ -186,7 +186,7 @@ class TestGetSDKAuthSubjectMustExist:
         api_key = ApiKeyFactory()
         developer_token = create_access_token(subject=str(DeveloperFactory().id))
 
-        result = await get_sdk_auth(db=db, token=developer_token, x_open_wearables_api_key=api_key.id)
+        result = await get_sdk_auth(db=db, token=developer_token, x_open_wearables_api_key=api_key.plain_key)
 
         assert result.auth_type == "api_key"
 

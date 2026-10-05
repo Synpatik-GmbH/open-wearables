@@ -6,7 +6,7 @@ import warnings
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import quote
 
 if TYPE_CHECKING:
@@ -15,7 +15,9 @@ if TYPE_CHECKING:
 from pydantic import AnyHttpUrl, Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.schemas.enums.data_granularity import DataGranularity
 from app.utils.config_utils import (
+    AccessLogLevel,
     EncryptedField,
     EnvironmentType,
     FernetDecryptorField,
@@ -44,6 +46,13 @@ class Settings(BaseSettings):
     paging_limit: int = 100
     cors_origins: list[AnyHttpUrl] = []
     cors_allow_all: bool = False
+
+    # None → derived in derive_access_log_level (prod: errors only, else: all)
+    access_log_level: AccessLogLevel | None = None
+    # Include the 4xx response body the client received in the access log.
+    log_error_response_body: bool = False
+    log_error_response_body_max_bytes: int = 8192  # truncate a logged body
+    log_error_response_body_max_per_minute: int = 60  # cap logged bodies/min
 
     # DATABASE SETTINGS
     db_host: str = "db"
@@ -103,6 +112,13 @@ class Settings(BaseSettings):
     # Will default to false in a future release.
     historical_sync_on_connect: bool = True
 
+    # Per-request timeout for provider API calls (connect/read/write/pool alike).
+    provider_request_timeout_seconds: float = Field(30.0, gt=0, le=300)
+
+    # How long a linked-account pull lock survives without renewal. The holder renews it
+    # four times per lease from a daemon thread, so the lock dies with the worker process.
+    linked_sync_pull_lease_seconds: int = Field(120, ge=30, le=3600)
+
     # Whether to ingest per-second workout samples (speed, cadence, power, GPS, etc.) into
     # data_point_series on workout webhook arrival. Significantly increases DB storage.
     # Per-provider granularity will be added via ProviderSetting in a future release.
@@ -119,12 +135,29 @@ class Settings(BaseSettings):
     workout_zone_target_completeness: float = 0.95  # emit once the trace is this complete
     workout_zone_hard_cap_seconds: int = 5  # emit whatever we have past this elapsed
 
+    # Default 24/7 data granularity (raw | hourly | daily) for providers that support it,
+    # used when a provider has no explicit ProviderSetting.data_granularity.
+    # DANGER: anything but raw halts Google Health 24/7 ingestion. Its rollUp operation is
+    # disabled (#1577), so every metric it would have driven is skipped and each sync reports
+    # the failure. Sleep and basal energy are unaffected. Leave this at raw.
+    default_data_granularity: DataGranularity = DataGranularity.RAW
+
     # SCORE SETTINGS
     score_backfill_days: int = 30  # How far back the missing-score query looks
     sleep_score_interval_seconds: int = 600  # How often to run the fill-missing-scores task (default: 10 min)
     resilience_score_interval_seconds: int = (
         600  # How often to run the fill-missing-resilience-scores task (default: 10 min)
     )
+
+    # SYNC RUN TRACKING
+    sync_run_tracking_enabled: bool = True
+    # Persist live runs too. WARNING: space-consuming — one row per webhook and per SDK
+    # batch, so hundreds a day for an active user. Historical runs are a handful, ever.
+    persist_live_sync_runs: bool = False
+    # Closed as stale once this long passes with no event. Covers the gap between events,
+    # not the whole run: the sweep leaves anything still reporting in Redis alone.
+    sync_run_stale_after_hours: int = Field(2, ge=1)
+    sync_run_sweep_interval_seconds: int = Field(1800, ge=60)
 
     # API SETTINGS
     api_base_url: str = "http://localhost:8000"
@@ -156,6 +189,13 @@ class Settings(BaseSettings):
     whoop_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
     whoop_default_scope: str = "offline read:profile read:cycles read:sleep read:recovery read:workout"
 
+    # SENSORBIO OAUTH SETTINGS
+    sensorbio_client_id: str | None = None
+    sensorbio_client_secret: SecretStr | None = None
+    # Sensor Bio OAuth currently has no granular scopes defined in the developer portal.
+    # Leave empty so the authorize URL omits scope= (mirrors Garmin/Suunto).
+    sensorbio_default_scope: str = ""
+
     # FITBIT OAUTH SETTINGS
     fitbit_client_id: str | None = None
     fitbit_client_secret: SecretStr | None = None
@@ -166,7 +206,7 @@ class Settings(BaseSettings):
     oura_client_id: str | None = None
     oura_client_secret: SecretStr | None = None
     oura_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
-    oura_default_scope: str = "personal daily activity heartrate workout session spo2 ring_configuration heart_health"
+    oura_default_scope: str = "personal daily heartrate workout session spo2 ring_configuration heart_health"
     oura_webhook_verification_token: SecretStr | None = None
 
     # STRAVA OAUTH SETTINGS
@@ -184,6 +224,37 @@ class Settings(BaseSettings):
     ultrahuman_client_secret: SecretStr | None = None
     ultrahuman_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
     ultrahuman_default_scope: str = "ring_data cgm_data profile"
+
+    # GOOGLE OAUTH SETTINGS
+    google_client_id: str | None = None
+    google_client_secret: SecretStr | None = None
+    google_default_scope: str = (
+        "openid email "
+        "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly "
+        "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly "
+        "https://www.googleapis.com/auth/googlehealth.nutrition.readonly "
+        "https://www.googleapis.com/auth/googlehealth.sleep.readonly "
+        "https://www.googleapis.com/auth/googlehealth.settings.readonly"
+    )
+    # Bearer secret Google echoes in the Authorization header of every webhook
+    # notification. Defaults to secret_key (see derive_google_webhook_secret).
+    google_webhook_secret: SecretStr | None = None
+    # GCP project NUMBER (not ID) for Health API subscriber registration.
+    google_project_id: str | None = None
+    # Path to the service-account JSON key used to authenticate project-level
+    # subscriber registration. If unset, Application Default Credentials are used.
+    google_service_account_file: str | None = None
+    # How 24/7 data is fetched, at native resolution either way.
+    # true - reconcile, false - list; for details check docs
+    google_use_reconcile: bool = True
+    # Compatibility patch: keep emitting the pre-split /oauth/google/callback redirect URI so
+    # an upgrade needs no change to the registered OAuth client. Removed in 1.0.
+    google_legacy_oauth_path: bool = True
+
+    withings_client_id: str | None = None
+    withings_client_secret: SecretStr | None = None
+    withings_webhook_token: SecretStr | None = None
+    withings_default_scope: str = "user.info,user.metrics,user.activity"
 
     # EMAIL SETTINGS (Resend)
     resend_api_key: SecretStr | None = None
@@ -203,6 +274,24 @@ class Settings(BaseSettings):
     aws_region: str = "eu-north-1"
     # for topic ARN verification from SNS notification (signature is verified regardless)
     aws_sns_topic_arn: SecretStr | None = None
+    # custom S3-compatible endpoint; enables path-style + SigV4. See Apple XML import docs.
+    aws_endpoint_url: str | None = None
+    # browser-facing endpoint for presigned URLs; falls back to aws_endpoint_url
+    aws_public_endpoint_url: str | None = None
+    # upload trigger: "client" (/complete) or "sns" (S3 bucket event); only one dispatches
+    apple_xml_upload_completion_mode: Literal["client", "sns"] = "client"
+    # max XML upload size, 5 MiB - 5 TiB (default 5 GiB)
+    apple_xml_max_file_size_bytes: int = Field(
+        5 * 1024 * 1024 * 1024,
+        ge=5 * 1024 * 1024,
+        le=5 * 1024 * 1024 * 1024 * 1024,
+    )
+    # browser multipart chunk size, 5 MiB - 5 GiB (default 100 MiB)
+    apple_xml_multipart_part_size_bytes: int = Field(
+        100 * 1024 * 1024,
+        ge=5 * 1024 * 1024,
+        le=5 * 1024 * 1024 * 1024,
+    )
 
     xml_chunk_size: int = 50_000
 
@@ -213,7 +302,15 @@ class Settings(BaseSettings):
     raw_payload_s3_prefix: str = "raw-payloads"
     raw_payload_s3_endpoint_url: str | None = None  # for S3-compatible storage (e.g. Railway Object Storage)
 
+    # SDK sync enqueues an S3 reference instead of the inline body, so a backlog stops eating
+    # broker memory. Needs a bucket, not raw_payload_storage=s3 — archival is a debug aid,
+    # not a reliability dependency.
+    sdk_payload_s3_offload: bool = False
+
     # SVIX WEBHOOK SETTINGS
+    # Master switch for outgoing webhooks. Off by default so deployments without Svix
+    # (no svix-server container) never build a client, emit, or register event types.
+    outgoing_webhooks_enabled: bool = False
     svix_server_url: str = "http://svix-server:8071"
     # Signing secret used by the Svix server to verify JWTs.  Must match SVIX_JWT_SECRET in docker-compose.
     svix_jwt_secret: SecretStr | None = None
@@ -270,6 +367,24 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def derive_access_log_level(self) -> "Settings":
+        if self.access_log_level is None:
+            self.access_log_level = (
+                AccessLogLevel.ERRORS if self.environment == EnvironmentType.PRODUCTION else AccessLogLevel.ALL
+            )
+        return self
+
+    @model_validator(mode="after")
+    def check_sdk_payload_s3_offload(self) -> "Settings":
+        """Fail at startup rather than degrading to inline payloads on the first request."""
+        if self.sdk_payload_s3_offload and not self.raw_payload_bucket:
+            raise ValueError(
+                "SDK_PAYLOAD_S3_OFFLOAD is on but no S3 bucket is configured - "
+                "set RAW_PAYLOAD_S3_BUCKET or AWS_BUCKET_NAME."
+            )
+        return self
+
+    @model_validator(mode="after")
     def derive_svix_jwt_secret(self) -> "Settings":
         if self.svix_jwt_secret is None or self.svix_jwt_secret.get_secret_value() == "":
             self.svix_jwt_secret = SecretStr(self.secret_key)
@@ -294,6 +409,12 @@ class Settings(BaseSettings):
             or self.oura_webhook_verification_token.get_secret_value() == ""
         ):
             self.oura_webhook_verification_token = SecretStr(self.secret_key)
+        return self
+
+    @model_validator(mode="after")
+    def derive_google_webhook_secret(self) -> "Settings":
+        if self.google_webhook_secret is None or self.google_webhook_secret.get_secret_value() == "":
+            self.google_webhook_secret = SecretStr(self.secret_key)
         return self
 
     @field_validator("cors_origins", mode="after")
@@ -338,7 +459,24 @@ class Settings(BaseSettings):
                 stacklevel=2,
             )
             return legacy_value
-        return f"{self.api_base_url}/api/v1/oauth/{provider.value}/callback"
+        return f"{self.api_base_url}/api/v1/oauth/{self._oauth_path(provider)}/callback"
+
+    def _oauth_path(self, provider: ProviderName) -> str:
+        """Path segment to publish for a provider's OAuth routes.
+
+        Google Health was reachable at /google/ before it was split from Health Connect,
+        and that path is in every pre-0.8.1 deployment's registered redirect URI.
+        """
+        from app.schemas.enums import ProviderName as _ProviderName  # runtime-only; see TYPE_CHECKING above
+
+        if provider is _ProviderName.GOOGLE_HEALTH and self.google_legacy_oauth_path:
+            return "google"
+        return provider.value
+
+    @property
+    def raw_payload_bucket(self) -> str | None:
+        """Bucket for raw payload storage and SDK payload offload."""
+        return self.raw_payload_s3_bucket or self.aws_bucket_name
 
     @property
     def redis_url(self) -> str:
@@ -391,7 +529,7 @@ class Settings(BaseSettings):
 
 @lru_cache()
 def _get_settings() -> Settings:
-    return Settings()  # ty: ignore[missing-argument]
+    return Settings()
 
 
 settings = _get_settings()

@@ -10,7 +10,6 @@ from .events import (
     MenstrualCycleRecord,
     SleepSession,
     Workout,
-    WorkoutDetailed,
 )
 from .resilience import (
     DailyHrvScore,
@@ -26,6 +25,7 @@ from .summaries import (
     HeartRateStats,
     IntensityMinutes,
     RecoverySummary,
+    SleepSessionSummary,
     SleepStagesSummary,
     SleepSummary,
 )
@@ -41,7 +41,6 @@ __all__ = [
     "IntensityMinutesResult",
     # Events
     "Workout",
-    "WorkoutDetailed",
     "Meal",
     "Measurement",
     "MenstrualCycleRecord",
@@ -57,5 +56,6 @@ __all__ = [
     "IntensityMinutes",
     "RecoverySummary",
     "SleepSummary",
+    "SleepSessionSummary",
     "SleepStagesSummary",
 ]

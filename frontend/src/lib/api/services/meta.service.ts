@@ -4,6 +4,7 @@ import { API_ENDPOINTS } from '../config';
 export interface TimeseriesMetric {
   code: string;
   unit: string;
+  description?: string;
   providers: string[];
 }
 
@@ -22,8 +23,14 @@ export interface SleepField {
   providers: string[];
 }
 
+export interface MenstrualCycleField {
+  code: string;
+  providers: string[];
+}
+
 export interface HealthScore {
   code: string;
+  description?: string;
   providers: string[];
 }
 
@@ -32,6 +39,7 @@ export interface CoverageResponse {
   timeseries: TimeseriesCategory[];
   workout_fields: WorkoutField[];
   sleep_fields: SleepField[];
+  menstrual_cycle_fields: MenstrualCycleField[];
   health_scores: HealthScore[];
 }
 

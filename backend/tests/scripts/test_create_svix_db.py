@@ -122,6 +122,7 @@ def _svix_absent(admin: psycopg.Connection, svix_preexisted: bool) -> None:
 
 
 def _point_script_at(monkeypatch: pytest.MonkeyPatch, target: _Target, user: str, password: str) -> None:
+    monkeypatch.setattr(script.settings, "outgoing_webhooks_enabled", True)
     monkeypatch.setattr(script.settings, "db_host", target.host)
     monkeypatch.setattr(script.settings, "db_port", target.port)
     monkeypatch.setattr(script.settings, "db_name", target.dbname)

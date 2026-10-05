@@ -319,10 +319,11 @@ class OuraWebhookHandler(BaseWebhookHandler):
             return 0
 
         if data_type == "workout":
-            return self.workouts.save_by_id(db, user_id, object_id)
+            return self.workouts.save_by_id(db, user_id, object_id, trace_id=trace_id)
 
         collection = _COLLECTION_NAME.get(data_type, data_type)
-        raw = self.data_247._make_api_request(db, user_id, f"/v2/usercollection/{collection}/{object_id}")
+        endpoint = f"/v2/usercollection/{collection}/{object_id}"
+        raw = self.data_247._make_api_request(db, user_id, endpoint)
         if not raw or not isinstance(raw, dict):
             log_structured(
                 logger,
@@ -337,14 +338,24 @@ class OuraWebhookHandler(BaseWebhookHandler):
             )
             return 0
 
+        store_raw_payload(
+            source="api_response",
+            provider="oura",
+            payload=raw,
+            user_id=str(user_id),
+            trace_id=trace_id,
+        )
+
         docs = [raw]
 
         log_ctx = LogContext(provider_user_id=notification.user_id, trace_id=trace_id)
 
         match data_type:
-            case "sleep" | "daily_sleep":
-                return self.data_247.save_sleep_data(
-                    db, user_id, self.data_247.normalize_sleeps(docs, user_id), log_ctx
+            case "sleep":
+                return self.data_247.save_sleep_data(db, user_id, self.data_247.normalize_sleeps(docs, user_id))
+            case "daily_sleep":
+                return self.data_247.save_daily_sleep_scores(
+                    db, user_id, self.data_247.normalize_daily_sleep_scores(docs, user_id)
                 )
             case "daily_readiness":
                 return self.data_247.save_readiness_data(

@@ -1,4 +1,4 @@
-from app.services.apple.healthkit.workout_settle import should_emit
+from app.services.sdk.workout_settle import should_emit
 
 T, CAP = 0.95, 5.0
 

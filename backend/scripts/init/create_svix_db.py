@@ -12,13 +12,20 @@ with InsufficientPrivilege even though the database exists. Only a role that
 can create databases ever reaches the CREATE, and only when the name is absent.
 """
 
+import logging
+
 import psycopg
 import psycopg.errors
 
 from app.config import settings
 
+logger = logging.getLogger(__name__)
+
 
 def create_svix_db() -> None:
+    if not settings.outgoing_webhooks_enabled:
+        logger.info("Outgoing webhooks disabled — skipping svix database creation.")
+        return
     dsn = (
         f"host={settings.db_host} "
         f"port={settings.db_port} "
@@ -39,4 +46,5 @@ def create_svix_db() -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s - %(name)s] (%(levelname)s) %(message)s")
     create_svix_db()

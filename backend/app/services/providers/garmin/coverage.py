@@ -19,7 +19,7 @@ ACTIVITY_SAMPLE_SERIES: list[tuple[str, SeriesType]] = [
 # Daily summary field → SeriesType (/wellness-api/rest/dailies).
 DAILIES_SERIES: list[tuple[str, SeriesType]] = [
     ("steps", SeriesType.steps),
-    ("active_calories", SeriesType.energy),
+    ("active_calories", SeriesType.active_energy),
     ("resting_heart_rate", SeriesType.resting_heart_rate),
     ("floors_climbed", SeriesType.flights_climbed),
     ("distance_meters", SeriesType.distance_walking_running),
@@ -30,7 +30,7 @@ DAILIES_SERIES: list[tuple[str, SeriesType]] = [
 EPOCHS_SERIES: dict[str, SeriesType] = {
     "heart_rate": SeriesType.heart_rate,
     "steps": SeriesType.steps,
-    "energy": SeriesType.energy,
+    "energy": SeriesType.active_energy,
 }
 
 TIMESERIES: frozenset[SeriesType] = frozenset(
@@ -68,6 +68,11 @@ WORKOUT_FIELDS: frozenset[str] = frozenset(
         "average_cadence",
         "average_speed",
         "total_elevation_gain",
+        "entry_source",
+        "label",
+        "hr_zones",
+        "power_zones",
+        "segments",
     }
 )
 
@@ -83,6 +88,27 @@ SLEEP_FIELDS: frozenset[str] = frozenset(
         "sleep_awake_minutes",
         "is_nap",
         "sleep_stages",
+    }
+)
+
+# MenstrualCycleDetail fields populated by data_247.py (Garmin MCT cycle summaries).
+MENSTRUAL_CYCLE_FIELDS: frozenset[str] = frozenset(
+    {
+        "day_in_cycle",
+        "current_phase",
+        "current_phase_type",
+        "length_of_current_phase",
+        "days_until_next_phase",
+        "predicted_cycle_length",
+        "is_predicted_cycle",
+        "cycle_length",
+        "last_updated_at",
+        "has_specified_cycle_length",
+        "has_specified_period_length",
+        "period_length",
+        "fertile_window_start",
+        "length_of_fertile_window",
+        "pregnancy_snapshot",
     }
 )
 
