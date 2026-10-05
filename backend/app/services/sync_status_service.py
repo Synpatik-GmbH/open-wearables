@@ -160,6 +160,8 @@ def try_persist_run(event: SyncStatusEvent) -> None:
                 ),
             )
     except Exception as exc:
+        # FORK (data protection): no user_id, and the error's type rather than its text.
+        # A database error's text carries the statement's parameters, user_id among them.
         log_structured(
             logger,
             "warning",
@@ -167,8 +169,7 @@ def try_persist_run(event: SyncStatusEvent) -> None:
             provider=event.provider,
             action="sync_run_persist_failed",
             run_id=event.run_id,
-            user_id=str(event.user_id),
-            error=str(exc),
+            error=type(exc).__name__,
         )
 
 
@@ -245,6 +246,9 @@ def emit(event: SyncStatusEvent) -> None:
     # Mirror the SSE event into the structured logs so sync outcome metadata
     # (status, item counts, inserted/updated split, message) is queryable in the
     # deployment logs, not only on the frontend stream.
+    # FORK (data protection): the line carries no user_id. The log window has no erasure
+    # path, and SDK log ingestion reaches this line. Correlate on run_id: a stored run
+    # maps to its user in sync_run, and stops mapping when the user is deleted.
     match event.status:
         case SyncStatus.FAILED:
             level = "error"
@@ -276,7 +280,6 @@ def emit(event: SyncStatusEvent) -> None:
         scope=str(event.scope),
         stage=str(event.stage),
         run_id=event.run_id,
-        user_id=str(event.user_id),
         **extra,
     )
 
@@ -301,7 +304,9 @@ def emit(event: SyncStatusEvent) -> None:
         pipe.publish(_global_channel(), payload)
         pipe.execute()
     except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("Failed to emit sync status event: %s", exc, exc_info=True)
+        # FORK (data protection): the error's type, not its text or traceback. A Redis
+        # pipeline error quotes the failed command, and its key and payload hold user_id.
+        logger.warning("Failed to emit sync status event: %s", type(exc).__name__)
 
     # Dispatch outgoing webhooks in a background thread so the Svix HTTP
     # round-trip (~2 s) does not block the Celery task or inflate sync duration.
