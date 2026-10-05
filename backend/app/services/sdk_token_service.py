@@ -30,3 +30,19 @@ def create_sdk_user_token(app_id: str, user_id: str) -> str:
     }
 
     return jwt.encode(claims, settings.secret_key, algorithm=settings.algorithm)
+
+
+# FORK (2.71.4): the app_id a token carries says which route minted it. A route that is
+# switched off also stops honouring the refresh tokens it issued while it was on.
+_APP_ID_PREFIX_SETTING = {
+    "admin:": "sdk_token_developer_mint_enabled",
+    "invite:": "user_invitation_codes_enabled",
+}
+
+
+def sdk_token_source_enabled(app_id: str | None) -> bool:
+    """Whether the route that minted a token with this app_id is still open."""
+    for prefix, setting in _APP_ID_PREFIX_SETTING.items():
+        if app_id and app_id.startswith(prefix):
+            return bool(getattr(settings, setting))
+    return True

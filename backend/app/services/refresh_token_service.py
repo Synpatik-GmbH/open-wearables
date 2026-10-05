@@ -12,7 +12,7 @@ from app.database import DbSession
 from app.models import RefreshToken
 from app.repositories.refresh_token_repository import refresh_token_repository
 from app.schemas.auth import TokenResponse, TokenType
-from app.services.sdk_token_service import create_sdk_user_token
+from app.services.sdk_token_service import create_sdk_user_token, sdk_token_source_enabled
 from app.utils.security import create_access_token
 from app.utils.structured_logging import log_structured
 
@@ -20,6 +20,9 @@ from app.utils.structured_logging import log_structured
 REFRESH_ACTION_ROTATED = "refresh_token_rotated"
 REFRESH_ACTION_GRACE_REISSUED = "refresh_token_grace_reissued"
 REFRESH_ACTION_REJECTED = "refresh_token_rejected"
+# FORK (2.71.4): not a member of REFRESH_REJECT_REASONS on purpose. That tuple is the stuck-client
+# query's vocabulary; a token refused because its minting route is switched off is not a stuck client.
+REFRESH_ACTION_ROUTE_CLOSED = "refresh_token_route_closed"
 REFRESH_REASON_UNKNOWN = "unknown"
 REFRESH_REASON_REVOKED = "revoked"
 REFRESH_REASON_SUCCESSOR_USED = "rotated_successor_used"
@@ -148,6 +151,9 @@ class RefreshTokenService:
             raise self._unauthorized()
         if first_read.token_type != TokenType.SDK:
             return self._refresh_non_sdk(db_session, refresh_token_str)
+        if not sdk_token_source_enabled(first_read.app_id):
+            self._log_refresh(REFRESH_ACTION_ROUTE_CLOSED, token_type=TokenType.SDK)
+            raise self._unauthorized()
         return self._refresh_sdk(db_session, first_read)
 
     def _refresh_sdk(self, db_session: DbSession, first_read: RefreshToken) -> TokenResponse:

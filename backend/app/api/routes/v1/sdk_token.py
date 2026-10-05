@@ -6,7 +6,7 @@ from fastapi import APIRouter, Body, HTTPException, status
 from app.config import settings
 from app.database import DbSession
 from app.schemas.auth import SDKTokenRequest, TokenResponse
-from app.services import application_service, create_sdk_user_token, refresh_token_service
+from app.services import application_service, create_sdk_user_token, refresh_token_service, user_service
 from app.utils.auth import DeveloperOptionalDep
 
 router = APIRouter()
@@ -25,6 +25,10 @@ def create_user_token(
     1. App credentials: Provide app_id and app_secret in the request body
     2. Admin authentication: Authenticate as a developer/admin via Bearer token
        (app_id and app_secret can be omitted)
+
+    In this fork method 2 is off by default and answers 403 unless
+    `SDK_TOKEN_DEVELOPER_MINT_ENABLED=true`. Minting is refused with 409 while more
+    than one application exists, and with 404 for a user that does not exist.
 
     Both methods return access_token with refresh_token.
 
@@ -57,6 +61,12 @@ def create_user_token(
         app_id = application.app_id
     # Method 2: Admin authentication (developer token)
     elif developer:
+        # FORK (2.71.4): off unless the setting turns it on.
+        if not settings.sdk_token_developer_mint_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="SDK token minting with developer authentication is disabled",
+            )
         # Use developer ID as app_id for admin-generated tokens (enables audit trail)
         # Format: "admin:{developer_id}" to distinguish from app-generated tokens
         app_id = f"admin:{developer.id}"
@@ -66,6 +76,10 @@ def create_user_token(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Either app credentials (app_id, app_secret) or admin authentication (Bearer token) is required",
         )
+
+    # FORK (2.71.4): after the caller is authenticated, so neither answer is given to a stranger.
+    application_service.require_single_application(db)
+    user_service.get(db, user_id, raise_404=True)
 
     # Generate user-scoped SDK token
     access_token = create_sdk_user_token(

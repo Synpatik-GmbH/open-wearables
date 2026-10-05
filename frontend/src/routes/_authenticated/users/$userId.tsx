@@ -25,6 +25,7 @@ import {
   useAppleXmlUpload,
   useGenerateInvitationCode,
 } from '@/hooks/api/use-users';
+import { useConfig } from '@/hooks/api/use-config';
 import { useUserDataSummary } from '@/hooks/api/use-health';
 import { useSyncStatusStream } from '@/hooks/api/use-sync-status';
 import { ROUTES } from '@/lib/constants/routes';
@@ -117,6 +118,10 @@ function UserDetailPage() {
     data: invitationCodeData,
     isPending: isGeneratingCode,
   } = useGenerateInvitationCode();
+  // FORK (2.71.4): the invitation-code routes are off unless the instance turns them on.
+  const config = useConfig();
+  const invitationCodesEnabled =
+    config.data?.user_invitation_codes_enabled === true;
   const [copied, setCopied] = useState(false);
   const [codeCopied, setCodeCopied] = useState(false);
   const [urlCopied, setUrlCopied] = useState(false);
@@ -319,30 +324,32 @@ function UserDetailPage() {
               </>
             )}
           </Button>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="secondary"
-                onClick={handleGenerateInvitationCode}
-                disabled={isGeneratingCode}
-              >
-                {isGeneratingCode ? (
-                  <>
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                    Generating...
-                  </>
-                ) : (
-                  <>
-                    <Smartphone className="h-4 w-4" />
-                    Connect Mobile App
-                  </>
-                )}
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom">
-              Generate a one-time code to connect the Open Wearables iOS app
-            </TooltipContent>
-          </Tooltip>
+          {invitationCodesEnabled && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="secondary"
+                  onClick={handleGenerateInvitationCode}
+                  disabled={isGeneratingCode}
+                >
+                  {isGeneratingCode ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                      Generating...
+                    </>
+                  ) : (
+                    <>
+                      <Smartphone className="h-4 w-4" />
+                      Connect Mobile App
+                    </>
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">
+                Generate a one-time code to connect the Open Wearables iOS app
+              </TooltipContent>
+            </Tooltip>
+          )}
           <input
             ref={fileInputRef}
             type="file"

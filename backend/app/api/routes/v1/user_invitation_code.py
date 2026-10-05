@@ -1,7 +1,8 @@
 from uuid import UUID
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
+from app.config import settings
 from app.database import DbSession
 from app.schemas.model_crud.credentials import (
     InvitationCodeRedeemResponse,
@@ -11,7 +12,14 @@ from app.schemas.model_crud.credentials import (
 from app.services import DeveloperDep
 from app.services.user_invitation_code_service import user_invitation_code_service
 
-router = APIRouter()
+
+def _require_invitation_codes_enabled() -> None:
+    """FORK (2.71.4): both routes answer as if they did not exist unless the setting is on."""
+    if not settings.user_invitation_codes_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
+
+router = APIRouter(dependencies=[Depends(_require_invitation_codes_enabled)])
 
 
 @router.post(
