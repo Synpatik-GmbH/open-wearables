@@ -176,6 +176,43 @@ class TestMintingStopsWithASecondApplication:
         assert response.status_code == 409
         assert _live_sdk_tokens(db) == 0
 
+    def test_an_unknown_code_learns_nothing_and_raises_no_alarm(
+        self,
+        client: TestClient,
+        db: Session,
+        api_v1_prefix: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capfd: pytest.CaptureFixture[str],
+    ) -> None:
+        # Redeem is public. A stranger must not be able to read the application count
+        # from the answer, nor fire the alert at will.
+        monkeypatch.setattr(settings, "user_invitation_codes_enabled", True)
+        ApplicationFactory(app_secret=SECRET)
+        ApplicationFactory(app_secret=SECRET)
+
+        response = client.post(f"{api_v1_prefix}/invitation-code/redeem", json={"code": "ZZZZZZZZ"})
+
+        assert response.status_code == 404
+        assert "sdk_token_refused_application_count" not in capfd.readouterr().out
+
+    def test_a_refused_code_is_not_used_up(
+        self, client: TestClient, db: Session, api_v1_prefix: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "user_invitation_codes_enabled", True)
+        ApplicationFactory(app_secret=SECRET)
+        extra = ApplicationFactory(app_secret=SECRET)
+        developer = DeveloperFactory()
+        user = UserFactory()
+        code = user_invitation_code_service.generate(db, user.id, developer.id).code
+        refused = client.post(f"{api_v1_prefix}/invitation-code/redeem", json={"code": code})
+        assert refused.status_code == 409
+
+        db.delete(extra)
+        db.commit()
+        response = client.post(f"{api_v1_prefix}/invitation-code/redeem", json={"code": code})
+
+        assert response.status_code == 200
+
     def test_a_token_minted_before_keeps_refreshing(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         # Devices already provisioned are not cut off; only new tokens stop.
         application = ApplicationFactory(app_secret=SECRET)
@@ -196,3 +233,24 @@ class TestUnknownUser:
 
         assert response.status_code == 404
         assert _live_sdk_tokens(db) == 0
+
+
+class TestDashboardIsTold:
+    def test_config_reports_invitation_codes_off_by_default(
+        self, client: TestClient, db: Session, api_v1_prefix: str
+    ) -> None:
+        developer = DeveloperFactory()
+
+        response = client.get(f"{api_v1_prefix}/config", headers=developer_auth_headers(developer.id))
+
+        assert response.json()["user_invitation_codes_enabled"] is False
+
+    def test_config_reports_invitation_codes_on(
+        self, client: TestClient, db: Session, api_v1_prefix: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(settings, "user_invitation_codes_enabled", True)
+        developer = DeveloperFactory()
+
+        response = client.get(f"{api_v1_prefix}/config", headers=developer_auth_headers(developer.id))
+
+        assert response.json()["user_invitation_codes_enabled"] is True

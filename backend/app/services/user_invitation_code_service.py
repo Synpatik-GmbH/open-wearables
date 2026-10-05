@@ -14,6 +14,7 @@ from app.schemas.model_crud.credentials import (
     UserInvitationCodeCreate,
     UserInvitationCodeRead,
 )
+from app.services.application_service import application_service
 from app.services.refresh_token_service import refresh_token_service
 from app.services.sdk_token_service import create_sdk_user_token
 from app.services.user_service import user_service
@@ -62,6 +63,10 @@ class UserInvitationCodeService:
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Invalid or expired invitation code",
             )
+
+        # FORK (2.71.4): only once the code is known to be valid, so this public route tells a
+        # stranger nothing and cannot be made to raise the alert; and before the code is used up.
+        application_service.require_single_application(db_session)
 
         self.crud.mark_redeemed(db_session, invitation_code)
 

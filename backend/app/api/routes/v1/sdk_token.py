@@ -26,6 +26,10 @@ def create_user_token(
     2. Admin authentication: Authenticate as a developer/admin via Bearer token
        (app_id and app_secret can be omitted)
 
+    In this fork method 2 is off by default and answers 403 unless
+    `SDK_TOKEN_DEVELOPER_MINT_ENABLED=true`. Minting is refused with 409 while more
+    than one application exists, and with 404 for a user that does not exist.
+
     Both methods return access_token with refresh_token.
 
     One live device per (user, app): issuing a token revokes every refresh token still live

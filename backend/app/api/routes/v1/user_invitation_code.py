@@ -9,7 +9,7 @@ from app.schemas.model_crud.credentials import (
     UserInvitationCodeRead,
     UserInvitationCodeRedeem,
 )
-from app.services import DeveloperDep, application_service
+from app.services import DeveloperDep
 from app.services.user_invitation_code_service import user_invitation_code_service
 
 
@@ -67,5 +67,4 @@ def redeem_invitation_code(
     has its own backend, mint and forward a token with
     `POST /api/v1/users/{user_id}/token` instead of redeeming codes on the client.
     """
-    application_service.require_single_application(db)  # FORK (2.71.4)
     return user_invitation_code_service.redeem(db, payload.code)

@@ -3,6 +3,7 @@ import { API_ENDPOINTS } from '../config';
 
 export interface AppConfig {
   outgoing_webhooks_enabled: boolean;
+  user_invitation_codes_enabled: boolean;
 }
 
 export const configService = {

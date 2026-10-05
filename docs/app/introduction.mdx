@@ -26,6 +26,10 @@ Whether you're into self-tracking and want to own your health data, or you're a 
   **Samsung Health on Android requires Developer Mode.** Samsung Health only allows data access to apps registered through Samsung's official partnership program. Since the Open Wearables app is not a registered Samsung partner, you need to [enable Developer Mode](https://developer.samsung.com/health/data/guide/developer-mode.html) in the Samsung Health app for it to work. This does not apply if you use Health Connect as your data source.
 </Warning>
 
+<Warning>
+  **In this fork the invitation-code flow is off by default.** `POST /api/v1/users/{user_id}/invitation-code` and `POST /api/v1/invitation-code/redeem` answer 404, and the dashboard hides **Connect Mobile App**, unless the instance sets `USER_INVITATION_CODES_ENABLED=true`. Read `FORK-DELTA.md` (*Who may obtain an SDK token*) before turning it on.
+</Warning>
+
 ## How it works
 
 <Steps>
