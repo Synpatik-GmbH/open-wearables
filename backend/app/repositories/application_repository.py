@@ -23,6 +23,10 @@ class ApplicationRepository(CrudRepository[Application, ApplicationCreateInterna
             .all()
         )
 
+    def count_all(self, db_session: DbSession) -> int:
+        """Number of applications, across every developer."""
+        return db_session.query(self.model).count()
+
     def get_all_ordered(self, db_session: DbSession) -> list[Application]:
         """Get all applications ordered by creation date descending."""
         return db_session.query(self.model).order_by(self.model.created_at.desc()).all()

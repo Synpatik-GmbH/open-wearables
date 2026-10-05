@@ -86,6 +86,31 @@ class ApplicationService(AppService[ApplicationRepository, Application, Applicat
 
         return application
 
+    def require_single_application(self, db: DbSession) -> None:
+        """Refuse to mint an SDK token while more than one application exists (FORK, 2.71.4).
+
+        Nothing binds an application to a user, so with two applications either could mint
+        for the other's users. Minting stops instead, until a binding is built.
+
+        Raises:
+            HTTPException: 409 when more than one application exists.
+        """
+        count = self.crud.count_all(db)
+        if count <= 1:
+            return
+        # The alert on this line is the consumer (calibra-ow-deploy, scripts/alerts.sh).
+        log_structured(
+            self.logger,
+            "error",
+            "SDK token refused: more than one application exists",
+            action="sdk_token_refused_application_count",
+            application_count=count,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="SDK token minting is disabled while more than one application exists",
+        )
+
     def list_applications(self, db: DbSession, developer_id: UUID) -> list[Application]:
         """List all applications for a developer."""
         applications = self.crud.list_by_developer(db, developer_id)

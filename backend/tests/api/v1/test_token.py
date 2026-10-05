@@ -6,6 +6,7 @@ Tests cover:
 - DELETE /api/v1/token/refresh - revoke refresh token
 """
 
+import pytest
 from jose import jwt
 from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
@@ -275,9 +276,13 @@ class TestSDKTokenReturnsRefreshToken:
         assert data["expires_in"] == settings.access_token_expire_minutes * 60
         assert data["refresh_token"].startswith("rt-")
 
-    def test_admin_sdk_token_returns_refresh_token(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
+    def test_admin_sdk_token_returns_refresh_token(
+        self, client: TestClient, db: Session, api_v1_prefix: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Admin-generated SDK token should return refresh token."""
         # Arrange
+        # FORK (2.71.4): off by default; this test is about how it behaves when on.
+        monkeypatch.setattr(settings, "sdk_token_developer_mint_enabled", True)
         from tests.utils import developer_auth_headers
 
         developer = DeveloperFactory()

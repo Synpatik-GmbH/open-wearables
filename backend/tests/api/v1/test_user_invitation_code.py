@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+import pytest
 from jose import jwt
 from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
@@ -11,6 +12,12 @@ from app.config import settings
 from app.models.user_invitation_code import UserInvitationCode
 from tests.factories import DeveloperFactory, UserFactory
 from tests.utils import developer_auth_headers
+
+
+@pytest.fixture(autouse=True)
+def _invitation_codes_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    # FORK (2.71.4): the routes are off by default; these tests are about how they behave when on.
+    monkeypatch.setattr(settings, "user_invitation_codes_enabled", True)
 
 
 class TestGenerateInvitationCode:

@@ -327,6 +327,12 @@ class Settings(BaseSettings):
     # 202 and then ignores, so sub-day retention is not expressible against this platform.
     svix_payload_retention_days: int = Field(default=5, ge=5, le=90)
 
+    # FORK (2.71.4): the ways to obtain an SDK token besides app credentials. Both are
+    # off: nothing binds an application to a user, so each open route is one more way to
+    # mint a token for any user id. See FORK-DELTA.md before turning either on.
+    sdk_token_developer_mint_enabled: bool = False
+    user_invitation_codes_enabled: bool = False
+
     # Outgoing-webhook fast lane: event types listed here are enqueued on the
     # dedicated "webhook_sync" queue so they can never queue behind bulk /
     # lifecycle events (sync.started/completed etc.) on "default".
