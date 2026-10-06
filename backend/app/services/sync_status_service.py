@@ -22,6 +22,7 @@ Keys (all TTL'd to ``HISTORY_TTL_SECONDS``):
 - ``sync:status:run:<run_id>``              — JSON-encoded latest event
 """
 
+import json
 import logging
 import threading
 import time
@@ -243,6 +244,61 @@ def get_stored_run(db: DbSession, run_key: str) -> SyncRunDetail | None:
     """One stored run with its per-data-type breakdown, or None when unknown."""
     run = sync_run_repository.get_with_data_types(db, run_key)
     return SyncRunDetail.model_validate(run) if run is not None else None
+
+
+def reduce_cached_sync_errors(*, dry_run: bool = False) -> int:
+    """Rewrite events already in Redis so their error is a code, returning how many were.
+
+    FORK (data protection, Notion 2.47.17.2). An image from before emit() reduced errors
+    cached the error's text. A user's recent list is not gone after 24 hours: every new
+    event renews it and it keeps the last MAX_RECENT_EVENTS, so such an event can be served
+    by the recent-events and stream endpoints for as long as it stays among them.
+    """
+    client = get_redis_client()
+    changed = 0
+
+    for key in client.scan_iter(match=_run_key("*")):
+        reduced = _reduced_payload(client.get(key))
+        if reduced is None:
+            continue
+        changed += 1
+        if not dry_run:
+            client.set(key, reduced, keepttl=True)
+
+    for key in client.scan_iter(match=_user_recent_key("*")):
+        rewritten = 0
+
+        def rewrite(pipe: Any, key: Any = key) -> None:
+            # WATCHed, so a worker that pushes meanwhile makes this run again: an index
+            # read before the push would otherwise point one entry too early.
+            nonlocal rewritten
+            rewritten = 0
+            items = pipe.lrange(key, 0, -1)
+            pipe.multi()
+            for index, item in enumerate(items):
+                reduced = _reduced_payload(item)
+                if reduced is None:
+                    continue
+                rewritten += 1
+                if not dry_run:
+                    pipe.lset(key, index, reduced)
+
+        client.transaction(rewrite, key)
+        changed += rewritten
+
+    return changed
+
+
+def _reduced_payload(raw: Any) -> str | None:
+    """The cached event with its error as a code, or None when it needs no change."""
+    try:
+        event = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(event, dict):
+        return None
+    reduced = {**event, "error": error_code(event.get("error")), "metadata": without_error_text(event.get("metadata"))}
+    return None if reduced == event else json.dumps(reduced)
 
 
 def emit(event: SyncStatusEvent) -> SyncStatusEvent:

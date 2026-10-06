@@ -18,6 +18,7 @@ import pytest
 from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
+from app.integrations.redis_client import get_redis_client
 from app.models import SyncRun, SyncRunDataType
 from app.repositories.sync_run_repository import sync_run_repository
 from app.schemas.sync_status import (
@@ -128,7 +129,7 @@ class TestReduceSyncRunErrors:
     def test_text_becomes_a_code_and_the_counts_say_how_many(self, db: Session, stored: dict[str, SyncRun]) -> None:
         result = reduce_sync_run_errors(db, dry_run=False)
 
-        assert result == {"runs": 3, "data_types": 2}
+        assert result == {"runs": 3, "data_types": 2, "cached": 0}
         db.expire_all()
         assert stored["text_error"].error == "unclassified"
         assert stored["text_error"].meta == {"is_historical": True}
@@ -155,14 +156,14 @@ class TestReduceSyncRunErrors:
     def test_a_second_run_finds_nothing(self, db: Session, stored: dict[str, SyncRun]) -> None:
         reduce_sync_run_errors(db, dry_run=False)
 
-        assert reduce_sync_run_errors(db, dry_run=False) == {"runs": 0, "data_types": 0}
+        assert reduce_sync_run_errors(db, dry_run=False) == {"runs": 0, "data_types": 0, "cached": 0}
 
     def test_dry_run_counts_and_changes_nothing(self, db: Session, stored: dict[str, SyncRun]) -> None:
         before = _everything_stored(db)
 
         result = reduce_sync_run_errors(db, dry_run=True)
 
-        assert result == {"runs": 3, "data_types": 2}
+        assert result == {"runs": 3, "data_types": 2, "cached": 0}
         assert _everything_stored(db, reload=False) == before
 
     def test_a_row_another_writer_changed_meanwhile_is_not_overwritten(self, db: Session) -> None:
@@ -190,7 +191,7 @@ class TestReduceSyncRunErrors:
 
         result = reduce_sync_run_errors(db, dry_run=False)
 
-        assert result == {"runs": 0, "data_types": 0}
+        assert result == {"runs": 0, "data_types": 0, "cached": 0}
         db.expire_all()
         assert (run.error, run.meta) == ("KeyError", {"inserted_by": "the_newer_event"})
         assert [row.error for row in rows_as_first_read] == ["KeyError"]
@@ -221,6 +222,20 @@ class TestReduceSyncRunErrors:
         # SKIP LOCKED would pass over a contended row and NOWAIT would abort the pass.
         assert all(s.rstrip().endswith("FOR UPDATE") for s in locks)
 
+    def test_an_event_cached_in_redis_is_reduced_and_counted(
+        self, db: Session, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        client = get_redis_client()
+        client.set("sync:status:run:pull_cached", json.dumps({"run_id": "pull_cached", "error": TEXT}), ex=3600)
+
+        result = reduce_sync_run_errors(db, dry_run=False)
+
+        assert result == {"runs": 0, "data_types": 0, "cached": 1}
+        assert json.loads(client.get("sync:status:run:pull_cached"))["error"] == "unclassified"
+        printed = capsys.readouterr().out
+        assert "1 cached event(s)" in printed
+        assert "187.5" not in printed
+
     def test_it_prints_counts_and_never_the_text(
         self, db: Session, stored: dict[str, SyncRun], capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -229,5 +244,6 @@ class TestReduceSyncRunErrors:
         printed = capsys.readouterr().out
         assert "3 run(s)" in printed
         assert "2 per-data-type row(s)" in printed
+        assert "cached event(s)" in printed
         assert "187.5" not in printed
         assert "5f0c1c1e" not in printed

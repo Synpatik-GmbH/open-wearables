@@ -610,8 +610,8 @@ class ImportService:
             )
             return UploadDataResponse(
                 status_code=400,
-                # FORK (2.47.17.2): the class, not the text. This answer is the upload
-                # task's result, which the worker logs and the result backend keeps.
+                # FORK (2.47.17.2): the class, not the text. This answer is what the upload
+                # task returns, which the worker logs.
                 response=f"Import failed: {error_code(e)}",
                 user_id=user_id,
             )

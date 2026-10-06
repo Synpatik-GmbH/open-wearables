@@ -30,6 +30,7 @@ from app.integrations.celery.core import create_celery
 from app.integrations.celery.tasks.close_stale_sync_runs_task import close_stale_sync_runs
 from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_upload
 from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
+from app.integrations.redis_client import get_redis_client
 from app.models import SyncRun, SyncRunDataType
 from app.repositories.sync_run_repository import sync_run_repository
 from app.schemas.sync_status import (
@@ -569,10 +570,13 @@ class TestTheSweepReducesWhatAnOlderWorkerWrote:
             ),
         )
 
-        result = close_stale_sync_runs()
+        with patch.object(db, "rollback", wraps=db.rollback) as rollback:
+            result = close_stale_sync_runs()
 
         assert result["run_keys"] == ["pull_stale"]
         assert result["errors_reduced"] is None
+        # A pass that failed part-way leaves the session unusable until it is rolled back.
+        rollback.assert_called_once()
         out, err = capfd.readouterr()
         logged = out + err + caplog.text
         assert '"action": "sync_run_errors_reduce_failed"' in logged
@@ -645,8 +649,8 @@ class TestTheSweepReducesWhatAnOlderWorkerWrote:
 
 
 class TestThePhoneImportAnswersWithACode:
-    """The import's answer becomes the upload task's result, which the worker logs and the
-    result backend keeps, and it is logged once more on the way."""
+    """The import's answer is what the upload task returns, which the worker logs, and it
+    is logged once more on the way."""
 
     def test_a_failed_import_names_the_error_class_not_its_text(self, db: Session) -> None:
         user = UserFactory()
@@ -718,3 +722,60 @@ class TestTheTwoTasksKeepNothingInTheResultBackend:
 
     def test_a_failure_is_not_kept_for_an_ignored_task_either(self) -> None:
         assert not create_celery().conf.task_store_errors_even_if_ignored
+
+
+class TestEventsAnOlderImageCachedAreReducedToo:
+    """The Redis history is not only 24 hours old: a user's list is kept alive by every
+    new event and holds the last 200, so an event an older image cached can be served by
+    the recent-events and stream endpoints long after."""
+
+    @staticmethod
+    def _as_an_older_image_cached_it(user_id: UUID, **overrides: Any) -> SyncStatusEvent:
+        event = _event(user_id, scope=SyncScope.LIVE, **overrides)
+        payload = event.model_dump_json()
+        client = get_redis_client()
+        client.lpush(f"sync:status:user:{user_id}:recent", payload)
+        client.expire(f"sync:status:user:{user_id}:recent", 3600)
+        client.set(f"sync:status:run:{event.run_id}", payload, ex=3600)
+        return event
+
+    def test_the_list_and_the_run_entry_are_rewritten_and_counted(self) -> None:
+        user_id = uuid4()
+        clean = self._as_an_older_image_cached_it(user_id, error=None, metadata={"inserted": 3})
+        dirty = self._as_an_older_image_cached_it(user_id)
+
+        assert sync_status_service.reduce_cached_sync_errors() == 2
+
+        recent = sync_status_service.get_recent_events(user_id)
+        assert [(e.run_id, e.error) for e in recent] == [(dirty.run_id, UNCLASSIFIED), (clean.run_id, None)]
+        assert recent[0].metadata["params"]["workouts"] == {"success": False, "error": UNCLASSIFIED}
+        assert recent[1].metadata == {"inserted": 3}
+        client = get_redis_client()
+        _assert_clean(str(client.lrange(f"sync:status:user:{user_id}:recent", 0, -1)))
+        _assert_clean(str(client.get(f"sync:status:run:{dirty.run_id}")))
+        # Rewriting must not make an entry outlive the time it was given.
+        assert 0 < client.ttl(f"sync:status:user:{user_id}:recent") <= 3600
+        assert 0 < client.ttl(f"sync:status:run:{dirty.run_id}") <= 3600
+
+    def test_a_second_pass_finds_nothing(self) -> None:
+        self._as_an_older_image_cached_it(uuid4())
+        sync_status_service.reduce_cached_sync_errors()
+
+        assert sync_status_service.reduce_cached_sync_errors() == 0
+
+    def test_a_dry_run_counts_and_changes_nothing(self) -> None:
+        user_id = uuid4()
+        dirty = self._as_an_older_image_cached_it(user_id)
+
+        assert sync_status_service.reduce_cached_sync_errors(dry_run=True) == 2
+
+        assert sync_status_service.get_recent_events(user_id)[0].error == dirty.error
+        cached_run = json.loads(get_redis_client().get(f"sync:status:run:{dirty.run_id}"))
+        assert cached_run["error"] == dirty.error
+
+    def test_an_entry_that_is_not_an_event_is_left_alone(self) -> None:
+        client = get_redis_client()
+        client.set("sync:status:run:not_json", "{not json", ex=3600)
+
+        assert sync_status_service.reduce_cached_sync_errors() == 0
+        assert client.get("sync:status:run:not_json") in ("{not json", b"{not json")

@@ -215,6 +215,9 @@ class BaseProviderStrategy(ABC):
                 "providers": [self.name],
                 "is_historical": True,
             },
+            # FORK (data protection, Notion 2.47.17.2): sent by name, so the task's own
+            # ignore_result does not apply and Celery would default to keeping the result.
+            ignore_result=True,
         )
 
         return HistoricalSyncResult(

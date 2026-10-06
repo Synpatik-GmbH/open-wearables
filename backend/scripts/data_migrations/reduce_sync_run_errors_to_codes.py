@@ -2,7 +2,8 @@
 """Reduce stored sync errors to codes (fork, Notion 2.47.17.2).
 
 Until this fork tag a failed sync stored the raw text of its error in sync_run.error,
-inside sync_run.meta, and in sync_run_data_type.error / error_code. For a database error
+inside sync_run.meta, and in sync_run_data_type.error / error_code, and cached it in
+the Redis sync history, which this script rewrites too. For a database error
 that text quotes the values being saved and the user id. The write path now keeps a code
 only (app/services/sync_error_code.py); this script rewrites the rows an older image
 left behind, with the same rule, so a stored code is kept and anything else becomes
@@ -30,6 +31,7 @@ from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.services.sync_error_cleanup import reduce_stored_sync_errors
+from app.services.sync_status_service import reduce_cached_sync_errors
 
 
 def reduce_sync_run_errors(db: Session, *, dry_run: bool) -> dict[str, int]:
@@ -38,6 +40,9 @@ def reduce_sync_run_errors(db: Session, *, dry_run: bool) -> dict[str, int]:
     verb = "Would reduce" if dry_run else "Reduced"
     print(f"sync_run:           {verb} {result['runs']} run(s) to an error code")
     print(f"sync_run_data_type: {verb} {result['data_types']} per-data-type row(s) to an error code")
+    cached = reduce_cached_sync_errors(dry_run=dry_run)
+    print(f"Redis history:      {verb} {cached} cached event(s) to an error code")
+    result = {**result, "cached": cached}
     if dry_run:
         print("\nDry run — no changes made.")
     return result

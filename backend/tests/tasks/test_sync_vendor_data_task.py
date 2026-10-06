@@ -244,8 +244,8 @@ class TestSyncVendorDataTask:
         assert str(result["user_id"]) == str(user.id)
         assert "garmin" in result["providers_synced"]
         assert result["providers_synced"]["garmin"]["params"]["workouts"]["success"] is False
-        # FORK (2.47.17.2): the error's class name, never its text. The result is also
-        # written to the worker's log and the Celery result backend.
+        # FORK (2.47.17.2): the error's class name, never its text. What the task returns
+        # is also written to the worker's log.
         assert result["providers_synced"]["garmin"]["params"]["workouts"]["error"] == "Exception"
 
     @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
@@ -428,8 +428,8 @@ class TestSyncVendorDataTask:
 
         # Assert
         assert result["user_id"] == "not-a-valid-uuid"
-        # FORK (2.47.17.2): the task's result is kept in the result backend and logged by
-        # the worker, so it carries the error's class name, never its text.
+        # FORK (2.47.17.2): what the task returns is logged by the worker, so it carries
+        # the error's class name, never its text.
         assert result["errors"] == {"user_id": "ValueError"}
 
 
