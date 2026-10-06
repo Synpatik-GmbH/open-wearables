@@ -24,6 +24,7 @@ from app.services.sdk.import_service import (
 from app.services.sdk.import_service import (
     import_service as sdk_import_service,
 )
+from app.services.sync_error_code import SDK_IMPORT_FAILED
 from app.services.sync_status_service import (
     emit_sync_completed,
     emit_sync_failed,
@@ -266,7 +267,7 @@ def process_sdk_upload(
                 SyncSource.SDK,
                 scope=scope,
                 run_id=run_id,
-                error="sdk_import_failed",
+                error=SDK_IMPORT_FAILED,
                 message=f"{provider.capitalize()} batch failed",
                 metadata={"batch_id": batch_id, "status_code": status_code},
             )

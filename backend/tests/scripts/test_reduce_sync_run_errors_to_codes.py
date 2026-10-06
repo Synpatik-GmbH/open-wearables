@@ -101,7 +101,7 @@ def stored(db: Session) -> dict[str, SyncRun]:
     _data_type(db, text_error, "workouts", error=TEXT, error_code=None)
     # error_code is varchar(64), so the text it can hold is short.
     _data_type(db, text_error, "sleep", error=None, error_code="value 187.5 rejected")
-    _data_type(db, clean, "workouts", error="KeyError", error_code="HKError_5")
+    _data_type(db, clean, "workouts", error="KeyError", error_code="KeyError")
     _data_type(db, clean, "sleep", error=None, error_code=None)
     db.flush()
     return {
@@ -148,7 +148,7 @@ class TestReduceSyncRunErrors:
         assert stored["clean"].meta == {"params": {"workouts": {"error": "KeyError"}}}
         assert (stored["no_error"].error, stored["no_error"].meta) == (None, None)
         types = {(t.run_id, t.data_type): (t.error, t.error_code) for t in db.query(SyncRunDataType).all()}
-        assert types[(stored["clean"].id, "workouts")] == ("KeyError", "HKError_5")
+        assert types[(stored["clean"].id, "workouts")] == ("KeyError", "KeyError")
         assert types[(stored["clean"].id, "sleep")] == (None, None)
 
     def test_a_second_run_finds_nothing(self, db: Session, stored: dict[str, SyncRun]) -> None:

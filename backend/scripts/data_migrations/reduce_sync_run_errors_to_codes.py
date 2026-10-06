@@ -11,8 +11,9 @@ left behind, with the same rule, so a stored code is kept and anything else beco
 It prints how many rows it changed and never what they held.
 
 Idempotent: a cleaned row no longer differs from its cleaned form, so re-runs are
-no-ops. It runs on every startup, because during a rolling deploy a worker still on the
-older image can write one more row after the API has started.
+no-ops. It runs on every API start and reads every row. A worker still on the older
+image can write one more row after that; the periodic close_stale_sync_runs task makes
+the same pass over recent rows, so such a row is reduced within one sweep interval.
 
 Usage (inside Docker):
     docker compose exec app uv run python scripts/data_migrations/reduce_sync_run_errors_to_codes.py --dry-run
@@ -21,44 +22,21 @@ Usage (inside Docker):
 
 import argparse
 
-from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
-from app.models import SyncRun, SyncRunDataType
-from app.services.sync_error_code import error_code, without_error_text
+from app.services.sync_error_cleanup import reduce_stored_sync_errors
 
 
 def reduce_sync_run_errors(db: Session, *, dry_run: bool) -> dict[str, int]:
-    """Rewrite error text as codes. Does not commit — caller owns the transaction."""
-    runs = 0
-    for run in db.query(SyncRun).filter(or_(SyncRun.error.isnot(None), SyncRun.meta.isnot(None))):
-        error, meta = error_code(run.error), without_error_text(run.meta)
-        if (error, meta) == (run.error, run.meta):
-            continue
-        runs += 1
-        if not dry_run:
-            run.error, run.meta = error, meta
-
-    data_types = 0
-    for row in db.query(SyncRunDataType).filter(
-        or_(SyncRunDataType.error.isnot(None), SyncRunDataType.error_code.isnot(None)),
-    ):
-        error, code = error_code(row.error), error_code(row.error_code)
-        if (error, code) == (row.error, row.error_code):
-            continue
-        data_types += 1
-        if not dry_run:
-            row.error, row.error_code = error, code
-
-    if not dry_run:
-        db.flush()
+    """Rewrite every stored row and print the counts. Does not commit."""
+    result = reduce_stored_sync_errors(db, dry_run=dry_run)
     verb = "Would reduce" if dry_run else "Reduced"
-    print(f"sync_run:           {verb} {runs} run(s) to an error code")
-    print(f"sync_run_data_type: {verb} {data_types} per-data-type row(s) to an error code")
+    print(f"sync_run:           {verb} {result['runs']} run(s) to an error code")
+    print(f"sync_run_data_type: {verb} {result['data_types']} per-data-type row(s) to an error code")
     if dry_run:
         print("\nDry run — no changes made.")
-    return {"runs": runs, "data_types": data_types}
+    return result
 
 
 def main(dry_run: bool) -> None:

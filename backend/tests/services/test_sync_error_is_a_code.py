@@ -9,7 +9,7 @@ rows, not the Redis history, not the outgoing webhook, not the log line.
 import json
 import time
 from collections.abc import Generator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
@@ -19,17 +19,27 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 import app.services.sync_status_service as sync_status_service
+from app.integrations.celery.tasks.close_stale_sync_runs_task import close_stale_sync_runs
 from app.models import SyncRun, SyncRunDataType
+from app.repositories.sync_run_repository import sync_run_repository
 from app.schemas.sync_status import (
     DataTypeKind,
     DataTypeOutcome,
+    SyncRunWrite,
     SyncScope,
     SyncSource,
     SyncStage,
     SyncStatus,
     SyncStatusEvent,
 )
-from app.services.sync_error_code import UNCLASSIFIED, error_code, without_error_text
+from app.services.sync_error_code import (
+    ALL_SUBTASKS_FAILED,
+    SDK_IMPORT_FAILED,
+    UNCLASSIFIED,
+    UNKNOWN,
+    error_code,
+    without_error_text,
+)
 from tests.factories import UserFactory
 
 # What a SQLAlchemy error's text looks like: the statement and its parameters.
@@ -45,10 +55,28 @@ DB_ERROR_TEXT = (
 class TestErrorCode:
     @pytest.mark.parametrize(
         "code",
-        ["IntegrityError", "HTTPException_404", "all_subtasks_failed", "OAuth2Error", "unknown", "a" * 64],
+        [
+            "IntegrityError",
+            "KeyError",
+            "HTTPException_404",
+            "HTTPException_599",
+            ALL_SUBTASKS_FAILED,
+            SDK_IMPORT_FAILED,
+            UNKNOWN,
+            UNCLASSIFIED,
+        ],
     )
-    def test_a_code_is_kept(self, code: str) -> None:
+    def test_an_exception_class_name_or_a_fixed_word_is_kept(self, code: str) -> None:
         assert error_code(code) == code
+
+    def test_a_class_defined_after_the_first_lookup_is_known(self) -> None:
+        assert error_code("LateArrivingSyncError") == UNCLASSIFIED
+
+        class LateArrivingSyncError(Exception):
+            pass
+
+        assert error_code("LateArrivingSyncError") == "LateArrivingSyncError"
+        assert error_code(LateArrivingSyncError(DB_ERROR_TEXT)) == "LateArrivingSyncError"
 
     @pytest.mark.parametrize(
         "text",
@@ -62,8 +90,21 @@ class TestErrorCode:
             "bpm_18750",
             "user@example.com",
             "'heart_rate'",
-            "a" * 65,
+            "a" * 64,
             "",
+            # One word, shaped like a code, but nobody's code: a name, a phone's own
+            # error code, a class that does not exist.
+            "Alice",
+            "heartrate",
+            "HKError_5",
+            "OAuth2Error",
+            # A status is kept only behind an exception class, and only as a status.
+            "IntegrityError_40",
+            "IntegrityError_600",
+            "IntegrityError_4040",
+            "all_subtasks_failed_404",
+            "_404",
+            "IntegrityError_",
             " IntegrityError",
             "IntegrityError\n",
         ],
@@ -274,6 +315,13 @@ class TestDataTypeRowsHoldNoErrorText:
                     kind=DataTypeKind.SERIES,
                     status=SyncStatus.FAILED,
                     error="IntegrityError",
+                    error_code="KeyError",
+                ),
+                # What a phone reports as its own error code is not ours to trust either.
+                DataTypeOutcome(
+                    data_type="sleep",
+                    kind=DataTypeKind.SERIES,
+                    status=SyncStatus.FAILED,
                     error_code="HKError_5",
                 ),
             ],
@@ -282,7 +330,8 @@ class TestDataTypeRowsHoldNoErrorText:
 
         rows = {row.data_type: row for row in db.query(SyncRunDataType).all()}
         assert (rows["workouts"].error, rows["workouts"].error_code) == (UNCLASSIFIED, UNCLASSIFIED)
-        assert (rows["steps"].error, rows["steps"].error_code) == ("IntegrityError", "HKError_5")
+        assert (rows["steps"].error, rows["steps"].error_code) == ("IntegrityError", "KeyError")
+        assert (rows["sleep"].error, rows["sleep"].error_code) == (None, UNCLASSIFIED)
 
     @patch("app.services.sync_status_service.SessionLocal")
     def test_a_storage_failure_logs_its_type_not_its_text(
@@ -304,3 +353,147 @@ class TestDataTypeRowsHoldNoErrorText:
         assert '"action": "sync_run_data_types_failed"' in logged
         assert '"error": "RuntimeError"' in logged
         _assert_clean(logged)
+
+
+def _stored_as_an_older_image_left_it(
+    db: Session, user_id: UUID, *, updated_at: datetime, error: str | None = DB_ERROR_TEXT
+) -> SyncRun:
+    """Written through the repository, which does no cleaning."""
+    run_key = f"pull_{uuid4().hex[:16]}"
+    sync_run_repository.upsert_run(
+        db,
+        SyncRunWrite(
+            run_key=run_key,
+            user_id=user_id,
+            provider="whoop",
+            source=SyncSource.BACKFILL,
+            scope=SyncScope.HISTORICAL,
+            status=SyncStatus.FAILED,
+            started_at=updated_at,
+            ended_at=updated_at,
+            error=error,
+            meta={"params": {"workouts": {"error": DB_ERROR_TEXT}}},
+            updated_at=updated_at,
+        ),
+    )
+    run = sync_run_repository.get_by_run_key(db, run_key)
+    assert run is not None
+    sync_run_repository.upsert_data_types(
+        db,
+        run_id=run.id,
+        outcomes=[
+            DataTypeOutcome(data_type="workouts", kind=DataTypeKind.TASK, status=SyncStatus.FAILED, error=DB_ERROR_TEXT)
+        ],
+        updated_at=updated_at,
+    )
+    return run
+
+
+class TestTheSweepReducesWhatAnOlderWorkerWrote:
+    """During a rolling deploy a worker on the older image can store text after the API's
+    start-up pass has run. The periodic sweep is the pass that comes after it."""
+
+    @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.SessionLocal")
+    def test_a_row_written_since_is_reduced_and_counted(
+        self,
+        mock_task_session: MagicMock,
+        db: Session,
+        capfd: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        mock_task_session.return_value.__enter__.return_value = db
+        user = UserFactory()
+        run = _stored_as_an_older_image_left_it(db, user.id, updated_at=datetime.now(timezone.utc))
+
+        with patch.object(db, "commit", wraps=db.commit) as commit:
+            result = close_stale_sync_runs()
+
+        assert result["errors_reduced"] == {"runs": 1, "data_types": 1}
+        commit.assert_called_once()
+        db.expire_all()
+        assert run.error == UNCLASSIFIED
+        assert run.meta == {"params": {"workouts": {"error": UNCLASSIFIED}}}
+        assert [row.error for row in db.query(SyncRunDataType).all()] == [UNCLASSIFIED]
+        out, err = capfd.readouterr()
+        logged = out + err + caplog.text
+        assert '"action": "sync_run_errors_reduced"' in logged
+        assert '"runs": 1' in logged
+        _assert_clean(logged)
+
+    @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.SessionLocal")
+    def test_a_run_that_completed_with_errors_is_reduced_too(self, mock_task_session: MagicMock, db: Session) -> None:
+        """It has no error of its own: the text is only inside its metadata."""
+        mock_task_session.return_value.__enter__.return_value = db
+        user = UserFactory()
+        run = _stored_as_an_older_image_left_it(db, user.id, updated_at=datetime.now(timezone.utc), error=None)
+
+        result = close_stale_sync_runs()
+
+        assert result["errors_reduced"] == {"runs": 1, "data_types": 1}
+        db.expire_all()
+        assert run.error is None
+        assert run.meta == {"params": {"workouts": {"error": UNCLASSIFIED}}}
+
+    @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.SessionLocal")
+    def test_nothing_to_reduce_is_reported_as_zero(self, mock_task_session: MagicMock, db: Session) -> None:
+        mock_task_session.return_value.__enter__.return_value = db
+
+        assert close_stale_sync_runs()["errors_reduced"] == {"runs": 0, "data_types": 0}
+
+    @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.SessionLocal")
+    def test_the_sweep_reads_the_last_day_only(self, mock_task_session: MagicMock, db: Session) -> None:
+        """Older rows are the start-up script's: it reads every row. The sweep runs every
+        half hour, so it reads only what can have been written since."""
+        mock_task_session.return_value.__enter__.return_value = db
+        user = UserFactory()
+        now = datetime.now(timezone.utc)
+        inside = _stored_as_an_older_image_left_it(db, user.id, updated_at=now - timedelta(hours=23))
+        outside = _stored_as_an_older_image_left_it(db, user.id, updated_at=now - timedelta(hours=25))
+
+        result = close_stale_sync_runs()
+
+        assert result["errors_reduced"] == {"runs": 1, "data_types": 1}
+        db.expire_all()
+        assert inside.error == UNCLASSIFIED
+        assert outside.error == DB_ERROR_TEXT
+
+    @pytest.mark.parametrize("redis_readable", [True, False])
+    @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.last_event_at")
+    @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.SessionLocal")
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_the_count_is_reported_on_every_way_out_of_the_sweep(
+        self,
+        mock_emit_session: MagicMock,
+        mock_task_session: MagicMock,
+        mock_last_event: MagicMock,
+        db: Session,
+        redis_readable: bool,
+    ) -> None:
+        mock_emit_session.return_value.__enter__.return_value = db
+        mock_task_session.return_value.__enter__.return_value = db
+        mock_last_event.return_value = {} if redis_readable else None
+        user = UserFactory()
+        now = datetime.now(timezone.utc)
+        _stored_as_an_older_image_left_it(db, user.id, updated_at=now)
+        old = now - timedelta(hours=48)
+        sync_status_service.try_persist_run(
+            _event(
+                user.id,
+                run_id="pull_stale",
+                stage=SyncStage.STARTED,
+                status=SyncStatus.IN_PROGRESS,
+                error=None,
+                metadata={},
+                started_at=old,
+                timestamp=old,
+            ),
+        )
+
+        result = close_stale_sync_runs()
+
+        # Each case leaves by its own return: the stale run closed, or the sweep skipped.
+        if redis_readable:
+            assert result["run_keys"] == ["pull_stale"]
+        else:
+            assert result["skipped"] is True
+        assert result["errors_reduced"] == {"runs": 1, "data_types": 1}

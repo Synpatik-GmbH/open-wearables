@@ -28,7 +28,7 @@ from app.services.sync_coordination import (
     release_stale_primary,
     try_become_primary,
 )
-from app.services.sync_error_code import error_code
+from app.services.sync_error_code import ALL_SUBTASKS_FAILED, error_code
 from app.services.sync_status_service import (
     emit_sync_completed,
     emit_sync_failed,
@@ -551,7 +551,7 @@ def sync_vendor_data(
                             sync_source,
                             scope=sync_scope,
                             run_id=run_id,
-                            error="all_subtasks_failed",
+                            error=ALL_SUBTASKS_FAILED,
                             message=f"Sync from {provider_name} failed",
                             primary_user_id=primary_uuid,
                             metadata={"is_historical": is_historical, "params": provider_result.params},
