@@ -70,7 +70,10 @@ def _batch_outcomes(types: list[str], workouts_saved: int, sleep_saved: int, sco
     return outcomes
 
 
-@shared_task(queue="sdk_sync")
+# FORK (data protection, Notion 2.47.17.2): ignore_result, because a task that raises
+# would have its exception, text and traceback, kept in the result backend for three
+# days. Nothing reads this task's result.
+@shared_task(queue="sdk_sync", ignore_result=True)
 def process_sdk_upload(
     content: str | None,
     content_type: str,

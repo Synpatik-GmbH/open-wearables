@@ -26,7 +26,10 @@ import app
 import app.integrations.celery.tasks.close_stale_sync_runs_task as sweep_task
 import app.services.sync_error_code as sync_error_code
 import app.services.sync_status_service as sync_status_service
+from app.integrations.celery.core import create_celery
 from app.integrations.celery.tasks.close_stale_sync_runs_task import close_stale_sync_runs
+from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_upload
+from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
 from app.models import SyncRun, SyncRunDataType
 from app.repositories.sync_run_repository import sync_run_repository
 from app.schemas.sync_status import (
@@ -702,3 +705,16 @@ class TestOnlyRowsThatCanHoldAnErrorAreRead:
 
         assert everything == {in_column, nested, in_a_list, old}
         assert recent == {in_column, nested, in_a_list}
+
+
+class TestTheTwoTasksKeepNothingInTheResultBackend:
+    """What a task returns is a code, but a task can also raise, and Celery would keep the
+    exception, text and traceback, in Redis for three days. Nothing reads these two tasks'
+    results, so they keep none: neither a return value nor an exception."""
+
+    @pytest.mark.parametrize("task", [process_sdk_upload, sync_vendor_data], ids=["sdk_upload", "provider_pull"])
+    def test_the_task_ignores_its_result(self, task: Any) -> None:
+        assert task.ignore_result is True
+
+    def test_a_failure_is_not_kept_for_an_ignored_task_either(self) -> None:
+        assert not create_celery().conf.task_store_errors_even_if_ignored

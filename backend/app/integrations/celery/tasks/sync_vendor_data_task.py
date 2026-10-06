@@ -77,7 +77,10 @@ def _include_in_periodic_pull(caps: Any, live_sync_mode: LiveSyncMode | None, is
     return live_sync_mode == LiveSyncMode.PULL
 
 
-@shared_task
+# FORK (data protection, Notion 2.47.17.2): ignore_result, because a task that raises
+# would have its exception, text and traceback, kept in the result backend for three
+# days. Nothing reads this task's result.
+@shared_task(ignore_result=True)
 def sync_vendor_data(
     user_id: str,
     start_date: str | None = None,
