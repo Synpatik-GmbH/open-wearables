@@ -16,6 +16,12 @@ logger = getLogger(__name__)
 # error that is still text. Rows older than this are the start-up script's, which reads
 # every row; the sweep only has to catch what an older worker wrote since.
 ERROR_CLEANUP_WINDOW = timedelta(hours=24)
+# For how long after this process started the sweep makes that pass at all. A worker on
+# the older image only exists while this image is being rolled out, and a rollout starts
+# every process afresh. The pass reads tables that grow without bound and have no index
+# for it, so it is not something to repeat for as long as the process lives.
+ERROR_CLEANUP_PERIOD = timedelta(hours=2)
+_PROCESS_STARTED_AT = datetime.now(timezone.utc)
 
 
 @shared_task
@@ -32,10 +38,12 @@ def close_stale_sync_runs() -> dict:
 
     with SessionLocal() as db:
         # FORK (data protection, Notion 2.47.17.2): first, so that no early return skips it.
-        errors_reduced = reduce_stored_sync_errors(db, since=now - ERROR_CLEANUP_WINDOW)
-        # Always, not only when something was rewritten: it also releases the row locks.
-        db.commit()
-        if any(errors_reduced.values()):
+        errors_reduced: dict[str, int] | None = None
+        if now - _PROCESS_STARTED_AT <= ERROR_CLEANUP_PERIOD:
+            errors_reduced = reduce_stored_sync_errors(db, since=now - ERROR_CLEANUP_WINDOW)
+            # Always, not only when something was rewritten: it also releases the row locks.
+            db.commit()
+        if errors_reduced and any(errors_reduced.values()):
             log_structured(
                 logger,
                 "warning",

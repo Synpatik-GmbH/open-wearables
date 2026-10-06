@@ -1,8 +1,8 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import ColumnElement, and_, case, func, literal, or_, select, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import ColumnElement, and_, case, cast, func, literal, or_, select, update
+from sqlalchemy.dialects.postgresql import JSONPATH, insert
 from sqlalchemy.orm import InstrumentedAttribute, selectinload
 
 from app.database import DbSession
@@ -135,6 +135,47 @@ class SyncRunRepository:
             },
         )
         db_session.execute(stmt)
+
+    # FORK (data protection, Notion 2.47.17.2): the four reads below serve
+    # services/sync_error_cleanup.py, which rewrites stored error text as codes.
+
+    def runs_with_an_error(self, db_session: DbSession, since: datetime | None = None) -> list[SyncRun]:
+        """Runs that have an error anywhere: in the column, or under an ``error`` key at
+        any depth of ``meta``. With ``since``, only those updated from then on.
+
+        No index serves this, so it reads the table. Its callers run it at start-up and
+        for a few hours after, not for as long as the process lives.
+        """
+        stmt = select(SyncRun).where(
+            or_(SyncRun.error.isnot(None), func.jsonb_path_exists(SyncRun.meta, cast("$.**.error", JSONPATH))),
+        )
+        if since is not None:
+            stmt = stmt.where(SyncRun.updated_at >= since)
+        return list(db_session.scalars(stmt).all())
+
+    def data_types_with_an_error(self, db_session: DbSession, since: datetime | None = None) -> list[SyncRunDataType]:
+        """Per-data-type rows with an error or an error code. See runs_with_an_error."""
+        stmt = select(SyncRunDataType).where(
+            or_(SyncRunDataType.error.isnot(None), SyncRunDataType.error_code.isnot(None)),
+        )
+        if since is not None:
+            stmt = stmt.where(SyncRunDataType.updated_at >= since)
+        return list(db_session.scalars(stmt).all())
+
+    def lock_run(self, db_session: DbSession, run_id: UUID) -> SyncRun | None:
+        """The run as it is now, locked until the transaction ends."""
+        stmt = select(SyncRun).where(SyncRun.id == run_id).with_for_update().execution_options(populate_existing=True)
+        return db_session.scalars(stmt).one_or_none()
+
+    def lock_data_type(self, db_session: DbSession, run_id: UUID, data_type: str) -> SyncRunDataType | None:
+        """The per-data-type row as it is now, locked until the transaction ends."""
+        stmt = (
+            select(SyncRunDataType)
+            .where(SyncRunDataType.run_id == run_id, SyncRunDataType.data_type == data_type)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return db_session.scalars(stmt).one_or_none()
 
     def find_stale(self, db_session: DbSession, cutoff: datetime) -> list[str]:
         """Keys of runs in progress that have not been written to since the cutoff.

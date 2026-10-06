@@ -23,6 +23,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 import app
+import app.integrations.celery.tasks.close_stale_sync_runs_task as sweep_task
 import app.services.sync_status_service as sync_status_service
 from app.integrations.celery.tasks.close_stale_sync_runs_task import close_stale_sync_runs
 from app.models import SyncRun, SyncRunDataType
@@ -490,6 +491,35 @@ class TestTheSweepReducesWhatAnOlderWorkerWrote:
         assert run.meta == {"params": {"workouts": {"error": UNCLASSIFIED}}}
 
     @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.SessionLocal")
+    def test_the_sweep_stops_looking_once_the_rollout_is_over(self, mock_task_session: MagicMock, db: Session) -> None:
+        """An older worker can only be around while this image is being rolled out, so the
+        sweep makes its pass for the first hours of its own process and then stops. The
+        tables grow without bound and have no index for this, so it must not scan forever."""
+        mock_task_session.return_value.__enter__.return_value = db
+        user = UserFactory()
+        now = datetime.now(timezone.utc)
+        run = _stored_as_an_older_image_left_it(db, user.id, updated_at=now)
+
+        with patch.object(
+            sweep_task, "_PROCESS_STARTED_AT", now - sweep_task.ERROR_CLEANUP_PERIOD - timedelta(minutes=1)
+        ):
+            late = close_stale_sync_runs()
+        db.expire_all()
+        untouched = run.error
+
+        with patch.object(
+            sweep_task, "_PROCESS_STARTED_AT", now - sweep_task.ERROR_CLEANUP_PERIOD + timedelta(minutes=1)
+        ):
+            in_time = close_stale_sync_runs()
+        db.expire_all()
+
+        # None, not zero: the pass did not run, which is not the same as finding nothing.
+        assert late["errors_reduced"] is None
+        assert untouched == DB_ERROR_TEXT
+        assert in_time["errors_reduced"] == {"runs": 1, "data_types": 1}
+        assert run.error == UNCLASSIFIED
+
+    @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.SessionLocal")
     def test_nothing_to_reduce_is_reported_as_zero(self, mock_task_session: MagicMock, db: Session) -> None:
         mock_task_session.return_value.__enter__.return_value = db
 
@@ -579,3 +609,43 @@ class TestTheWebhookIsDescribedAsItIs:
         assert "error code" in description
         assert "includes error message" not in description
         assert UNCLASSIFIED in description
+
+
+class TestOnlyRowsThatCanHoldAnErrorAreRead:
+    """The pass rewrites in Python, so the database hands it only rows with an error
+    somewhere: in the column, or under an ``error`` key at any depth of the metadata."""
+
+    def test_runs(self, db: Session) -> None:
+        user = UserFactory()
+        now = datetime.now(timezone.utc)
+
+        def stored(error: str | None, meta: dict[str, Any] | None, updated_at: datetime = now) -> UUID:
+            run_key = f"pull_{uuid4().hex[:16]}"
+            return sync_run_repository.upsert_run(
+                db,
+                SyncRunWrite(
+                    run_key=run_key,
+                    user_id=user.id,
+                    provider="whoop",
+                    source=SyncSource.BACKFILL,
+                    scope=SyncScope.HISTORICAL,
+                    status=SyncStatus.SUCCESS,
+                    started_at=updated_at,
+                    error=error,
+                    meta=meta,
+                    updated_at=updated_at,
+                ),
+            )
+
+        in_column = stored("KeyError", None)
+        nested = stored(None, {"params": {"workouts": {"success": False, "error": "KeyError"}}})
+        in_a_list = stored(None, {"results": [{"error": "KeyError"}]})
+        stored(None, {"params": {"workouts": {"success": True, "note": "no error here"}}})
+        stored(None, None)
+        old = stored("KeyError", None, updated_at=now - timedelta(days=3))
+
+        everything = {run.id for run in sync_run_repository.runs_with_an_error(db)}
+        recent = {run.id for run in sync_run_repository.runs_with_an_error(db, since=now - timedelta(days=1))}
+
+        assert everything == {in_column, nested, in_a_list, old}
+        assert recent == {in_column, nested, in_a_list}
