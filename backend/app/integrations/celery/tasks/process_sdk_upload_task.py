@@ -24,6 +24,7 @@ from app.services.sdk.import_service import (
 from app.services.sdk.import_service import (
     import_service as sdk_import_service,
 )
+from app.services.sync_error_code import SDK_IMPORT_FAILED
 from app.services.sync_status_service import (
     emit_sync_completed,
     emit_sync_failed,
@@ -69,7 +70,10 @@ def _batch_outcomes(types: list[str], workouts_saved: int, sleep_saved: int, sco
     return outcomes
 
 
-@shared_task(queue="sdk_sync")
+# FORK (data protection, Notion 2.47.17.2): ignore_result, because a task that raises
+# would have its exception, text and traceback, kept in the result backend for three
+# days. Nothing reads this task's result.
+@shared_task(queue="sdk_sync", ignore_result=True)
 def process_sdk_upload(
     content: str | None,
     content_type: str,
@@ -266,7 +270,7 @@ def process_sdk_upload(
                 SyncSource.SDK,
                 scope=scope,
                 run_id=run_id,
-                error=str(result.get("response", "Unknown error")),
+                error=SDK_IMPORT_FAILED,
                 message=f"{provider.capitalize()} batch failed",
                 metadata={"batch_id": batch_id, "status_code": status_code},
             )

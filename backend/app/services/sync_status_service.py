@@ -22,14 +22,18 @@ Keys (all TTL'd to ``HISTORY_TTL_SECONDS``):
 - ``sync:status:run:<run_id>``              — JSON-encoded latest event
 """
 
+import json
 import logging
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any, cast
 from uuid import UUID, uuid4
+
+from redis.client import Pipeline
+from redis.exceptions import WatchError
 
 from app.config import settings
 from app.database import DbSession, SessionLocal
@@ -47,6 +51,7 @@ from app.schemas.sync_status import (
     SyncStatus,
     SyncStatusEvent,
 )
+from app.services.sync_error_code import error_code, without_error_text
 from app.utils.context import trace_id_var
 from app.utils.sse import format_comment, format_event
 from app.utils.structured_logging import log_structured
@@ -189,7 +194,13 @@ def try_record_data_types(run_key: str, outcomes: list[DataTypeOutcome], *, scop
             sync_run_repository.upsert_data_types(
                 db,
                 run_id=run.id,
-                outcomes=outcomes,
+                # FORK (data protection, 2.47.17.2): codes, never the error's text.
+                outcomes=[
+                    outcome.model_copy(
+                        update={"error": error_code(outcome.error), "error_code": error_code(outcome.error_code)},
+                    )
+                    for outcome in outcomes
+                ],
                 updated_at=datetime.now(timezone.utc),
             )
     except Exception as exc:
@@ -199,7 +210,8 @@ def try_record_data_types(run_key: str, outcomes: list[DataTypeOutcome], *, scop
             "Failed to record sync run data types",
             action="sync_run_data_types_failed",
             run_id=run_key,
-            error=str(exc),
+            # FORK (data protection): the error's type, as in try_persist_run above.
+            error=type(exc).__name__,
         )
 
 
@@ -237,12 +249,101 @@ def get_stored_run(db: DbSession, run_key: str) -> SyncRunDetail | None:
     return SyncRunDetail.model_validate(run) if run is not None else None
 
 
-def emit(event: SyncStatusEvent) -> None:
-    """Persist and broadcast a sync status event.
+def reduce_cached_sync_errors(*, dry_run: bool = False) -> int:
+    """Rewrite events already in Redis so their error is a code, returning how many were.
+
+    FORK (data protection, Notion 2.47.17.2). An image from before emit() reduced errors
+    cached the error's text. A user's recent list is not gone after 24 hours: every new
+    event renews it and it keeps the last MAX_RECENT_EVENTS, so such an event can be served
+    by the recent-events and stream endpoints for as long as it stays among them.
+    """
+    client = get_redis_client()
+    changed = 0
+
+    for key in client.scan_iter(match=_run_key("*"), count=_SCAN_COUNT):
+
+        def rewrite_entry(pipe: Pipeline, key: Any = key) -> int:
+            reduced = _reduced_payload(pipe.get(key))
+            pipe.multi()
+            if reduced is not None and not dry_run:
+                pipe.set(key, reduced, keepttl=True)
+            return 0 if reduced is None else 1
+
+        changed += _under_watch(client, key, rewrite_entry)
+
+    for key in client.scan_iter(match=_user_recent_key("*"), count=_SCAN_COUNT):
+
+        def rewrite_list(pipe: Pipeline, key: Any = key) -> int:
+            rewritten = 0
+            items = pipe.lrange(key, 0, -1)
+            pipe.multi()
+            for index, item in enumerate(items):
+                reduced = _reduced_payload(item)
+                if reduced is None:
+                    continue
+                rewritten += 1
+                if not dry_run:
+                    pipe.lset(key, index, reduced)
+            return rewritten
+
+        changed += _under_watch(client, key, rewrite_list)
+
+    return changed
+
+
+_SCAN_COUNT = 200
+_WATCH_ATTEMPTS = 5
+
+
+def _under_watch(client: Any, key: Any, rewrite: Callable[[Pipeline], int]) -> int:
+    """Run ``rewrite`` on ``key`` as a WATCHed transaction, returning what it returns.
+
+    A worker can store a newer event between the read and the write. The transaction then
+    fails and runs again on what is there now, so the newer event is neither put back to
+    an older one nor, in a list, written to the wrong index. It gives up after a few
+    attempts rather than wait for ever: this runs before the API starts serving.
+    """
+    for _ in range(_WATCH_ATTEMPTS):
+        with client.pipeline(transaction=True) as pipe:
+            try:
+                pipe.watch(key)
+                count = rewrite(pipe)
+                pipe.execute()
+                return count
+            except WatchError:
+                continue
+    # Not the key: it holds a run id or a user id, and this message is logged.
+    raise TimeoutError("a cached sync history key kept changing; left for the next run")
+
+
+def _reduced_payload(raw: Any) -> str | None:
+    """The cached event with its error as a code, or None when that changes nothing.
+
+    An entry that is not an event object is left alone. One that lacks an ``error`` or a
+    ``metadata`` key gains it as null, once; emit() always writes both.
+    """
+    try:
+        event = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(event, dict):
+        return None
+    reduced = {**event, "error": error_code(event.get("error")), "metadata": without_error_text(event.get("metadata"))}
+    return None if reduced == event else json.dumps(reduced)
+
+
+def emit(event: SyncStatusEvent) -> SyncStatusEvent:
+    """Persist and broadcast a sync status event, returning it as it was stored and sent.
 
     Failures are logged but never raised — sync flow must not be blocked
     by Redis problems.
     """
+    # FORK (data protection, 2.47.17.2): every path below (the log line, the stored run,
+    # Redis, the outgoing webhook) gets an error code, never the error's text.
+    event = event.model_copy(
+        update={"error": error_code(event.error), "metadata": without_error_text(event.metadata)},
+    )
+
     # Mirror the SSE event into the structured logs so sync outcome metadata
     # (status, item counts, inserted/updated split, message) is queryable in the
     # deployment logs, not only on the frontend stream.
@@ -315,6 +416,8 @@ def emit(event: SyncStatusEvent) -> None:
         args=(event,),
         daemon=True,
     ).start()
+
+    return event
 
 
 def _maybe_dispatch_outgoing_webhook(event: SyncStatusEvent) -> None:
@@ -407,8 +510,8 @@ def emit_event(
         started_at=started_at,
         ended_at=ended_at,
     )
-    emit(event)
-    return event
+    # FORK (data protection, 2.47.17.2): the event as emit() reduced it, not as it was built.
+    return emit(event)
 
 
 def last_event_at(run_ids: list[str]) -> dict[str, datetime] | None:

@@ -42,6 +42,7 @@ from app.schemas.providers.mobile_sdk.sync_request import (
 )
 from app.schemas.responses.upload import UploadDataResponse
 from app.services.event_record_service import event_record_service
+from app.services.sync_error_code import error_code
 from app.services.timeseries_service import timeseries_service
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
@@ -609,7 +610,9 @@ class ImportService:
             )
             return UploadDataResponse(
                 status_code=400,
-                response=f"Import failed: {str(e)}",
+                # FORK (2.47.17.2): the class, not the text. This answer is what the upload
+                # task returns, which the worker logs.
+                response=f"Import failed: {error_code(e)}",
                 user_id=user_id,
             )
 

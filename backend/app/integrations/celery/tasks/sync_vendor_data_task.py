@@ -28,6 +28,7 @@ from app.services.sync_coordination import (
     release_stale_primary,
     try_become_primary,
 )
+from app.services.sync_error_code import ALL_SUBTASKS_FAILED, UNCLASSIFIED, error_code
 from app.services.sync_status_service import (
     emit_sync_completed,
     emit_sync_failed,
@@ -76,7 +77,10 @@ def _include_in_periodic_pull(caps: Any, live_sync_mode: LiveSyncMode | None, is
     return live_sync_mode == LiveSyncMode.PULL
 
 
-@shared_task
+# FORK (data protection, Notion 2.47.17.2): ignore_result, because a task that raises
+# would have its exception, text and traceback, kept in the result backend for three
+# days. Nothing reads this task's result.
+@shared_task(ignore_result=True)
 def sync_vendor_data(
     user_id: str,
     start_date: str | None = None,
@@ -130,7 +134,8 @@ def sync_vendor_data(
             user_id=user_id,
             start_date=start_date,
             end_date=end_date,
-            errors={"user_id": f"Invalid UUID format: {str(e)}"},
+            # FORK (2.47.17.2): the result is stored and logged, so a code, as below.
+            errors={"user_id": error_code(e) or UNCLASSIFIED},
         ).model_dump()
 
     result = SyncVendorDataResult(
@@ -377,14 +382,14 @@ def sync_vendor_data(
                                     "trace_id": trace_id,
                                 },
                             )
-                            provider_result.params["workouts"] = {"success": False, "error": str(e)}
+                            provider_result.params["workouts"] = {"success": False, "error": error_code(e)}
                             data_type_outcomes.append(
                                 DataTypeOutcome(
                                     data_type="workouts",
                                     kind=DataTypeKind.TASK,
                                     native_type="workouts",
                                     status=SyncStatus.FAILED,
-                                    error=str(e),
+                                    error=error_code(e),
                                 )
                             )
 
@@ -479,14 +484,14 @@ def sync_vendor_data(
                                     "trace_id": trace_id,
                                 },
                             )
-                            provider_result.params["data_247"] = {"success": False, "error": str(e)}
+                            provider_result.params["data_247"] = {"success": False, "error": error_code(e)}
                             data_type_outcomes.append(
                                 DataTypeOutcome(
                                     data_type="data_247",
                                     kind=DataTypeKind.TASK,
                                     native_type="data_247",
                                     status=SyncStatus.FAILED,
-                                    error=str(e),
+                                    error=error_code(e),
                                 )
                             )
 
@@ -550,7 +555,7 @@ def sync_vendor_data(
                             sync_source,
                             scope=sync_scope,
                             run_id=run_id,
-                            error="All sync sub-tasks failed",
+                            error=ALL_SUBTASKS_FAILED,
                             message=f"Sync from {provider_name} failed",
                             primary_user_id=primary_uuid,
                             metadata={"is_historical": is_historical, "params": provider_result.params},
@@ -610,7 +615,7 @@ def sync_vendor_data(
                         sync_source,
                         scope=sync_scope,
                         run_id=run_id,
-                        error=str(e),
+                        error=error_code(e),
                         message=f"Sync from {provider_name} failed",
                         metadata={"is_historical": is_historical},
                     )
@@ -625,7 +630,7 @@ def sync_vendor_data(
                             "trace_id": trace_id,
                         },
                     )
-                    result.errors[provider_name] = str(e)
+                    result.errors[provider_name] = error_code(e) or UNCLASSIFIED
                     continue
                 finally:
                     clear_primary_lease()
@@ -639,5 +644,5 @@ def sync_vendor_data(
                 f"Error processing user {user_id}: {str(e)}",
                 extra={"user_id": user_id, "task": "sync_vendor_data", "trace_id": trace_id},
             )
-            result.errors["general"] = str(e)
+            result.errors["general"] = error_code(e) or UNCLASSIFIED
             return result.model_dump()

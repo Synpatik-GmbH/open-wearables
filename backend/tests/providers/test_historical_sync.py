@@ -70,6 +70,9 @@ class TestPullBasedHistoricalSync:
         assert result.start_date is not None
         assert result.end_date is not None
         mock_celery.send_task.assert_called_once()
+        # FORK (2.47.17.2): sent by name, so the task's own ignore_result does not apply;
+        # without the option the result backend would keep this run's result or failure.
+        assert mock_celery.send_task.call_args.kwargs["ignore_result"] is True
         call_kwargs = mock_celery.send_task.call_args[1]["kwargs"]
         assert call_kwargs["user_id"] == str(user_id)
         assert call_kwargs["providers"] == ["oura"]

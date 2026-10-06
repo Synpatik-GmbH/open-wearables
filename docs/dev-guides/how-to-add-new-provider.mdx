@@ -608,10 +608,12 @@ curl -X POST "http://localhost:8000/api/v1/providers/suunto/users/YOUR_USER_ID/s
   "success": true,
   "async": true,
   "task_id": "58fd1f21-1768-49ea-bcb8-3876b76ed4f7",
-  "message": "Sync task queued for suunto. Check task status for results."
+  "message": "Sync task queued for suunto. Follow the run at GET /api/v1/users/YOUR_USER_ID/sync/runs."
 }
 ```
 </CodeGroup>
+
+The task keeps no result, so `task_id` cannot be polled for an outcome. Follow the run on the [sync status endpoints](/api-reference/guides/sync-status-stream) instead: `GET /api/v1/users/{user_id}/sync/runs`, or the event stream.
 
 ### 3. Verify Database
 

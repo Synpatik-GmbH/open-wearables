@@ -201,7 +201,11 @@ EVENT_TYPE_DESCRIPTIONS: dict[WebhookEventType, str] = {
     ),
     WebhookEventType.SYNC_STARTED: "A sync run started for a user (live, historical, backfill, SDK or XML).",
     WebhookEventType.SYNC_COMPLETED: "A sync run completed successfully (terminal state).",
-    WebhookEventType.SYNC_FAILED: "A sync run failed (terminal state, includes error message).",
+    # FORK (2.47.17.2): a code, since the error's own text can quote health values.
+    WebhookEventType.SYNC_FAILED: (
+        "A sync run failed (terminal state). `error` is an error code, never the error's message: "
+        "an exception class name, optionally with an HTTP status, a fixed word, or `unclassified`."
+    ),
     WebhookEventType.WORKOUT_CREATED: "A new workout session was saved.",
     WebhookEventType.SLEEP_CREATED: "A new (or merged) sleep session was saved.",
     WebhookEventType.MENSTRUAL_CYCLE_CREATED: "A new menstrual cycle record was saved.",

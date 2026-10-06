@@ -300,7 +300,9 @@ class TestTryRecordDataTypes:
 
         row = db.query(SyncRunDataType).filter(SyncRunDataType.data_type == "sleep").one()
         assert row.status == SyncStatus.FAILED
-        assert row.error_code == "HKErrorAuthorizationDenied"
+        # FORK (2.47.17.2): what the phone reports as its error code and message is not
+        # stored. The failure itself still is, which is what this test is about.
+        assert row.error_code == "unclassified"
         assert row.ended_at == ended
         assert row.duration_ms == 8412
         # What the batch did write is still recorded against the type.

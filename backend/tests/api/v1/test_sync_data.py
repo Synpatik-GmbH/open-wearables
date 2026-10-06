@@ -82,6 +82,10 @@ class TestSyncDataEndpoint:
         assert data["success"] is True
         assert data["async"] is True
         assert data["task_id"] == "test-task-id-123"
+        # FORK (2.47.17.2): the task keeps no result, so the caller is pointed at where the
+        # run can be followed, not at a task status that would stay pending.
+        assert f"/api/v1/users/{user.id}/sync/runs" in data["message"]
+        assert "task status" not in data["message"]
 
         # Verify Celery task was dispatched
         mock_celery_task.delay.assert_called_once()

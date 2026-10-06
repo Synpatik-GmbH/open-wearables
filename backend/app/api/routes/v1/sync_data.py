@@ -152,7 +152,11 @@ def sync_user_data(
             "success": True,
             "async": True,
             "task_id": task.id,
-            "message": f"Sync task queued for {provider.value}. Check task status for results.",
+            # FORK (2.47.17.2): the task keeps no result (ignore_result), so its id cannot be
+            # polled. The run is followed where sync runs are reported.
+            "message": (
+                f"Sync task queued for {provider.value}. Follow the run at GET /api/v1/users/{user_id}/sync/runs."
+            ),
         }
 
     # Synchronous mode
