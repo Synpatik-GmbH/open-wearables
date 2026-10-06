@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any
+from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -47,7 +48,9 @@ def _load_module() -> ModuleType:
     return module
 
 
-reduce_sync_run_errors = _load_module().reduce_sync_run_errors
+script = _load_module()
+reduce_sync_run_errors = script.reduce_sync_run_errors
+reduce_cached_events = script.reduce_cached_events
 
 
 def _run(db: Session, user_id: UUID, *, error: str | None, meta: dict[str, Any] | None) -> SyncRun:
@@ -129,7 +132,7 @@ class TestReduceSyncRunErrors:
     def test_text_becomes_a_code_and_the_counts_say_how_many(self, db: Session, stored: dict[str, SyncRun]) -> None:
         result = reduce_sync_run_errors(db, dry_run=False)
 
-        assert result == {"runs": 3, "data_types": 2, "cached": 0}
+        assert result == {"runs": 3, "data_types": 2}
         db.expire_all()
         assert stored["text_error"].error == "unclassified"
         assert stored["text_error"].meta == {"is_historical": True}
@@ -156,14 +159,14 @@ class TestReduceSyncRunErrors:
     def test_a_second_run_finds_nothing(self, db: Session, stored: dict[str, SyncRun]) -> None:
         reduce_sync_run_errors(db, dry_run=False)
 
-        assert reduce_sync_run_errors(db, dry_run=False) == {"runs": 0, "data_types": 0, "cached": 0}
+        assert reduce_sync_run_errors(db, dry_run=False) == {"runs": 0, "data_types": 0}
 
     def test_dry_run_counts_and_changes_nothing(self, db: Session, stored: dict[str, SyncRun]) -> None:
         before = _everything_stored(db)
 
         result = reduce_sync_run_errors(db, dry_run=True)
 
-        assert result == {"runs": 3, "data_types": 2, "cached": 0}
+        assert result == {"runs": 3, "data_types": 2}
         assert _everything_stored(db, reload=False) == before
 
     def test_a_row_another_writer_changed_meanwhile_is_not_overwritten(self, db: Session) -> None:
@@ -191,7 +194,7 @@ class TestReduceSyncRunErrors:
 
         result = reduce_sync_run_errors(db, dry_run=False)
 
-        assert result == {"runs": 0, "data_types": 0, "cached": 0}
+        assert result == {"runs": 0, "data_types": 0}
         db.expire_all()
         assert (run.error, run.meta) == ("KeyError", {"inserted_by": "the_newer_event"})
         assert [row.error for row in rows_as_first_read] == ["KeyError"]
@@ -222,19 +225,63 @@ class TestReduceSyncRunErrors:
         # SKIP LOCKED would pass over a contended row and NOWAIT would abort the pass.
         assert all(s.rstrip().endswith("FOR UPDATE") for s in locks)
 
-    def test_an_event_cached_in_redis_is_reduced_and_counted(
-        self, db: Session, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_an_event_cached_in_redis_is_reduced_and_counted(self, capsys: pytest.CaptureFixture[str]) -> None:
         client = get_redis_client()
         client.set("sync:status:run:pull_cached", json.dumps({"run_id": "pull_cached", "error": TEXT}), ex=3600)
 
-        result = reduce_sync_run_errors(db, dry_run=False)
+        assert reduce_cached_events(dry_run=False) == 1
 
-        assert result == {"runs": 0, "data_types": 0, "cached": 1}
         assert json.loads(client.get("sync:status:run:pull_cached"))["error"] == "unclassified"
         printed = capsys.readouterr().out
         assert "1 cached event(s)" in printed
         assert "187.5" not in printed
+
+    def test_the_database_is_committed_before_redis_is_touched(self, db: Session, stored: dict[str, SyncRun]) -> None:
+        """The two stores are independent. With Redis down the database pass must still be
+        kept, and the script must still fail, so the cache pass is seen to be owed."""
+        order: list[str] = []
+        session = MagicMock(wraps=db)
+        session.commit.side_effect = lambda: order.append("commit")
+
+        def redis_is_down(**_: Any) -> int:
+            order.append("redis")
+            raise ConnectionError("redis is down")
+
+        with (
+            patch.object(script, "SessionLocal") as session_local,
+            patch.object(script, "reduce_cached_sync_errors", side_effect=redis_is_down),
+        ):
+            session_local.return_value.__enter__.return_value = session
+            session_local.return_value.__exit__.side_effect = lambda *_: order.append("close")
+            with pytest.raises(ConnectionError):
+                script.main(dry_run=False)
+
+        # Committed while the session is open: closing it first would roll the pass back.
+        assert order == ["commit", "close", "redis"]
+
+    @pytest.mark.parametrize(("dry_run", "commits"), [(True, 0), (False, 1)])
+    def test_only_a_real_run_commits(
+        self, db: Session, stored: dict[str, SyncRun], dry_run: bool, commits: int
+    ) -> None:
+        session = MagicMock(wraps=db)
+        with patch.object(script, "SessionLocal") as session_local:
+            session_local.return_value.__enter__.return_value = session
+            script.main(dry_run=dry_run)
+
+        assert session.commit.call_count == commits
+
+    def test_a_dry_run_of_the_script_changes_neither_store(self, db: Session, stored: dict[str, SyncRun]) -> None:
+        client = get_redis_client()
+        cached = json.dumps({"run_id": "pull_cached", "error": TEXT, "metadata": {}})
+        client.set("sync:status:run:pull_cached", cached, ex=3600)
+        before = _everything_stored(db)
+
+        with patch.object(script, "SessionLocal") as session_local:
+            session_local.return_value.__enter__.return_value = db
+            script.main(dry_run=True)
+
+        assert _everything_stored(db, reload=False) == before
+        assert client.get("sync:status:run:pull_cached") == cached
 
     def test_it_prints_counts_and_never_the_text(
         self, db: Session, stored: dict[str, SyncRun], capsys: pytest.CaptureFixture[str]
@@ -244,6 +291,5 @@ class TestReduceSyncRunErrors:
         printed = capsys.readouterr().out
         assert "3 run(s)" in printed
         assert "2 per-data-type row(s)" in printed
-        assert "cached event(s)" in printed
         assert "187.5" not in printed
         assert "5f0c1c1e" not in printed

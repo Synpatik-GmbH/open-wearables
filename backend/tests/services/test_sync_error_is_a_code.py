@@ -757,6 +757,75 @@ class TestEventsAnOlderImageCachedAreReducedToo:
         assert 0 < client.ttl(f"sync:status:user:{user_id}:recent") <= 3600
         assert 0 < client.ttl(f"sync:status:run:{dirty.run_id}") <= 3600
 
+    def test_a_run_entry_a_worker_wrote_meanwhile_is_not_put_back(self) -> None:
+        """The pass reads an entry and writes it back. A worker can store the run's next
+        event in between, and that newer event must be the one that stays."""
+        dirty = self._as_an_older_image_cached_it(uuid4())
+        key = f"sync:status:run:{dirty.run_id}"
+        newer = dirty.model_copy(update={"error": None, "metadata": {}, "status": SyncStatus.SUCCESS}).model_dump_json()
+        real = sync_status_service._reduced_payload
+        wrote: list[bool] = []
+
+        def a_worker_writes_first(raw: Any) -> str | None:
+            if not wrote and raw and dirty.run_id in str(raw) and "INSERT INTO" in str(raw):
+                wrote.append(True)
+                get_redis_client().set(key, newer, ex=3600)
+            return real(raw)
+
+        with patch.object(sync_status_service, "_reduced_payload", side_effect=a_worker_writes_first):
+            sync_status_service.reduce_cached_sync_errors()
+
+        assert wrote
+        assert json.loads(get_redis_client().get(key))["status"] == "success"
+
+    def test_a_list_a_worker_pushed_to_meanwhile_keeps_the_new_event(self) -> None:
+        user_id = uuid4()
+        dirty = self._as_an_older_image_cached_it(user_id)
+        key = f"sync:status:user:{user_id}:recent"
+        newer = _event(user_id, scope=SyncScope.LIVE, error=None, metadata={}, status=SyncStatus.SUCCESS)
+        real = sync_status_service._reduced_payload
+        pushed: list[bool] = []
+
+        def a_worker_pushes_first(raw: Any) -> str | None:
+            # Only while the list is being read, which is after the run entries are done.
+            if not pushed and raw and dirty.run_id in str(raw) and get_redis_client().llen(key) == 1 and len(seen) >= 1:
+                pushed.append(True)
+                get_redis_client().lpush(key, newer.model_dump_json())
+            seen.append(raw)
+            return real(raw)
+
+        seen: list[Any] = []
+        with patch.object(sync_status_service, "_reduced_payload", side_effect=a_worker_pushes_first):
+            sync_status_service.reduce_cached_sync_errors()
+
+        assert pushed
+        recent = sync_status_service.get_recent_events(user_id)
+        assert [(e.run_id, e.error) for e in recent] == [(newer.run_id, None), (dirty.run_id, UNCLASSIFIED)]
+
+    def test_an_entry_that_never_stops_changing_ends_the_pass_instead_of_hanging_it(self) -> None:
+        """The pass runs before the API starts serving. It must not wait for ever on a key
+        a worker keeps writing; it fails, and the next start tries again."""
+        dirty = self._as_an_older_image_cached_it(uuid4())
+        key = f"sync:status:run:{dirty.run_id}"
+        real = sync_status_service._reduced_payload
+        writes: list[int] = []
+
+        def a_worker_writes_every_time(raw: Any) -> str | None:
+            if raw and dirty.run_id in str(raw) and "INSERT INTO" in str(raw):
+                writes.append(1)
+                get_redis_client().set(key, dirty.model_dump_json(), ex=3600)
+            return real(raw)
+
+        with (
+            patch.object(sync_status_service, "_reduced_payload", side_effect=a_worker_writes_every_time),
+            pytest.raises(TimeoutError, match="kept changing") as raised,
+        ):
+            sync_status_service.reduce_cached_sync_errors()
+
+        assert len(writes) == sync_status_service._WATCH_ATTEMPTS
+        # The key holds a run id or a user id, so the error must not name it.
+        assert dirty.run_id not in str(raised.value)
+
     def test_a_second_pass_finds_nothing(self) -> None:
         self._as_an_older_image_cached_it(uuid4())
         sync_status_service.reduce_cached_sync_errors()

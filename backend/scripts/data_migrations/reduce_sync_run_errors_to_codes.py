@@ -16,6 +16,14 @@ no-ops. It runs on every API start and reads every row. A worker still on the ol
 image can write one more row after that; the periodic close_stale_sync_runs task makes
 the same pass over recent rows for the first two hours of its worker process.
 
+Two stores, handled apart. The database is rewritten and committed first; Redis is
+touched only after that, so a Redis that cannot be reached does not undo the database
+pass. A Redis failure still ends the script with an error, which the start-up script
+reports as a warning and the next start retries. In the database a row is read again
+under a row lock before it is rewritten; in Redis a key is rewritten under WATCH, and a
+key a worker keeps writing to ends the pass after a few attempts instead of holding up
+the API's start.
+
 Neither of those can promise to come after the last write of an older image, so the
 rollout that first carries this ends with one run by hand, after the last app has
 moved (FORK-DELTA.md). A second run then reports nothing left.
@@ -40,23 +48,34 @@ def reduce_sync_run_errors(db: Session, *, dry_run: bool) -> dict[str, int]:
     verb = "Would reduce" if dry_run else "Reduced"
     print(f"sync_run:           {verb} {result['runs']} run(s) to an error code")
     print(f"sync_run_data_type: {verb} {result['data_types']} per-data-type row(s) to an error code")
-    cached = reduce_cached_sync_errors(dry_run=dry_run)
-    print(f"Redis history:      {verb} {cached} cached event(s) to an error code")
-    result = {**result, "cached": cached}
-    if dry_run:
-        print("\nDry run — no changes made.")
     return result
 
 
+def reduce_cached_events(*, dry_run: bool) -> int:
+    """Rewrite the events cached in Redis and print the count."""
+    cached = reduce_cached_sync_errors(dry_run=dry_run)
+    verb = "Would reduce" if dry_run else "Reduced"
+    print(f"Redis history:      {verb} {cached} cached event(s) to an error code")
+    return cached
+
+
 def main(dry_run: bool) -> None:
+    # The database first, and committed before Redis is touched: the two stores are
+    # independent, and a Redis that cannot be reached must not undo the database pass.
+    # A Redis failure still ends the script with an error, so the cache pass is seen
+    # to be owed and the next start retries it.
     with SessionLocal() as db:
         result = reduce_sync_run_errors(db, dry_run=dry_run)
-        if dry_run:
-            return
-        if not any(result.values()):
-            print("Nothing to do — no stored sync error held text.")
-            return
-        db.commit()
+        if not dry_run and any(result.values()):
+            db.commit()
+
+    cached = reduce_cached_events(dry_run=dry_run)
+
+    if dry_run:
+        print("\nDry run — no changes made.")
+    elif not any(result.values()) and not cached:
+        print("Nothing to do — no stored sync error held text.")
+    else:
         print("Done.")
 
 

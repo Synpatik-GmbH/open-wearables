@@ -26,11 +26,14 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any, cast
 from uuid import UUID, uuid4
+
+from redis.client import Pipeline
+from redis.exceptions import WatchError
 
 from app.config import settings
 from app.database import DbSession, SessionLocal
@@ -257,21 +260,20 @@ def reduce_cached_sync_errors(*, dry_run: bool = False) -> int:
     client = get_redis_client()
     changed = 0
 
-    for key in client.scan_iter(match=_run_key("*")):
-        reduced = _reduced_payload(client.get(key))
-        if reduced is None:
-            continue
-        changed += 1
-        if not dry_run:
-            client.set(key, reduced, keepttl=True)
+    for key in client.scan_iter(match=_run_key("*"), count=_SCAN_COUNT):
 
-    for key in client.scan_iter(match=_user_recent_key("*")):
-        rewritten = 0
+        def rewrite_entry(pipe: Pipeline, key: Any = key) -> int:
+            reduced = _reduced_payload(pipe.get(key))
+            pipe.multi()
+            if reduced is not None and not dry_run:
+                pipe.set(key, reduced, keepttl=True)
+            return 0 if reduced is None else 1
 
-        def rewrite(pipe: Any, key: Any = key) -> None:
-            # WATCHed, so a worker that pushes meanwhile makes this run again: an index
-            # read before the push would otherwise point one entry too early.
-            nonlocal rewritten
+        changed += _under_watch(client, key, rewrite_entry)
+
+    for key in client.scan_iter(match=_user_recent_key("*"), count=_SCAN_COUNT):
+
+        def rewrite_list(pipe: Pipeline, key: Any = key) -> int:
             rewritten = 0
             items = pipe.lrange(key, 0, -1)
             pipe.multi()
@@ -282,15 +284,44 @@ def reduce_cached_sync_errors(*, dry_run: bool = False) -> int:
                 rewritten += 1
                 if not dry_run:
                     pipe.lset(key, index, reduced)
+            return rewritten
 
-        client.transaction(rewrite, key)
-        changed += rewritten
+        changed += _under_watch(client, key, rewrite_list)
 
     return changed
 
 
+_SCAN_COUNT = 200
+_WATCH_ATTEMPTS = 5
+
+
+def _under_watch(client: Any, key: Any, rewrite: Callable[[Pipeline], int]) -> int:
+    """Run ``rewrite`` on ``key`` as a WATCHed transaction, returning what it returns.
+
+    A worker can store a newer event between the read and the write. The transaction then
+    fails and runs again on what is there now, so the newer event is neither put back to
+    an older one nor, in a list, written to the wrong index. It gives up after a few
+    attempts rather than wait for ever: this runs before the API starts serving.
+    """
+    for _ in range(_WATCH_ATTEMPTS):
+        with client.pipeline(transaction=True) as pipe:
+            try:
+                pipe.watch(key)
+                count = rewrite(pipe)
+                pipe.execute()
+                return count
+            except WatchError:
+                continue
+    # Not the key: it holds a run id or a user id, and this message is logged.
+    raise TimeoutError("a cached sync history key kept changing; left for the next run")
+
+
 def _reduced_payload(raw: Any) -> str | None:
-    """The cached event with its error as a code, or None when it needs no change."""
+    """The cached event with its error as a code, or None when that changes nothing.
+
+    An entry that is not an event object is left alone. One that lacks an ``error`` or a
+    ``metadata`` key gains it as null, once; emit() always writes both.
+    """
     try:
         event = json.loads(raw)
     except (TypeError, ValueError):
