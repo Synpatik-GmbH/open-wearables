@@ -167,7 +167,11 @@ class TestReduceSyncRunErrors:
 
     def test_a_row_another_writer_changed_meanwhile_is_not_overwritten(self, db: Session) -> None:
         """The pass reads a row, then rewrites it. A worker can store the run's next event in
-        between. What is written must come from the row as it is then, not as it was read."""
+        between. What is written must come from a second read, not from the first.
+
+        This runs in one session, so it proves the second read and what is done with it.
+        That the second read waits for the other writer is the lock, which the next test
+        pins by its statement: this fixture has one connection, so two cannot contend."""
         user = UserFactory()
         run = _run(db, user.id, error=TEXT, meta={"params": {"workouts": {"error": TEXT}}})
         _data_type(db, run, "workouts", error=TEXT, error_code=None)
@@ -213,6 +217,9 @@ class TestReduceSyncRunErrors:
         # One lock per row that needed rewriting: three runs and two per-data-type rows.
         assert len([s for s in locks if "FROM sync_run " in s or "FROM sync_run\n" in s]) == 3
         assert len([s for s in locks if "FROM sync_run_data_type" in s]) == 2
+        # A plain lock, which waits for another writer and then reads what it committed.
+        # SKIP LOCKED would pass over a contended row and NOWAIT would abort the pass.
+        assert all(s.rstrip().endswith("FOR UPDATE") for s in locks)
 
     def test_it_prints_counts_and_never_the_text(
         self, db: Session, stored: dict[str, SyncRun], capsys: pytest.CaptureFixture[str]

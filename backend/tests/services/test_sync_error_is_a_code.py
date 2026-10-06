@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 
 import app
 import app.integrations.celery.tasks.close_stale_sync_runs_task as sweep_task
+import app.services.sync_error_code as sync_error_code
 import app.services.sync_status_service as sync_status_service
 from app.integrations.celery.tasks.close_stale_sync_runs_task import close_stale_sync_runs
 from app.models import SyncRun, SyncRunDataType
@@ -38,6 +39,8 @@ from app.schemas.sync_status import (
     SyncStatus,
     SyncStatusEvent,
 )
+from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEventType
+from app.services.sdk.import_service import import_service
 from app.services.sync_error_code import (
     ALL_SUBTASKS_FAILED,
     SDK_IMPORT_FAILED,
@@ -87,6 +90,19 @@ class TestErrorCode:
 
         assert error_code("OnlyThisProcessKnowsMeError") == UNCLASSIFIED
         assert error_code(OnlyThisProcessKnowsMeError(DB_ERROR_TEXT)) == UNCLASSIFIED
+
+    def test_a_listed_module_that_cannot_be_imported_does_not_stop_a_sync(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The registry is built inside emit(), which must never raise. A module that has
+        gone missing costs its own codes, which read unclassified, and nothing else."""
+        monkeypatch.setattr(sync_error_code, "_registry", None)
+        monkeypatch.setattr(
+            sync_error_code, "_APP_MODULES", ("app.this_module_does_not_exist", *sync_error_code._APP_MODULES)
+        )
+
+        assert error_code(ValueError(DB_ERROR_TEXT)) == "ValueError"
+        assert error_code("WithingsTokenError_401") == "WithingsTokenError_401"
 
     def test_every_exception_the_backend_defines_is_a_code_in_a_process_that_loaded_nothing(self) -> None:
         """Asked of a fresh interpreter that has imported only the module under test, so a
@@ -519,6 +535,47 @@ class TestTheSweepReducesWhatAnOlderWorkerWrote:
         assert in_time["errors_reduced"] == {"runs": 1, "data_types": 1}
         assert run.error == UNCLASSIFIED
 
+    @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.reduce_stored_sync_errors")
+    @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.SessionLocal")
+    @patch("app.services.sync_status_service.SessionLocal")
+    def test_a_pass_that_fails_does_not_stop_stale_runs_being_closed(
+        self,
+        mock_emit_session: MagicMock,
+        mock_task_session: MagicMock,
+        mock_reduce: MagicMock,
+        db: Session,
+        capfd: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The sweep's own job is closing stale runs. The pass rides along with it."""
+        mock_emit_session.return_value.__enter__.return_value = db
+        mock_task_session.return_value.__enter__.return_value = db
+        mock_reduce.side_effect = RuntimeError(DB_ERROR_TEXT)
+        user = UserFactory()
+        old = datetime.now(timezone.utc) - timedelta(hours=48)
+        sync_status_service.try_persist_run(
+            _event(
+                user.id,
+                run_id="pull_stale",
+                stage=SyncStage.STARTED,
+                status=SyncStatus.IN_PROGRESS,
+                error=None,
+                metadata={},
+                started_at=old,
+                timestamp=old,
+            ),
+        )
+
+        result = close_stale_sync_runs()
+
+        assert result["run_keys"] == ["pull_stale"]
+        assert result["errors_reduced"] is None
+        out, err = capfd.readouterr()
+        logged = out + err + caplog.text
+        assert '"action": "sync_run_errors_reduce_failed"' in logged
+        assert '"error": "RuntimeError"' in logged
+        _assert_clean(logged)
+
     @patch("app.integrations.celery.tasks.close_stale_sync_runs_task.SessionLocal")
     def test_nothing_to_reduce_is_reported_as_zero(self, mock_task_session: MagicMock, db: Session) -> None:
         mock_task_session.return_value.__enter__.return_value = db
@@ -589,8 +646,6 @@ class TestThePhoneImportAnswersWithACode:
     result backend keeps, and it is logged once more on the way."""
 
     def test_a_failed_import_names_the_error_class_not_its_text(self, db: Session) -> None:
-        from app.services.sdk.import_service import import_service
-
         user = UserFactory()
 
         with patch.object(import_service, "_parse_json_content", side_effect=RuntimeError(DB_ERROR_TEXT)):
@@ -602,8 +657,6 @@ class TestThePhoneImportAnswersWithACode:
 
 class TestTheWebhookIsDescribedAsItIs:
     def test_sync_failed_promises_a_code_not_a_message(self) -> None:
-        from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEventType
-
         description = EVENT_TYPE_DESCRIPTIONS[WebhookEventType.SYNC_FAILED]
 
         assert "error code" in description

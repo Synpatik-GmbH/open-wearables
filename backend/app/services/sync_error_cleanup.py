@@ -10,7 +10,6 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.models import SyncRun, SyncRunDataType
 from app.repositories.sync_run_repository import sync_run_repository
 from app.services.sync_error_code import error_code, without_error_text
 
@@ -23,44 +22,33 @@ def reduce_stored_sync_errors(db: Session, *, dry_run: bool = False, since: date
     held until it ends.
     """
     # Two steps, because a worker can store a run's next event between a read and a
-    # write. The first read only finds the rows that need rewriting. Each of those is
-    # then read again under a row lock, and what is written comes from that second read.
+    # write. The first read only finds the rows that need rewriting. The repository then
+    # reads each of those again under a row lock and writes from that second read.
     run_ids = [
         run.id
         for run in sync_run_repository.runs_with_an_error(db, since)
-        if _run_as_codes(run) != (run.error, run.meta)
+        if _run_as_codes(run.error, run.meta) != (run.error, run.meta)
     ]
     row_keys = [
         (row.run_id, row.data_type)
         for row in sync_run_repository.data_types_with_an_error(db, since)
-        if _row_as_codes(row) != (row.error, row.error_code)
+        if _row_as_codes(row.error, row.error_code) != (row.error, row.error_code)
     ]
     if dry_run:
         return {"runs": len(run_ids), "data_types": len(row_keys)}
 
-    runs = 0
-    for run_id in run_ids:
-        run = sync_run_repository.lock_run(db, run_id)
-        if run is None or _run_as_codes(run) == (run.error, run.meta):
-            continue
-        run.error, run.meta = _run_as_codes(run)
-        runs += 1
-
-    data_types = 0
-    for run_id, data_type in row_keys:
-        row = sync_run_repository.lock_data_type(db, run_id, data_type)
-        if row is None or _row_as_codes(row) == (row.error, row.error_code):
-            continue
-        row.error, row.error_code = _row_as_codes(row)
-        data_types += 1
-
-    db.flush()
-    return {"runs": runs, "data_types": data_types}
+    return {
+        "runs": sum(sync_run_repository.rewrite_run_error(db, run_id, _run_as_codes) for run_id in run_ids),
+        "data_types": sum(
+            sync_run_repository.rewrite_data_type_error(db, run_id, data_type, _row_as_codes)
+            for run_id, data_type in row_keys
+        ),
+    }
 
 
-def _run_as_codes(run: SyncRun) -> tuple[str | None, dict[str, Any] | None]:
-    return error_code(run.error), without_error_text(run.meta)
+def _run_as_codes(error: str | None, meta: dict[str, Any] | None) -> tuple[str | None, dict[str, Any] | None]:
+    return error_code(error), without_error_text(meta)
 
 
-def _row_as_codes(row: SyncRunDataType) -> tuple[str | None, str | None]:
-    return error_code(row.error), error_code(row.error_code)
+def _row_as_codes(error: str | None, code: str | None) -> tuple[str | None, str | None]:
+    return error_code(error), error_code(code)

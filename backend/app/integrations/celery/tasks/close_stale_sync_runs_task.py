@@ -40,9 +40,21 @@ def close_stale_sync_runs() -> dict:
         # FORK (data protection, Notion 2.47.17.2): first, so that no early return skips it.
         errors_reduced: dict[str, int] | None = None
         if now - _PROCESS_STARTED_AT <= ERROR_CLEANUP_PERIOD:
-            errors_reduced = reduce_stored_sync_errors(db, since=now - ERROR_CLEANUP_WINDOW)
-            # Always, not only when something was rewritten: it also releases the row locks.
-            db.commit()
+            try:
+                errors_reduced = reduce_stored_sync_errors(db, since=now - ERROR_CLEANUP_WINDOW)
+                # Always, not only when something was rewritten: it also releases the row locks.
+                db.commit()
+            except Exception as exc:
+                # Closing stale runs is this task's own job and must not wait on the pass.
+                db.rollback()
+                errors_reduced = None
+                log_structured(
+                    logger,
+                    "warning",
+                    "Could not reduce stored sync errors to codes",
+                    action="sync_run_errors_reduce_failed",
+                    error=type(exc).__name__,
+                )
         if errors_reduced and any(errors_reduced.values()):
             log_structured(
                 logger,

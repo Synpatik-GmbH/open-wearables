@@ -1,4 +1,6 @@
+from collections.abc import Callable, Iterator
 from datetime import datetime
+from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import ColumnElement, and_, case, cast, func, literal, or_, select, update
@@ -27,6 +29,9 @@ def _overlaps(
     if range_start is not None:
         conditions.append(end_column > range_start)
     return conditions
+
+
+_STREAM_BATCH = 500
 
 
 class SyncRunRepository:
@@ -136,46 +141,81 @@ class SyncRunRepository:
         )
         db_session.execute(stmt)
 
-    # FORK (data protection, Notion 2.47.17.2): the four reads below serve
-    # services/sync_error_cleanup.py, which rewrites stored error text as codes.
+    # FORK (data protection, Notion 2.47.17.2): the four methods below serve
+    # services/sync_error_cleanup.py, which decides what an error is reduced to.
 
-    def runs_with_an_error(self, db_session: DbSession, since: datetime | None = None) -> list[SyncRun]:
+    def runs_with_an_error(self, db_session: DbSession, since: datetime | None = None) -> Iterator[SyncRun]:
         """Runs that have an error anywhere: in the column, or under an ``error`` key at
         any depth of ``meta``. With ``since``, only those updated from then on.
 
         No index serves this, so it reads the table. Its callers run it at start-up and
-        for a few hours after, not for as long as the process lives.
+        for a few hours after, not for as long as the process lives. Rows are streamed,
+        so a caller that keeps only what it needs does not hold the table in memory.
         """
         stmt = select(SyncRun).where(
             or_(SyncRun.error.isnot(None), func.jsonb_path_exists(SyncRun.meta, cast("$.**.error", JSONPATH))),
         )
         if since is not None:
             stmt = stmt.where(SyncRun.updated_at >= since)
-        return list(db_session.scalars(stmt).all())
+        return iter(db_session.scalars(stmt.execution_options(yield_per=_STREAM_BATCH)))
 
-    def data_types_with_an_error(self, db_session: DbSession, since: datetime | None = None) -> list[SyncRunDataType]:
+    def data_types_with_an_error(
+        self, db_session: DbSession, since: datetime | None = None
+    ) -> Iterator[SyncRunDataType]:
         """Per-data-type rows with an error or an error code. See runs_with_an_error."""
         stmt = select(SyncRunDataType).where(
             or_(SyncRunDataType.error.isnot(None), SyncRunDataType.error_code.isnot(None)),
         )
         if since is not None:
             stmt = stmt.where(SyncRunDataType.updated_at >= since)
-        return list(db_session.scalars(stmt).all())
+        return iter(db_session.scalars(stmt.execution_options(yield_per=_STREAM_BATCH)))
 
-    def lock_run(self, db_session: DbSession, run_id: UUID) -> SyncRun | None:
-        """The run as it is now, locked until the transaction ends."""
+    def rewrite_run_error(
+        self,
+        db_session: DbSession,
+        run_id: UUID,
+        reduce: Callable[[str | None, dict[str, Any] | None], tuple[str | None, dict[str, Any] | None]],
+    ) -> bool:
+        """Replace the run's (error, meta) with ``reduce`` of them, returning whether it changed.
+
+        The run is read again under a row lock first and ``reduce`` is given that read, so
+        an event a worker stored since the caller looked is neither lost nor overwritten.
+        The lock is held until the transaction ends.
+        """
         stmt = select(SyncRun).where(SyncRun.id == run_id).with_for_update().execution_options(populate_existing=True)
-        return db_session.scalars(stmt).one_or_none()
+        run = db_session.scalars(stmt).one_or_none()
+        if run is None:
+            return False
+        reduced = reduce(run.error, run.meta)
+        if reduced == (run.error, run.meta):
+            return False
+        run.error, run.meta = reduced
+        db_session.flush()
+        return True
 
-    def lock_data_type(self, db_session: DbSession, run_id: UUID, data_type: str) -> SyncRunDataType | None:
-        """The per-data-type row as it is now, locked until the transaction ends."""
+    def rewrite_data_type_error(
+        self,
+        db_session: DbSession,
+        run_id: UUID,
+        data_type: str,
+        reduce: Callable[[str | None, str | None], tuple[str | None, str | None]],
+    ) -> bool:
+        """Replace the row's (error, error_code) with ``reduce`` of them. See rewrite_run_error."""
         stmt = (
             select(SyncRunDataType)
             .where(SyncRunDataType.run_id == run_id, SyncRunDataType.data_type == data_type)
             .with_for_update()
             .execution_options(populate_existing=True)
         )
-        return db_session.scalars(stmt).one_or_none()
+        row = db_session.scalars(stmt).one_or_none()
+        if row is None:
+            return False
+        reduced = reduce(row.error, row.error_code)
+        if reduced == (row.error, row.error_code):
+            return False
+        row.error, row.error_code = reduced
+        db_session.flush()
+        return True
 
     def find_stale(self, db_session: DbSession, cutoff: datetime) -> list[str]:
         """Keys of runs in progress that have not been written to since the cutoff.

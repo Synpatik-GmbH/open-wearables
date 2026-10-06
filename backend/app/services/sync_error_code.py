@@ -77,12 +77,20 @@ _registry: frozenset[str] | None = None
 
 
 def _registered_exception_names() -> frozenset[str]:
-    # Built on first use, not at import: the provider modules import their way back here.
+    # Built on first use, by name, and so imported here rather than at the top of the
+    # file: the provider modules import their way back to this one.
     global _registry
     if _registry is None:
         names: set[str] = set()
         for module_name in (*_APP_MODULES, *_LIBRARY_MODULES):
-            exported = vars(importlib.import_module(module_name)).values()
+            try:
+                module = importlib.import_module(module_name)
+            except ImportError:
+                # This runs inside emit(), which must not raise. A module that has gone
+                # missing costs its own codes, which then read "unclassified"; the test
+                # that asks a fresh interpreter is what reports it.
+                continue
+            exported = vars(module).values()
             names.update(
                 item.__name__ for item in exported if isinstance(item, type) and issubclass(item, BaseException)
             )
