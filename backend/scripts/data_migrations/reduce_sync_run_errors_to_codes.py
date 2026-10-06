@@ -13,7 +13,7 @@ It prints how many rows it changed and never what they held.
 Idempotent: a cleaned row no longer differs from its cleaned form, so re-runs are
 no-ops. It runs on every API start and reads every row. A worker still on the older
 image can write one more row after that; the periodic close_stale_sync_runs task makes
-the same pass over recent rows, so such a row is reduced within one sweep interval.
+the same pass over recent rows for the first two hours of its worker process.
 
 Neither of those can promise to come after the last write of an older image, so the
 rollout that first carries this ends with one run by hand, after the last app has
