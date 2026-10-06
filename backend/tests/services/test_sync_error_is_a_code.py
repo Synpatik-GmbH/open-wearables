@@ -6,7 +6,11 @@ event leaves behind may carry that text: not the stored run, not the per-data-ty
 rows, not the Redis history, not the outgoing webhook, not the log line.
 """
 
+import importlib
 import json
+import pkgutil
+import subprocess
+import sys
 import time
 from collections.abc import Generator
 from datetime import datetime, timedelta, timezone
@@ -18,6 +22,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+import app
 import app.services.sync_status_service as sync_status_service
 from app.integrations.celery.tasks.close_stale_sync_runs_task import close_stale_sync_runs
 from app.models import SyncRun, SyncRunDataType
@@ -58,6 +63,9 @@ class TestErrorCode:
         [
             "IntegrityError",
             "KeyError",
+            "UniqueViolation",
+            "UnsupportedGranularityError",
+            "WithingsTokenError_401",
             "HTTPException_404",
             "HTTPException_599",
             ALL_SUBTASKS_FAILED,
@@ -69,14 +77,37 @@ class TestErrorCode:
     def test_an_exception_class_name_or_a_fixed_word_is_kept(self, code: str) -> None:
         assert error_code(code) == code
 
-    def test_a_class_defined_after_the_first_lookup_is_known(self) -> None:
-        assert error_code("LateArrivingSyncError") == UNCLASSIFIED
+    def test_a_class_this_process_merely_happens_to_have_loaded_is_not_a_code(self) -> None:
+        """What is a code must not depend on which process asks: a worker stores it and the
+        start-up script, which has loaded far less, reads it back."""
 
-        class LateArrivingSyncError(Exception):
+        class OnlyThisProcessKnowsMeError(Exception):
             pass
 
-        assert error_code("LateArrivingSyncError") == "LateArrivingSyncError"
-        assert error_code(LateArrivingSyncError(DB_ERROR_TEXT)) == "LateArrivingSyncError"
+        assert error_code("OnlyThisProcessKnowsMeError") == UNCLASSIFIED
+        assert error_code(OnlyThisProcessKnowsMeError(DB_ERROR_TEXT)) == UNCLASSIFIED
+
+    def test_every_exception_the_backend_defines_is_a_code_in_a_process_that_loaded_nothing(self) -> None:
+        """Asked of a fresh interpreter that has imported only the module under test, so a
+        class counts because it is registered, not because something loaded it first."""
+        for module in pkgutil.walk_packages(app.__path__, "app."):
+            importlib.import_module(module.name)
+        defined = sorted(
+            {cls.__name__ for cls in _all_subclasses(BaseException) if cls.__module__.startswith("app.")},
+        )
+        assert "WithingsTokenError" in defined
+        assert "UnsupportedGranularityError" in defined
+
+        asked = [*defined, "WithingsTokenError_401", "UniqueViolation", "ConnectError", "IntegrityError"]
+        script = (
+            "import sys, json; from app.services.sync_error_code import error_code; "
+            "print(json.dumps([error_code(name) for name in sys.argv[1:]]))"
+        )
+        answered = subprocess.run(  # noqa: S603
+            [sys.executable, "-c", script, *asked], capture_output=True, text=True, check=True
+        ).stdout.splitlines()[-1]
+
+        assert json.loads(answered) == asked
 
     @pytest.mark.parametrize(
         "text",
@@ -153,6 +184,15 @@ class TestWithoutErrorText:
     @pytest.mark.parametrize("value", [{"detail": DB_ERROR_TEXT}, [DB_ERROR_TEXT], 187.5])
     def test_an_error_that_is_not_a_string_is_dropped_too(self, value: object) -> None:
         assert without_error_text({"error": value}) == {"error": UNCLASSIFIED}
+
+
+def _all_subclasses(cls: type) -> set[type]:
+    found: set[type] = set()
+    for subclass in type.__subclasses__(cls):
+        if subclass not in found:
+            found.add(subclass)
+            found |= _all_subclasses(subclass)
+    return found
 
 
 def _event(user_id: UUID, **overrides: Any) -> SyncStatusEvent:
@@ -528,3 +568,14 @@ class TestThePhoneImportAnswersWithACode:
 
         assert response.status_code == 400
         assert response.response == "Import failed: RuntimeError"
+
+
+class TestTheWebhookIsDescribedAsItIs:
+    def test_sync_failed_promises_a_code_not_a_message(self) -> None:
+        from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEventType
+
+        description = EVENT_TYPE_DESCRIPTIONS[WebhookEventType.SYNC_FAILED]
+
+        assert "error code" in description
+        assert "includes error message" not in description
+        assert UNCLASSIFIED in description

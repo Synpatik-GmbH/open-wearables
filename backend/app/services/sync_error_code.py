@@ -7,7 +7,7 @@ the text would reach all four. They keep a code instead.
 
 A code is one of two things, and nothing is a code by its shape alone:
 
-- the name of an exception class this process has loaded, optionally followed by an
+- the name of an exception class from the registry below, optionally followed by an
   HTTP status (``IntegrityError``, ``HTTPException_404``);
 - one of the fixed words below, which callers use where there is no exception.
 
@@ -15,8 +15,14 @@ Everything else is kept as ``unclassified``: sentences, numbers and ids, but als
 single word that merely looks like a code, such as a name or the error code a phone
 reports for itself. Callers still pass strings, so this is where a caller that passes
 text by mistake is stopped.
+
+The registry is the same in every process, because a worker stores a code and the
+start-up script, which has loaded far less, reads it back: it is the exception classes
+that a fixed list of modules export, not the classes a process happens to have loaded.
+An exception of a class outside it is ``unclassified`` too.
 """
 
+import importlib
 import re
 from typing import Any
 
@@ -27,28 +33,65 @@ SDK_IMPORT_FAILED = "sdk_import_failed"
 
 _FIXED_WORDS = frozenset({UNCLASSIFIED, UNKNOWN, ALL_SUBTASKS_FAILED, SDK_IMPORT_FAILED})
 
+# Every module of this backend that defines an exception class. A test finds the classes
+# and fails when one is missing from here.
+_APP_MODULES = (
+    "app.utils.exceptions",
+    "app.integrations.celery.tasks.send_email_task",
+    "app.services.providers.google_health.data_247",
+    "app.services.providers.withings.handlers.rpc_client",
+    "app.services.providers.withings.oauth",
+)
+# The libraries a sync runs on. A class from anywhere else reads "unclassified".
+_LIBRARY_MODULES = (
+    "builtins",
+    "asyncio",
+    "binascii",
+    "concurrent.futures",
+    "decimal",
+    "json",
+    "socket",
+    "ssl",
+    "botocore.exceptions",
+    "celery.exceptions",
+    "fastapi",
+    "fastapi.exceptions",
+    "httpcore",
+    "httpx",
+    "kombu.exceptions",
+    "psycopg",
+    "psycopg.errors",
+    "pydantic",
+    "pydantic_core",
+    "redis.exceptions",
+    "requests.exceptions",
+    "sqlalchemy.exc",
+    "sqlalchemy.orm.exc",
+    "starlette.exceptions",
+    "urllib3.exceptions",
+)
+
 _WITH_STATUS = re.compile(r"(?P<name>.+)_(?P<status>[1-5][0-9]{2})")
 
-_exception_names: frozenset[str] = frozenset()
+_registry: frozenset[str] | None = None
 
 
-def _loaded_exception_names() -> frozenset[str]:
-    seen: set[type] = {BaseException}
-    pending: list[type] = [BaseException]
-    while pending:
-        for subclass in type.__subclasses__(pending.pop()):
-            if subclass not in seen:
-                seen.add(subclass)
-                pending.append(subclass)
-    return frozenset(cls.__name__ for cls in seen)
+def _registered_exception_names() -> frozenset[str]:
+    # Built on first use, not at import: the provider modules import their way back here.
+    global _registry
+    if _registry is None:
+        names: set[str] = set()
+        for module_name in (*_APP_MODULES, *_LIBRARY_MODULES):
+            exported = vars(importlib.import_module(module_name)).values()
+            names.update(
+                item.__name__ for item in exported if isinstance(item, type) and issubclass(item, BaseException)
+            )
+        _registry = frozenset(names)
+    return _registry
 
 
 def _is_exception_name(name: str) -> bool:
-    # Classes keep being loaded, so a miss is checked once more against a fresh set.
-    global _exception_names
-    if name not in _exception_names:
-        _exception_names = _loaded_exception_names()
-    return name in _exception_names
+    return name in _registered_exception_names()
 
 
 def _is_code(text: str) -> bool:

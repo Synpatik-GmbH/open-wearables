@@ -90,10 +90,28 @@ Every event is a JSON object emitted as the `data` field of an SSE message with 
 | `progress`        | `number \| null`      | Optional 0..1 fraction. Not all syncs report this.                                                                   |
 | `items_processed` | `number \| null`      | Items in the run. For SDK uploads: samples and sleep records received, plus workouts newly inserted. See `metadata.inserted` / `metadata.updated` for rows actually written. |
 | `items_total`     | `number \| null`      | Optional total when known.                                                                                           |
-| `metadata`        | `object`              | Provider-specific detail, e.g. `types` (SeriesType slugs written), `inserted`, `updated`.                             |
+| `error`           | `string \| null`      | An error **code**, never the error's message. See [Error codes](#error-codes).                                        |
+| `metadata`        | `object`              | Provider-specific detail, e.g. `types` (SeriesType slugs written), `inserted`, `updated`. A nested `error` is a code too. |
 | `started_at`      | `string \| null`      | ISO-8601 timestamp when the run started.                                                                             |
 | `ended_at`        | `string \| null`      | ISO-8601 timestamp when the run reached a terminal status.                                                           |
 | `timestamp`       | `string`              | ISO-8601 timestamp of this individual event.                                                                         |
+
+### Error codes
+
+`error`, and any `error` nested in `metadata`, holds a code and never the text of the error. The same is true of the `sync.failed` and `sync.completed` webhook payloads and of stored sync runs. An error's text is not bounded: a database error quotes the values being saved, which here are health values and the user id.
+
+A code is one of:
+
+| Code | Meaning |
+| --- | --- |
+| An exception class name, e.g. `IntegrityError`, `ConnectError` | The kind of error that stopped the sync. |
+| A class name with an HTTP status, e.g. `HTTPException_401` | The provider or an upstream service answered with that status. `401` usually means the connection needs re-authorization. |
+| `all_subtasks_failed` | Every part of a provider pull failed. The parts are in `metadata.params`. |
+| `sdk_import_failed` | A batch uploaded by the mobile SDK could not be imported. |
+| `unknown` | The source reported a failure without saying why. |
+| `unclassified` | The source gave a reason that is not a known code, so it was not kept. |
+
+Do not show a code to an end user as a message, and do not match on the wording of an error: there is none. Use `status`, `stage` and `message` for what to show, and the code to tell kinds of failure apart.
 
 ---
 
