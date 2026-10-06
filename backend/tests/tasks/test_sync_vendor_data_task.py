@@ -281,6 +281,51 @@ class TestSyncVendorDataTask:
 
     @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
     @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_a_provider_that_fails_outright_reports_a_code(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        """FORK (2.47.17.2): the failure outside the per-task handlers, in the result too."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin", status=ConnectionStatus.ACTIVE)
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+
+        mock_strategy = MagicMock()
+        mock_strategy.capabilities.rest_pull = True
+        mock_strategy.capabilities.webhook_stream = False
+        # The first call picks the providers to pull; the second is the pull itself.
+        mock_get_provider.side_effect = [mock_strategy, LookupError("value 187.5 for user")]
+
+        result = sync_vendor_data(str(user.id))
+
+        assert result["errors"] == {"garmin": "LookupError"}
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_a_run_that_fails_before_any_provider_reports_a_code(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        """FORK (2.47.17.2): the outermost failure, in the result too."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin", status=ConnectionStatus.ACTIVE)
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+        mock_get_provider.side_effect = RuntimeError("value 187.5 for user")
+
+        result = sync_vendor_data(str(user.id))
+
+        assert result["errors"] == {"general": "RuntimeError"}
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
     def test_sync_vendor_data_sync_returns_false(
         self,
         mock_get_provider: MagicMock,
@@ -383,8 +428,9 @@ class TestSyncVendorDataTask:
 
         # Assert
         assert result["user_id"] == "not-a-valid-uuid"
-        assert "user_id" in result["errors"]
-        assert "Invalid UUID format" in result["errors"]["user_id"]
+        # FORK (2.47.17.2): the task's result is kept in the result backend and logged by
+        # the worker, so it carries the error's class name, never its text.
+        assert result["errors"] == {"user_id": "ValueError"}
 
 
 class TestBuildSyncParams:

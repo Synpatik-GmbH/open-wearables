@@ -15,6 +15,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
 from app.models import SyncRun, SyncRunDataType
@@ -163,6 +164,55 @@ class TestReduceSyncRunErrors:
 
         assert result == {"runs": 3, "data_types": 2}
         assert _everything_stored(db, reload=False) == before
+
+    def test_a_row_another_writer_changed_meanwhile_is_not_overwritten(self, db: Session) -> None:
+        """The pass reads a row, then rewrites it. A worker can store the run's next event in
+        between. What is written must come from the row as it is then, not as it was read."""
+        user = UserFactory()
+        run = _run(db, user.id, error=TEXT, meta={"params": {"workouts": {"error": TEXT}}})
+        _data_type(db, run, "workouts", error=TEXT, error_code=None)
+        db.flush()
+        # Held in a variable on purpose: the session keeps only weak references, and a row
+        # nothing refers to would simply be read afresh.
+        rows_as_first_read = db.query(SyncRunDataType).all()
+        assert [row.error for row in rows_as_first_read] == [TEXT]
+        # The session now holds the rows as first read. Another writer replaces them
+        # underneath it, which a plain query in this session will not notice.
+        db.execute(
+            text("UPDATE sync_run SET error = 'KeyError', meta = CAST(:meta AS json) WHERE id = :id"),
+            {"meta": json.dumps({"inserted_by": "the_newer_event"}), "id": run.id},
+        )
+        db.execute(text("UPDATE sync_run_data_type SET error = 'KeyError' WHERE run_id = :id"), {"id": run.id})
+
+        result = reduce_sync_run_errors(db, dry_run=False)
+
+        assert result == {"runs": 0, "data_types": 0}
+        db.expire_all()
+        assert (run.error, run.meta) == ("KeyError", {"inserted_by": "the_newer_event"})
+        assert [row.error for row in rows_as_first_read] == ["KeyError"]
+
+    def test_a_row_it_rewrites_is_locked_first_and_a_dry_run_locks_nothing(
+        self, db: Session, stored: dict[str, SyncRun]
+    ) -> None:
+        statements: list[str] = []
+
+        def record(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+            statements.append(statement)
+
+        event.listen(db.get_bind(), "before_cursor_execute", record)
+        try:
+            reduce_sync_run_errors(db, dry_run=True)
+            dry_run_locks = [s for s in statements if "FOR UPDATE" in s]
+            statements.clear()
+            reduce_sync_run_errors(db, dry_run=False)
+        finally:
+            event.remove(db.get_bind(), "before_cursor_execute", record)
+
+        assert dry_run_locks == []
+        locks = [s for s in statements if "FOR UPDATE" in s]
+        # One lock per row that needed rewriting: three runs and two per-data-type rows.
+        assert len([s for s in locks if "FROM sync_run " in s or "FROM sync_run\n" in s]) == 3
+        assert len([s for s in locks if "FROM sync_run_data_type" in s]) == 2
 
     def test_it_prints_counts_and_never_the_text(
         self, db: Session, stored: dict[str, SyncRun], capsys: pytest.CaptureFixture[str]

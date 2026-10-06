@@ -512,3 +512,19 @@ class TestTheSweepReducesWhatAnOlderWorkerWrote:
         else:
             assert result["skipped"] is True
         assert result["errors_reduced"] == {"runs": 1, "data_types": 1}
+
+
+class TestThePhoneImportAnswersWithACode:
+    """The import's answer becomes the upload task's result, which the worker logs and the
+    result backend keeps, and it is logged once more on the way."""
+
+    def test_a_failed_import_names_the_error_class_not_its_text(self, db: Session) -> None:
+        from app.services.sdk.import_service import import_service
+
+        user = UserFactory()
+
+        with patch.object(import_service, "_parse_json_content", side_effect=RuntimeError(DB_ERROR_TEXT)):
+            response = import_service.import_data_from_request(db, "{}", "application/json", str(user.id))
+
+        assert response.status_code == 400
+        assert response.response == "Import failed: RuntimeError"

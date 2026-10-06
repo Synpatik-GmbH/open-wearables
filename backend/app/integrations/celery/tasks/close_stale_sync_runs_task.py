@@ -33,8 +33,9 @@ def close_stale_sync_runs() -> dict:
     with SessionLocal() as db:
         # FORK (data protection, Notion 2.47.17.2): first, so that no early return skips it.
         errors_reduced = reduce_stored_sync_errors(db, since=now - ERROR_CLEANUP_WINDOW)
+        # Always, not only when something was rewritten: it also releases the row locks.
+        db.commit()
         if any(errors_reduced.values()):
-            db.commit()
             log_structured(
                 logger,
                 "warning",

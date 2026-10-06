@@ -28,7 +28,7 @@ from app.services.sync_coordination import (
     release_stale_primary,
     try_become_primary,
 )
-from app.services.sync_error_code import ALL_SUBTASKS_FAILED, error_code
+from app.services.sync_error_code import ALL_SUBTASKS_FAILED, UNCLASSIFIED, error_code
 from app.services.sync_status_service import (
     emit_sync_completed,
     emit_sync_failed,
@@ -131,7 +131,8 @@ def sync_vendor_data(
             user_id=user_id,
             start_date=start_date,
             end_date=end_date,
-            errors={"user_id": f"Invalid UUID format: {str(e)}"},
+            # FORK (2.47.17.2): the result is stored and logged, so a code, as below.
+            errors={"user_id": error_code(e) or UNCLASSIFIED},
         ).model_dump()
 
     result = SyncVendorDataResult(
@@ -626,7 +627,7 @@ def sync_vendor_data(
                             "trace_id": trace_id,
                         },
                     )
-                    result.errors[provider_name] = str(e)
+                    result.errors[provider_name] = error_code(e) or UNCLASSIFIED
                     continue
                 finally:
                     clear_primary_lease()
@@ -640,5 +641,5 @@ def sync_vendor_data(
                 f"Error processing user {user_id}: {str(e)}",
                 extra={"user_id": user_id, "task": "sync_vendor_data", "trace_id": trace_id},
             )
-            result.errors["general"] = str(e)
+            result.errors["general"] = error_code(e) or UNCLASSIFIED
             return result.model_dump()
