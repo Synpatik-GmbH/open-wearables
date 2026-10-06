@@ -15,6 +15,10 @@ no-ops. It runs on every API start and reads every row. A worker still on the ol
 image can write one more row after that; the periodic close_stale_sync_runs task makes
 the same pass over recent rows, so such a row is reduced within one sweep interval.
 
+Neither of those can promise to come after the last write of an older image, so the
+rollout that first carries this ends with one run by hand, after the last app has
+moved (FORK-DELTA.md). A second run then reports nothing left.
+
 Usage (inside Docker):
     docker compose exec app uv run python scripts/data_migrations/reduce_sync_run_errors_to_codes.py --dry-run
     docker compose exec app uv run python scripts/data_migrations/reduce_sync_run_errors_to_codes.py
