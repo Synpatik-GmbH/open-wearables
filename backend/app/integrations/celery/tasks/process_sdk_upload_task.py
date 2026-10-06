@@ -266,7 +266,7 @@ def process_sdk_upload(
                 SyncSource.SDK,
                 scope=scope,
                 run_id=run_id,
-                error=str(result.get("response", "Unknown error")),
+                error="sdk_import_failed",
                 message=f"{provider.capitalize()} batch failed",
                 metadata={"batch_id": batch_id, "status_code": status_code},
             )

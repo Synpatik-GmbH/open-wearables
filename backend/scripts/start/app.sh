@@ -49,6 +49,13 @@ echo 'Running Whoop strain event_record backfill...'
 uv run python scripts/data_migrations/backfill_whoop_strain_event_record.py \
     || echo "Warning: Whoop strain backfill failed — will retry on next startup."
 
+# FORK (data protection, Notion 2.47.17.2): reduces stored sync errors to codes. Stays
+# for as long as an image that stored the error's text could still be running beside
+# this one. Idempotent, prints counts only.
+echo 'Reducing stored sync errors to codes...'
+uv run python scripts/data_migrations/reduce_sync_run_errors_to_codes.py \
+    || echo "Warning: reducing stored sync errors failed — will retry on next startup."
+
 # Initialize archival settings
 echo 'Initializing archival settings...'
 uv run python scripts/init/seed_archival_settings.py

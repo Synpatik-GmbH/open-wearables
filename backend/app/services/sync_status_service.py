@@ -47,6 +47,7 @@ from app.schemas.sync_status import (
     SyncStatus,
     SyncStatusEvent,
 )
+from app.services.sync_error_code import error_code, without_error_text
 from app.utils.context import trace_id_var
 from app.utils.sse import format_comment, format_event
 from app.utils.structured_logging import log_structured
@@ -189,7 +190,13 @@ def try_record_data_types(run_key: str, outcomes: list[DataTypeOutcome], *, scop
             sync_run_repository.upsert_data_types(
                 db,
                 run_id=run.id,
-                outcomes=outcomes,
+                # FORK (data protection, 2.47.17.2): codes, never the error's text.
+                outcomes=[
+                    outcome.model_copy(
+                        update={"error": error_code(outcome.error), "error_code": error_code(outcome.error_code)},
+                    )
+                    for outcome in outcomes
+                ],
                 updated_at=datetime.now(timezone.utc),
             )
     except Exception as exc:
@@ -199,7 +206,8 @@ def try_record_data_types(run_key: str, outcomes: list[DataTypeOutcome], *, scop
             "Failed to record sync run data types",
             action="sync_run_data_types_failed",
             run_id=run_key,
-            error=str(exc),
+            # FORK (data protection): the error's type, as in try_persist_run above.
+            error=type(exc).__name__,
         )
 
 
@@ -243,6 +251,12 @@ def emit(event: SyncStatusEvent) -> None:
     Failures are logged but never raised — sync flow must not be blocked
     by Redis problems.
     """
+    # FORK (data protection, 2.47.17.2): every path below (the log line, the stored run,
+    # Redis, the outgoing webhook) gets an error code, never the error's text.
+    event = event.model_copy(
+        update={"error": error_code(event.error), "metadata": without_error_text(event.metadata)},
+    )
+
     # Mirror the SSE event into the structured logs so sync outcome metadata
     # (status, item counts, inserted/updated split, message) is queryable in the
     # deployment logs, not only on the frontend stream.

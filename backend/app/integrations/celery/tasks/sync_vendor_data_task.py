@@ -28,6 +28,7 @@ from app.services.sync_coordination import (
     release_stale_primary,
     try_become_primary,
 )
+from app.services.sync_error_code import error_code
 from app.services.sync_status_service import (
     emit_sync_completed,
     emit_sync_failed,
@@ -377,14 +378,14 @@ def sync_vendor_data(
                                     "trace_id": trace_id,
                                 },
                             )
-                            provider_result.params["workouts"] = {"success": False, "error": str(e)}
+                            provider_result.params["workouts"] = {"success": False, "error": error_code(e)}
                             data_type_outcomes.append(
                                 DataTypeOutcome(
                                     data_type="workouts",
                                     kind=DataTypeKind.TASK,
                                     native_type="workouts",
                                     status=SyncStatus.FAILED,
-                                    error=str(e),
+                                    error=error_code(e),
                                 )
                             )
 
@@ -479,14 +480,14 @@ def sync_vendor_data(
                                     "trace_id": trace_id,
                                 },
                             )
-                            provider_result.params["data_247"] = {"success": False, "error": str(e)}
+                            provider_result.params["data_247"] = {"success": False, "error": error_code(e)}
                             data_type_outcomes.append(
                                 DataTypeOutcome(
                                     data_type="data_247",
                                     kind=DataTypeKind.TASK,
                                     native_type="data_247",
                                     status=SyncStatus.FAILED,
-                                    error=str(e),
+                                    error=error_code(e),
                                 )
                             )
 
@@ -550,7 +551,7 @@ def sync_vendor_data(
                             sync_source,
                             scope=sync_scope,
                             run_id=run_id,
-                            error="All sync sub-tasks failed",
+                            error="all_subtasks_failed",
                             message=f"Sync from {provider_name} failed",
                             primary_user_id=primary_uuid,
                             metadata={"is_historical": is_historical, "params": provider_result.params},
@@ -610,7 +611,7 @@ def sync_vendor_data(
                         sync_source,
                         scope=sync_scope,
                         run_id=run_id,
-                        error=str(e),
+                        error=error_code(e),
                         message=f"Sync from {provider_name} failed",
                         metadata={"is_historical": is_historical},
                     )

@@ -244,7 +244,40 @@ class TestSyncVendorDataTask:
         assert str(result["user_id"]) == str(user.id)
         assert "garmin" in result["providers_synced"]
         assert result["providers_synced"]["garmin"]["params"]["workouts"]["success"] is False
-        assert "Provider API unavailable" in result["providers_synced"]["garmin"]["params"]["workouts"]["error"]
+        # FORK (2.47.17.2): the error's class name, never its text. The result is also
+        # written to the worker's log and the Celery result backend.
+        assert result["providers_synced"]["garmin"]["params"]["workouts"]["error"] == "Exception"
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_sync_vendor_data_247_error_is_a_code(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        """FORK (2.47.17.2): a failed 24/7 load reports the error's class name, never its text."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin", status=ConnectionStatus.ACTIVE)
+
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+
+        mock_247 = MagicMock()
+        mock_247.load_and_save_all.side_effect = KeyError("value 187.5 for user")
+        mock_247.load_all_247_data.side_effect = KeyError("value 187.5 for user")
+
+        mock_strategy = MagicMock()
+        mock_strategy.capabilities.rest_pull = True
+        mock_strategy.capabilities.webhook_stream = False
+        mock_strategy.workouts = None
+        mock_strategy.data_247 = mock_247
+        mock_get_provider.return_value = mock_strategy
+
+        result = sync_vendor_data(str(user.id))
+
+        assert result["providers_synced"]["garmin"]["params"]["data_247"] == {"success": False, "error": "KeyError"}
 
     @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
     @patch("app.services.providers.factory.ProviderFactory.get_provider")
