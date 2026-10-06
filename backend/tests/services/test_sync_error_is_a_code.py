@@ -278,6 +278,21 @@ class TestEmitLeavesNoErrorText:
         _wait_for(outgoing["completed"])
         _assert_clean(json.dumps(outgoing["completed"].call_args.kwargs, default=str))
 
+    def test_what_the_caller_gets_back(self, outgoing: dict[str, MagicMock]) -> None:
+        """The helpers return the event. It is the one that was stored and sent."""
+        returned = sync_status_service.emit_sync_failed(
+            uuid4(),
+            "whoop",
+            SyncSource.PULL,
+            run_id="pull_returned",
+            error=DB_ERROR_TEXT,
+            metadata={"params": {"workouts": {"error": DB_ERROR_TEXT}}},
+        )
+
+        assert returned.error == UNCLASSIFIED
+        assert returned.metadata == {"params": {"workouts": {"error": UNCLASSIFIED}}}
+        assert sync_status_service.emit(_event(uuid4(), scope=SyncScope.LIVE)).error == UNCLASSIFIED
+
     def test_the_log_line(
         self, outgoing: dict[str, MagicMock], capfd: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
     ) -> None:

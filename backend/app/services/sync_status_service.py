@@ -245,8 +245,8 @@ def get_stored_run(db: DbSession, run_key: str) -> SyncRunDetail | None:
     return SyncRunDetail.model_validate(run) if run is not None else None
 
 
-def emit(event: SyncStatusEvent) -> None:
-    """Persist and broadcast a sync status event.
+def emit(event: SyncStatusEvent) -> SyncStatusEvent:
+    """Persist and broadcast a sync status event, returning it as it was stored and sent.
 
     Failures are logged but never raised — sync flow must not be blocked
     by Redis problems.
@@ -329,6 +329,8 @@ def emit(event: SyncStatusEvent) -> None:
         args=(event,),
         daemon=True,
     ).start()
+
+    return event
 
 
 def _maybe_dispatch_outgoing_webhook(event: SyncStatusEvent) -> None:
@@ -421,8 +423,8 @@ def emit_event(
         started_at=started_at,
         ended_at=ended_at,
     )
-    emit(event)
-    return event
+    # FORK (data protection, 2.47.17.2): the event as emit() reduced it, not as it was built.
+    return emit(event)
 
 
 def last_event_at(run_ids: list[str]) -> dict[str, datetime] | None:
