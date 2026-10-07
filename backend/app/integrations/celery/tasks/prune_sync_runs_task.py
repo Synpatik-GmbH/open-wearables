@@ -37,7 +37,7 @@ def prune_old_sync_runs() -> dict:
     log_structured(
         logger,
         "info",
-        f"Removed {removed_count} sync run(s) stored more than {retention_days} days ago",
+        "Removed the sync runs stored before the retention period",
         action="sync_run_prune_complete",
         removed_count=removed_count,
         retention_days=retention_days,

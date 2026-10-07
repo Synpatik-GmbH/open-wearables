@@ -17,6 +17,7 @@ from celery.schedules import crontab
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+import app.integrations.celery.tasks as tasks
 from app.config import settings
 from app.integrations.celery.core import create_celery
 from app.integrations.celery.tasks import prune_sync_runs_task as task_module
@@ -238,6 +239,22 @@ class TestWhatTheRunReports:
         assert log.call_args.kwargs["retention_days"] == 90
         assert log.call_args.kwargs["oldest_remaining_age_days"] == pytest.approx(3, abs=0.1)
 
+    def test_the_log_message_is_the_same_whatever_was_removed(self, task_db: Session) -> None:
+        """The numbers are attributes, so the line can be found by its message (AGENTS.md)."""
+        user = UserFactory()
+        _store(task_db, user.id, stored=timedelta(days=30))
+        messages = []
+        for retention_days in (90, 7):
+            with (
+                patch.object(task_module, "log_structured") as log,
+                patch.object(settings, "sync_run_retention_days", retention_days),
+            ):
+                prune_old_sync_runs()
+            messages.append(log.call_args.args[2])
+            assert log.call_args.kwargs["removed_count"] == (0 if retention_days == 90 else 1)
+
+        assert messages[0] == messages[1]
+
     def test_the_log_line_carries_no_user_or_run(self, task_db: Session) -> None:
         user = UserFactory()
         user_id = str(user.id)
@@ -266,8 +283,6 @@ class TestTheSchedule:
         assert entry["schedule"].day_of_month == set(range(1, 32))
 
     def test_the_task_is_one_a_worker_loads(self) -> None:
-        import app.integrations.celery.tasks as tasks
-
         assert tasks.prune_old_sync_runs is prune_old_sync_runs
         assert "prune_old_sync_runs" in tasks.__all__
 
