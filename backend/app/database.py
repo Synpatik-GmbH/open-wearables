@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import Depends
 from sqlalchemy import UUID as SQL_UUID
-from sqlalchemy import Date, DateTime, Engine, String, Text, create_engine, func, inspect
+from sqlalchemy import Date, DateTime, Engine, String, Text, create_engine, event, func, inspect
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -26,7 +26,12 @@ from app.schemas.auth import ConnectionStatus, LiveSyncMode, TokenType
 from app.schemas.enums import AggregationMethod, DataGranularity, HealthScoreCategory, ProviderName
 from app.schemas.model_crud.user_management import InvitationStatus
 from app.schemas.sync_status import SyncScope, SyncSource, SyncStatus
+from app.utils.database_error_text import reduce_database_error
 from app.utils.mappings_meta import AutoRelMeta
+
+# FORK (data protection, Notion 2.47.17.3): on the Engine class, so that no engine in the
+# process raises a database error with the database's message in it. See the module.
+event.listen(Engine, "handle_error", reduce_database_error)
 
 engine = create_engine(
     settings.db_uri,
