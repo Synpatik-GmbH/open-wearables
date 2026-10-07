@@ -172,7 +172,8 @@ class SyncRunDataTypeRecord(BaseModel):
 
 
 class SyncRunRecord(BaseModel):
-    """A stored sync run. Unlike the Redis-backed summaries this is not time limited."""
+    """A stored sync run. Unlike the Redis-backed summaries it is not limited to 24 hours:
+    it is removed `SYNC_RUN_RETENTION_DAYS` (90 by default) after it was stored."""
 
     model_config = ConfigDict(from_attributes=True)
 

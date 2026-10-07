@@ -191,6 +191,7 @@ def list_stored_sync_runs(
 
     Unlike /sync/runs this reads from the database rather than the Redis event buffer,
     so it is not limited to the last 24 hours. Only historical runs are stored by default.
+    A stored run is removed `SYNC_RUN_RETENTION_DAYS` (90 by default) after it was stored.
     Use /sync/history/{run_key} for the per-data-type breakdown.
 
     `since` filters on when a run executed. `covered_from` / `covered_to` filter on the span
@@ -218,7 +219,11 @@ def get_stored_sync_run(
     db: DbSession,
     _api_key: ApiKeyDep,
 ) -> SyncRunDetail:
-    """One stored sync run with its per-data-type breakdown."""
+    """One stored sync run with its per-data-type breakdown.
+
+    A stored run is removed `SYNC_RUN_RETENTION_DAYS` (90 by default) after it was stored,
+    and is not found from then on.
+    """
     run = get_stored_run(db, run_key)
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sync run not found")

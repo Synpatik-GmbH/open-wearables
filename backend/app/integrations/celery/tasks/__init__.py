@@ -31,6 +31,7 @@ from .periodic_sync_task import sync_all_users
 from .process_aws_upload_task import complete_and_process_aws_upload, process_aws_upload
 from .process_sdk_upload_task import process_sdk_upload
 from .process_xml_upload_task import process_xml_upload
+from .prune_sync_runs_task import prune_old_sync_runs
 from .refresh_dashboard_stats_task import refresh_dashboard_total_data_points
 from .register_provider_webhooks_task import register_provider_webhooks, register_user_webhooks
 from .renew_oura_webhooks_task import renew_oura_webhooks
@@ -58,6 +59,7 @@ __all__ = [
     "fill_missing_resilience_scores",
     # Other tasks
     "close_stale_sync_runs",
+    "prune_old_sync_runs",
     "finalize_stale_sleeps",
     "finalize_workout_zones",
     "process_sdk_upload",
