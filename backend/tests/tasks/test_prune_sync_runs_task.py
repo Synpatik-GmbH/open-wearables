@@ -129,8 +129,8 @@ class TestWhichRunsAreRemoved:
         assert _stored_keys(task_db) == set()
 
     def test_the_age_is_counted_from_when_the_run_was_stored(self, task_db: Session) -> None:
-        """started_at and updated_at come from the event, which for an SDK run is the
-        device's clock. Only created_at is this server's."""
+        """created_at is set by the database when the row is first stored. started_at and
+        updated_at are copied from the event, and updated_at moves with every later one."""
         user = UserFactory()
         now = datetime.now(timezone.utc)
         _store(task_db, user.id, stored=PERIOD + MARGIN, started_at=now, updated_at=now, run_key="pull_stored_long_ago")

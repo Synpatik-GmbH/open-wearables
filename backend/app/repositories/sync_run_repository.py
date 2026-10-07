@@ -256,10 +256,11 @@ class SyncRunRepository:
     def delete_stored_before(self, db_session: DbSession, cutoff: datetime) -> int:
         """Remove every run stored before the cutoff, returning how many.
 
-        On created_at, the one timestamp this server sets: started_at and updated_at are
-        the event's, which for an SDK run is the device's clock. The per-data-type rows
-        go with their run through the foreign key. No index serves this, so it reads the
-        table, which this delete is what keeps small.
+        On created_at, which the database sets when the row is first stored and nothing
+        changes after: started_at and updated_at are copied from the event. A run key that
+        is used again keeps its one row, so its age counts from the first time. The
+        per-data-type rows go with their run through the foreign key. No index serves
+        this, so it reads the table, which this delete is what keeps small.
         """
         stmt = delete(SyncRun).where(SyncRun.created_at < cutoff).returning(SyncRun.id)
         removed = len(db_session.scalars(stmt).all())
