@@ -158,6 +158,9 @@ class Settings(BaseSettings):
     # not the whole run: the sweep leaves anything still reporting in Redis alone.
     sync_run_stale_after_hours: int = Field(2, ge=1)
     sync_run_sweep_interval_seconds: int = Field(1800, ge=60)
+    # FORK (data protection, Notion 2.47.17.1): a stored run is removed this many days
+    # after it was stored. Not zero: that would remove a run while its sync is going.
+    sync_run_retention_days: int = Field(90, ge=1)
 
     # API SETTINGS
     api_base_url: str = "http://localhost:8000"

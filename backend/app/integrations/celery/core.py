@@ -172,6 +172,13 @@ def create_celery() -> Celery:
             "args": (),
             "kwargs": {},
         },
+        # FORK (data protection, Notion 2.47.17.1).
+        "prune-old-sync-runs": {
+            "task": "app.integrations.celery.tasks.prune_sync_runs_task.prune_old_sync_runs",
+            "schedule": crontab(hour=3, minute=30),  # Daily at 03:30 UTC
+            "args": (),
+            "kwargs": {},
+        },
         "renew-oura-webhooks-monthly": {
             "task": "app.integrations.celery.tasks.renew_oura_webhooks_task.renew_oura_webhooks",
             "schedule": crontab(day_of_month=1, hour=0, minute=0),  # 1st of each month at 00:00 UTC

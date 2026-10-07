@@ -191,6 +191,7 @@ def list_stored_sync_runs(
 
     Unlike /sync/runs this reads from the database rather than the Redis event buffer,
     so it is not limited to the last 24 hours. Only historical runs are stored by default.
+    A stored run is removed `SYNC_RUN_RETENTION_DAYS` (90 by default) after it was stored.
     Use /sync/history/{run_key} for the per-data-type breakdown.
 
     `since` filters on when a run executed. `covered_from` / `covered_to` filter on the span
