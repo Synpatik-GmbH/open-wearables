@@ -198,6 +198,15 @@ class TestWhatTheRunReports:
         assert result["retention_days"] == 90
         assert result["oldest_remaining_age_days"] == pytest.approx(40, abs=0.1)
 
+    def test_that_age_is_counted_from_when_the_run_was_stored_too(self, task_db: Session) -> None:
+        user = UserFactory()
+        long_ago = datetime.now(timezone.utc) - timedelta(days=80)
+        _store(task_db, user.id, stored=timedelta(days=2), started_at=long_ago, updated_at=long_ago)
+
+        result = prune_old_sync_runs()
+
+        assert result["oldest_remaining_age_days"] == pytest.approx(2, abs=0.1)
+
     def test_the_age_is_none_when_no_run_is_left(self, task_db: Session) -> None:
         user = UserFactory()
         _store(task_db, user.id, stored=PERIOD + MARGIN)
