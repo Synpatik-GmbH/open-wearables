@@ -22,6 +22,7 @@ from app.config import settings
 from app.integrations.celery.core import create_celery
 from app.integrations.celery.tasks import prune_sync_runs_task as task_module
 from app.integrations.celery.tasks.prune_sync_runs_task import prune_old_sync_runs
+from app.main import api
 from app.models import SyncRun, SyncRunDataType
 from app.schemas.sync_status import DataTypeKind, SyncScope, SyncSource, SyncStatus
 from tests.factories import UserFactory
@@ -285,6 +286,27 @@ class TestTheSchedule:
     def test_the_task_is_one_a_worker_loads(self) -> None:
         assert tasks.prune_old_sync_runs is prune_old_sync_runs
         assert "prune_old_sync_runs" in tasks.__all__
+
+
+class TestWhatTheApiSays:
+    """A caller reads the stored runs through two routes. Each has to say they are removed."""
+
+    @pytest.mark.parametrize(
+        "path",
+        ["/api/v1/users/{user_id}/sync/history", "/api/v1/sync/history/{run_key}"],
+    )
+    def test_each_stored_run_route_names_the_period(self, path: str) -> None:
+        description = api.openapi()["paths"][path]["get"]["description"]
+
+        assert "SYNC_RUN_RETENTION_DAYS" in description
+
+    def test_the_stored_run_schema_names_the_period(self) -> None:
+        description = api.openapi()["components"]["schemas"]["SyncRunRecord"]["description"]
+
+        assert "SYNC_RUN_RETENTION_DAYS" in description
+
+    def test_nothing_in_the_api_says_stored_runs_are_kept_without_limit(self) -> None:
+        assert "not time limited" not in str(api.openapi())
 
 
 class TestAFailure:

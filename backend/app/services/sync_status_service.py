@@ -228,7 +228,8 @@ def list_stored_runs(
 ) -> list[SyncRunRecord]:
     """Stored runs for a user, newest first.
 
-    Reads Postgres rather than the Redis buffer, so it is not capped at 24h.
+    Reads Postgres rather than the Redis buffer, so it is not capped at 24h. A stored run
+    is removed sync_run_retention_days after it was stored (prune_old_sync_runs).
     """
     runs = sync_run_repository.list_for_user(
         db,
