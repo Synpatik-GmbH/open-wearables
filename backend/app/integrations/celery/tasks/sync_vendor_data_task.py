@@ -13,6 +13,7 @@ from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.auth import LiveSyncMode
 from app.schemas.responses.upload import ProviderSyncResult, SyncVendorDataResult
 from app.schemas.sync_status import (
+    DataTypeFailure,
     DataTypeKind,
     DataTypeOutcome,
     SyncScope,
@@ -363,24 +364,17 @@ def sync_vendor_data(
                                 )
                             )
                         except Exception as e:
+                            # FORK (2.96.6.1, spec cause 3): a failure is logged as a code, never
+                            # the exception's text (R-2026-10-06-b); no traceback.
                             log_structured(
                                 logger,
                                 "warning",
-                                f"Workouts sync failed for {provider_name}: {e}",
+                                "Workouts sync failed",
                                 provider=provider_name,
                                 task="sync_vendor_data",
                                 user_id=user_id,
-                            )
-                            log_and_capture_error(
-                                e,
-                                logger,
-                                f"Workouts sync failed for {provider_name}: {e}",
-                                extra={
-                                    "user_id": user_id,
-                                    "provider": provider_name,
-                                    "task": "sync_vendor_data",
-                                    "trace_id": trace_id,
-                                },
+                                trace_id=trace_id,
+                                error_code=error_code(e),
                             )
                             provider_result.params["workouts"] = {"success": False, "error": error_code(e)}
                             data_type_outcomes.append(
@@ -420,10 +414,31 @@ def sync_vendor_data(
                                     end_time=end_dt,
                                     is_first_sync=is_first_sync,
                                 )
-                                provider_result.params["data_247"] = {"success": True, "saved": True, **results_247}
+                                provider_result.params["data_247"] = {
+                                    "success": True,
+                                    "saved": True,
+                                    **{
+                                        k: {"error": v.code} if isinstance(v, DataTypeFailure) else v
+                                        for k, v in results_247.items()
+                                    },
+                                }
                                 for _task, _count in results_247.items():
                                     # Some providers put flags in the same dict as counts.
                                     if _task in _NON_COUNT_RESULT_KEYS:
+                                        continue
+                                    # FORK (2.96.6.1, spec cause 3, AC4/AC5): a type the provider
+                                    # reports as failed is FAILED with its code, not "nothing new".
+                                    if isinstance(_count, DataTypeFailure):
+                                        data_type_outcomes.append(
+                                            DataTypeOutcome(
+                                                data_type=_task,
+                                                kind=DataTypeKind.TASK,
+                                                native_type=_task,
+                                                status=SyncStatus.FAILED,
+                                                items_inserted=_count.saved,
+                                                error_code=_count.code,
+                                            )
+                                        )
                                         continue
                                     pull_inserted += getattr(_count, "inserted", 0)
                                     pull_updated += getattr(_count, "updated", 0)
@@ -465,24 +480,17 @@ def sync_vendor_data(
                                 user_id=user_id,
                             )
                         except Exception as e:
+                            # FORK (2.96.6.1, spec cause 3): a failure is logged as a code, never
+                            # the exception's text (R-2026-10-06-b); no traceback.
                             log_structured(
                                 logger,
                                 "warning",
-                                f"247 data sync failed for {provider_name}: {e}",
+                                "247 data sync failed",
                                 provider=provider_name,
                                 task="sync_vendor_data",
                                 user_id=user_id,
-                            )
-                            log_and_capture_error(
-                                e,
-                                logger,
-                                f"247 data sync failed for {provider_name}: {e}",
-                                extra={
-                                    "user_id": user_id,
-                                    "provider": provider_name,
-                                    "task": "sync_vendor_data",
-                                    "trace_id": trace_id,
-                                },
+                                trace_id=trace_id,
+                                error_code=error_code(e),
                             )
                             provider_result.params["data_247"] = {"success": False, "error": error_code(e)}
                             data_type_outcomes.append(
@@ -495,7 +503,9 @@ def sync_vendor_data(
                                 )
                             )
 
-                    if not is_historical:
+                    # FORK (2.96.6.1, spec cause 3, AC4): the cursor does not move past a pull in
+                    # which any data type failed, so the next pull asks for that span again.
+                    if not is_historical and not any(o.status == SyncStatus.FAILED for o in data_type_outcomes):
                         user_connection_repo.update_last_synced_at(db, connection)
 
                     if shared_token and connection.provider_user_id:
@@ -560,6 +570,9 @@ def sync_vendor_data(
                             primary_user_id=primary_uuid,
                             metadata={"is_historical": is_historical, "params": provider_result.params},
                         )
+                        # FORK (2.96.6.1, AC5): a failed run keeps its per-type outcomes too, so the
+                        # failure record says which type failed and with what code.
+                        try_record_data_types(run_id, data_type_outcomes, scope=sync_scope)
                     else:
                         # inserted/updated are run-level totals across all timeseries
                         # types: a single sync (historical included) can have both —
