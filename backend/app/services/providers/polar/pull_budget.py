@@ -14,7 +14,14 @@ Three rules, all read and written here, all keyed on the Polar connection:
   fetches its short form or nothing. ``FULL_INTERVAL`` plus one pull interval stays under 24
   hours, so data Polar serves late is stored within 24 hours of being served (AC2).
 - A 429 ends the pull (``RATE_LIMITED``): every later call in it would be refused too. What was
-  not fetched is still due, so the next pull asks for it again (spec cause 3).
+  not asked is still due, so the next pull asks for it.
+- Spec cause 3, AC4 (v0.6): a full fetch that failed is asked for again after a gap that doubles
+  from ``RETRY_FIRST_GAP`` up to ``RETRY_MAX_GAP`` (``record_full_failure``), until it succeeds;
+  its window moves on, so a date in it is dropped once it is older than 90 days. With pulls at
+  most an hour apart, ``RETRY_MAX_GAP`` keeps every failed type asked for at least once every 22
+  hours, while a Polar failing on every endpoint costs a member 136 calls on the worst-case day
+  (``test_a_day_on_which_polar_fails_every_endpoint_stays_inside_the_limit``).
+  The short forms are not held back: the newest night is asked for on every pull.
 - Spec R2: Polar is asked for last night when the member opens the app (``polar/last_night.py``),
   past the pull interval, at most once every ``ON_OPEN_INTERVAL`` and ``ON_OPEN_DAILY_CAP`` times a
   Berlin day (``claim_on_open``). Each costs at most three calls, so a day of them adds at most 36
@@ -38,6 +45,8 @@ from app.models import PolarPullState
 
 PULL_INTERVAL = timedelta(minutes=55)
 FULL_INTERVAL = timedelta(hours=22)
+RETRY_FIRST_GAP = timedelta(hours=1)
+RETRY_MAX_GAP = timedelta(hours=21)
 ON_OPEN_INTERVAL = timedelta(seconds=30)
 ON_OPEN_DAILY_CAP = 12
 
@@ -69,18 +78,22 @@ def claim_pull(db: DbSession, connection_id: UUID, now: datetime, *, ignore_inte
         claimed = db.execute(stmt.returning(PolarPullState.user_connection_id)).first() is not None
         db.commit()
     except Exception:
-        # Leave the pull's session usable: the caller lets the pull run when the claim fails.
+        # Leave the pull's session usable: the caller skips the pull and records why.
         db.rollback()
         raise
     return claimed
 
 
 def full_due(db: DbSession, connection_id: UUID, now: datetime, data_types: Iterable[str]) -> frozenset[str]:
-    """The data types among ``data_types`` that this pull fetches in full."""
+    """The data types among ``data_types`` that this pull fetches in full: those with no full fetch
+    in the last ``FULL_INTERVAL``, unless a failed one's retry gap has not passed yet."""
     state = db.get(PolarPullState, connection_id)
     fetched = state.full_fetched_at if state is not None else {}
+    retries = (state.full_retry if state is not None else None) or {}
     due = set()
     for data_type in data_types:
+        if not _gap_passed(retries.get(data_type), now):
+            continue
         try:
             last = datetime.fromisoformat(fetched[data_type])
         except (KeyError, TypeError, ValueError):
@@ -92,6 +105,16 @@ def full_due(db: DbSession, connection_id: UUID, now: datetime, data_types: Iter
     return frozenset(due)
 
 
+def _gap_passed(retry: object, now: datetime) -> bool:
+    """True when no retry gap holds the type back. A value this code cannot read holds nothing."""
+    if not isinstance(retry, dict):
+        return True
+    try:
+        return now >= datetime.fromisoformat(retry["next"])
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
 def record_full_fetch(db: DbSession, connection_id: UUID, data_type: str, now: datetime) -> None:
     """``data_type`` was fetched in full at ``now`` without failing."""
     stamp = type_coerce({data_type: now.isoformat()}, JSONB)
@@ -99,18 +122,36 @@ def record_full_fetch(db: DbSession, connection_id: UUID, data_type: str, now: d
     stmt = insert(PolarPullState).values(user_connection_id=connection_id, full_fetched_at=stamp)
     stmt = stmt.on_conflict_do_update(
         index_elements=[PolarPullState.user_connection_id],
-        set_={"full_fetched_at": PolarPullState.full_fetched_at.op("||")(stamp)},
+        set_={
+            "full_fetched_at": PolarPullState.full_fetched_at.op("||")(stamp),
+            # A success ends the type's retry gaps: the next failure starts again at the first.
+            "full_retry": PolarPullState.full_retry.op("-")(literal(data_type)),
+        },
     )
     db.execute(stmt)
     db.commit()
 
 
-def forget_full_fetch(db: DbSession, connection_id: UUID, data_type: str) -> None:
-    """Make ``data_type`` due in full on the next pull: its short form failed (spec cause 3)."""
-    db.query(PolarPullState).filter(PolarPullState.user_connection_id == connection_id).update(
-        {PolarPullState.full_fetched_at: PolarPullState.full_fetched_at.op("-")(literal(data_type))},
-        synchronize_session=False,
+def record_full_failure(db: DbSession, connection_id: UUID, data_type: str, now: datetime) -> None:
+    """``data_type`` failed in full at ``now``: it is not asked for again until its gap has passed.
+
+    The gap is ``RETRY_FIRST_GAP`` after the first failure in a row and doubles with each one
+    after, up to ``RETRY_MAX_GAP``. A connection's pulls are one at a time (``claim_pull``), so
+    reading the count and writing the next one is not raced.
+    """
+    state = db.get(PolarPullState, connection_id)
+    previous = ((state.full_retry if state is not None else None) or {}).get(data_type)
+    failures = previous.get("failures", 0) if isinstance(previous, dict) else 0
+    if not isinstance(failures, int) or failures < 0:
+        failures = 0
+    gap = min(RETRY_FIRST_GAP * (2 ** min(failures, 16)), RETRY_MAX_GAP)
+    entry = type_coerce({data_type: {"failures": failures + 1, "next": (now + gap).isoformat()}}, JSONB)
+    stmt = insert(PolarPullState).values(user_connection_id=connection_id, full_retry=entry)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[PolarPullState.user_connection_id],
+        set_={"full_retry": PolarPullState.full_retry.op("||")(entry)},
     )
+    db.execute(stmt)
     db.commit()
 
 
@@ -162,10 +203,12 @@ __all__ = [
     "ON_OPEN_INTERVAL",
     "PULL_INTERVAL",
     "RATE_LIMITED",
+    "RETRY_FIRST_GAP",
+    "RETRY_MAX_GAP",
     "TOO_SOON",
     "claim_on_open",
     "claim_pull",
-    "forget_full_fetch",
     "full_due",
+    "record_full_failure",
     "record_full_fetch",
 ]

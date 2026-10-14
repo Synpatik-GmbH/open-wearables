@@ -10,6 +10,7 @@ from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
+from freezegun import freeze_time
 from sqlalchemy.orm import Session
 
 from app.models import DataSource, EventRecord, HealthScore, User, UserConnection
@@ -58,6 +59,10 @@ class FakePolar:
         self.failure_status = 503
         # Every endpoint answers 429 (Polar's daily limit is spent).
         self.rate_limited = False
+        # Every endpoint answers failure_status (Polar is down).
+        self.failing_all = False
+        # A night that fails with its own status, ahead of failing_nights.
+        self.night_statuses: dict[date, int] = {}
         # The sleep score each night carries, when set.
         self.sleep_score: int | None = None
         # Entries /sleep/available lists ahead of the nights, as given (a malformed one, say).
@@ -69,6 +74,8 @@ class FakePolar:
         self.calls.append((endpoint, params))
         if self.rate_limited:
             raise HTTPException(status_code=429, detail="Polar API error: rate limit")
+        if self.failing_all:
+            raise HTTPException(status_code=self.failure_status, detail="Polar API error: down")
         if endpoint in self.failing_endpoints:
             raise HTTPException(
                 status_code=self.failure_status, detail="upstream said something with the user's data in it"
@@ -77,6 +84,8 @@ class FakePolar:
             return {"available": [*self.extra_available, *(_night(d) for d in self.nights)]}
         if endpoint.startswith("/v3/users/sleep/"):
             day = date.fromisoformat(endpoint.rsplit("/", 1)[1])
+            if day in self.night_statuses:
+                raise HTTPException(status_code=self.night_statuses[day], detail="night failed")
             if day in self.failing_nights:
                 raise HTTPException(status_code=self.failure_status, detail="night failed")
             sleep = _sleep(day)
@@ -255,7 +264,9 @@ class TestNights:
         assert _stored_polar_nights(db, user_id) == set()
 
         polar.calls.clear()
-        second = data_247.load_and_save_all(db, user_id)
+        # Spec cause 3, AC4 (v0.6): asked for again once its retry gap (an hour) has passed.
+        with freeze_time(datetime.now(timezone.utc) + timedelta(hours=1)):
+            second = data_247.load_and_save_all(db, user_id)
 
         assert second["sleep"] == 1
         assert f"/v3/users/sleep/{TODAY.isoformat()}" in [e for e, _ in polar.calls]
@@ -314,7 +325,9 @@ class TestNights:
 
         polar.failing_nights = set()
         polar.calls.clear()
-        second = data_247.load_and_save_all(db, user_id)
+        # Spec cause 3, AC4 (v0.6): asked for again once its retry gap (an hour) has passed.
+        with freeze_time(datetime.now(timezone.utc) + timedelta(hours=1)):
+            second = data_247.load_and_save_all(db, user_id)
 
         assert second["sleep"] == 1
         refetched = [e for e, _ in polar.calls if e.startswith("/v3/users/sleep/2")]

@@ -12,8 +12,8 @@ from app.services.providers.polar.pull_budget import (
     TOO_SOON,
     claim_on_open,
     claim_pull,
-    forget_full_fetch,
     full_due,
+    record_full_failure,
     record_full_fetch,
 )
 from tests.factories import UserConnectionFactory
@@ -111,16 +111,69 @@ class TestFullFetch:
 
         assert full_due(db, connection.id, T0 + timedelta(hours=2), TYPES) == {"daily_activity"}
 
-    def test_a_forgotten_type_is_due_again_and_the_others_are_not(self, db: Session) -> None:
-        connection = UserConnectionFactory(provider="polar")
-        for data_type in TYPES:
-            record_full_fetch(db, connection.id, data_type, T0)
 
-        forget_full_fetch(db, connection.id, "sleep")
+class TestRetryGaps:
+    """Spec cause 3, AC4 (v0.6): a failed full fetch waits a gap that doubles, up to 21 hours.
+
+    Times are written out, not read from the constants, so a shorter or longer gap is red too.
+    """
+
+    def _due(self, db: Session, connection_id, at) -> bool:  # noqa: ANN001
+        db.expire_all()
+        return "spo2" in full_due(db, connection_id, at, TYPES)
+
+    def test_the_gaps_are_one_two_four_hours_and_so_on(self, db: Session) -> None:
+        connection = UserConnectionFactory(provider="polar")
+        at = T0
+        for gap_hours in (1, 2, 4, 8, 16):
+            record_full_failure(db, connection.id, "spo2", at)
+            assert not self._due(db, connection.id, at + timedelta(hours=gap_hours) - timedelta(seconds=1))
+            assert self._due(db, connection.id, at + timedelta(hours=gap_hours))
+            at += timedelta(hours=gap_hours)
+
+    def test_the_gap_stops_growing_at_21_hours(self, db: Session) -> None:
+        connection = UserConnectionFactory(provider="polar")
+        for _ in range(8):
+            record_full_failure(db, connection.id, "spo2", T0)
+
+        assert not self._due(db, connection.id, T0 + timedelta(hours=21) - timedelta(seconds=1))
+        assert self._due(db, connection.id, T0 + timedelta(hours=21))
+
+    def test_a_success_ends_the_gaps_and_the_next_failure_starts_again_at_an_hour(self, db: Session) -> None:
+        connection = UserConnectionFactory(provider="polar")
+        for _ in range(4):
+            record_full_failure(db, connection.id, "spo2", T0)
+        record_full_fetch(db, connection.id, "spo2", T0 + timedelta(hours=9))
+        later = T0 + timedelta(hours=9) + FULL_INTERVAL
+
+        assert self._due(db, connection.id, later)
+        record_full_failure(db, connection.id, "spo2", later)
+        assert self._due(db, connection.id, later + timedelta(hours=1))
+
+    def test_a_gap_holds_back_only_its_own_type(self, db: Session) -> None:
+        connection = UserConnectionFactory(provider="polar")
+        record_full_failure(db, connection.id, "spo2", T0)
 
         db.expire_all()
-        assert full_due(db, connection.id, T0 + timedelta(hours=1), TYPES) == {"sleep"}
+        assert full_due(db, connection.id, T0 + timedelta(minutes=30), TYPES) == {"sleep", "daily_activity"}
 
+    def test_an_unreadable_gap_holds_nothing_back(self, db: Session) -> None:
+        connection = UserConnectionFactory(provider="polar")
+        db.add(PolarPullState(user_connection_id=connection.id, full_retry={"spo2": {"next": "x"}}))
+        db.commit()
+
+        assert self._due(db, connection.id, T0)
+
+    def test_a_failure_does_not_move_the_pull_clock(self, db: Session) -> None:
+        connection = UserConnectionFactory(provider="polar")
+        claim_pull(db, connection.id, T0)
+        record_full_failure(db, connection.id, "spo2", T0 + timedelta(minutes=3))
+
+        db.expire_all()
+        assert db.get(PolarPullState, connection.id).pull_started_at == T0
+
+
+class TestFullFetchAgain:
     def test_recording_a_fetch_does_not_move_the_pull_clock(self, db: Session) -> None:
         connection = UserConnectionFactory(provider="polar")
         claim_pull(db, connection.id, T0)

@@ -16,7 +16,12 @@ from sqlalchemy.orm import Session
 from app.models import PolarRegistration, UserConnection
 from app.schemas.auth import ConnectionStatus
 from app.services.providers.polar.data_247 import Polar247Data
-from app.services.providers.polar.pull_budget import ON_OPEN_DAILY_CAP, ON_OPEN_INTERVAL, claim_pull
+from app.services.providers.polar.pull_budget import (
+    ON_OPEN_DAILY_CAP,
+    ON_OPEN_INTERVAL,
+    claim_pull,
+    record_full_failure,
+)
 from tests.factories import ApiKeyFactory, UserConnectionFactory, UserFactory
 from tests.providers.polar.test_polar_no_lost_nights import FakePolar, _stored_polar_nights
 
@@ -197,6 +202,20 @@ def test_a_recharge_failure_answers_failed_and_keeps_the_night_stored(
     answer = _ask(client, user_id)
 
     assert answer == {"outcome": "failed", "reason": "HTTPException_503", "stored": 1}
+    assert LAST_NIGHT in _stored_polar_nights(db, user_id)
+
+
+def test_a_retry_gap_on_sleep_does_not_hold_back_an_ask(client: TestClient, db: Session, polar: FakePolar) -> None:
+    # Spec R2 with cause 3 (v0.6): the ask on open is not slowed by any retry gap.
+    user_id = _member(db)
+    connection = db.query(UserConnection).filter_by(user_id=user_id).one()
+    for _ in range(3):
+        record_full_failure(db, connection.id, "sleep", NOW)
+    polar.nights = [LAST_NIGHT]
+
+    answer = _ask(client, user_id)
+
+    assert answer["outcome"] == "fetched"
     assert LAST_NIGHT in _stored_polar_nights(db, user_id)
 
 

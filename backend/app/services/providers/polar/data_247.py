@@ -59,8 +59,8 @@ from app.services.providers.api_client import make_authenticated_request
 from app.services.providers.polar.coverage import ACTIVITY_SERIES
 from app.services.providers.polar.pull_budget import (
     RATE_LIMITED,
-    forget_full_fetch,
     full_due,
+    record_full_failure,
     record_full_fetch,
 )
 from app.services.providers.templates.base_247_data import Base247DataTemplate
@@ -1059,6 +1059,9 @@ class Polar247Data(Base247DataTemplate):
                     error_code=code,
                 )
                 if code == RATE_LIMITED:
+                    # Codex 4271871222: the 429 is what the night type reports, whatever failed
+                    # before it, so the caller ends the whole pull on it (spec R1).
+                    first_failure = RATE_LIMITED
                     break
         if first_failure is None and malformed:
             first_failure = POLAR_SLEEP_LISTING_MALFORMED
@@ -1251,7 +1254,6 @@ class Polar247Data(Base247DataTemplate):
             tasks[_SHORT_FORM_KEYS["daily_activity"]] = daily_activity(now - timedelta(days=_SHORT_ACTIVITY_DAYS))
         tasks.update({data_type: fn for data_type, fn in full_only.items() if data_type in due})
 
-        full_type_of = {short: full for full, short in _SHORT_FORM_KEYS.items()}
         results: dict[str, int | DataTypeFailure] = {}
         stopped: str | None = None
         for data_type, fn in tasks.items():
@@ -1285,10 +1287,12 @@ class Polar247Data(Base247DataTemplate):
             if isinstance(outcome, DataTypeFailure):
                 if outcome.code == RATE_LIMITED:
                     stopped = RATE_LIMITED
-                # A short form that failed makes its full form due, so the next pull asks again
-                # for what failed (spec cause 3, AC4), even once it is no longer the newest.
-                if data_type in full_type_of and connection_id is not None:
-                    forget_full_fetch(db, connection_id, full_type_of[data_type])
+                # Spec cause 3, AC4 (v0.6): a full fetch that failed is asked for again after a
+                # growing gap, at least once every 22 hours (pull_budget.record_full_failure). A
+                # short form that failed needs nothing: the next pull asks for it again anyway,
+                # and a night that is no longer the newest is the next full fetch's.
+                if data_type in _FULL_FORM_TYPES and connection_id is not None:
+                    record_full_failure(db, connection_id, data_type, now)
             elif data_type in _FULL_FORM_TYPES and connection_id is not None:
                 record_full_fetch(db, connection_id, data_type, now)
 

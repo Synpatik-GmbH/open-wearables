@@ -6,8 +6,9 @@ FORK (2.96.6.1, No lost wearable data): three operational tables, identifiers an
 - polar_workout_true_time: which Polar workouts hold their true start instant (spec L2).
 - polar_registration: whether Polar accepted the connection's user registration (spec cause 4).
 - polar_pull_state: when Calibra last pulled Polar for the connection, when each data type was
-  last fetched in full (spec R1, Polar's call limit), and when and how often that day it asked
-  Polar for last night because the member opened the app (spec R2).
+  last fetched in full (spec R1, Polar's call limit), when a type whose full fetch failed may be
+  asked for again (spec cause 3), and when and how often that day it asked Polar for last night
+  because the member opened the app (spec R2).
 
 Revision ID: 635d0674389f
 Revises: e4b7a1c9d3f2
@@ -53,6 +54,12 @@ def upgrade() -> None:
         sa.Column("pull_started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column(
             "full_fetched_at",
+            postgresql.JSONB(astext_type=sa.Text()),
+            server_default=sa.text("'{}'::jsonb"),
+            nullable=False,
+        ),
+        sa.Column(
+            "full_retry",
             postgresql.JSONB(astext_type=sa.Text()),
             server_default=sa.text("'{}'::jsonb"),
             nullable=False,

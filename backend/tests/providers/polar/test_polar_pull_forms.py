@@ -157,18 +157,25 @@ class TestTheNextPull:
         assert "daily_activity" in result
         assert min(_activity_from(polar)) == (_after_full_interval() - timedelta(days=90)).date()
 
-    def test_a_type_that_failed_in_full_is_fetched_in_full_on_the_next_pull(
+    def test_a_type_that_failed_in_full_is_asked_for_again_after_its_gap_not_before(
         self, db: Session, data_247: Polar247Data, polar: FakePolar
     ) -> None:
-        # Spec cause 3, AC4: the next pull asks for it again.
+        # Spec cause 3, AC4 (v0.6): retried at growing intervals, the first an hour.
+        start = datetime.now(timezone.utc)
         user_id = _polar_user(db)
         polar.failing_endpoints = {FULL_ONLY["spo2"]}
-        data_247.load_and_save_all(db, user_id)
+        with freeze_time(start):
+            data_247.load_and_save_all(db, user_id)
         polar.failing_endpoints = set()
         polar.calls.clear()
 
-        result = data_247.load_and_save_all(db, user_id)
+        with freeze_time(start + timedelta(minutes=59)):
+            early = data_247.load_and_save_all(db, user_id)
+        assert "spo2" not in early
+        assert polar.requested(FULL_ONLY["spo2"]) == []
 
+        with freeze_time(start + timedelta(hours=1)):
+            result = data_247.load_and_save_all(db, user_id)
         assert result["spo2"] == 0
         assert len(polar.requested(FULL_ONLY["spo2"])) == 1
         assert polar.requested(FULL_ONLY["cardio_load"]) == []
@@ -204,24 +211,58 @@ class TestNights:
 
         assert _stored_polar_nights(db, user_id) == {TODAY, TODAY - timedelta(days=5)}
 
-    def test_a_night_whose_short_fetch_failed_is_fetched_by_the_next_pull_once_no_longer_newest(
+    def test_a_night_whose_short_fetch_failed_is_asked_for_again_within_22_hours(
         self, db: Session, data_247: Polar247Data, polar: FakePolar
     ) -> None:
-        # Spec cause 3, AC4: a failed fetch is asked for again on the next sync, even when a
-        # newer night has appeared in between.
+        # Spec cause 3, AC4 (v0.6): a short form that fails does not make the next pull a full
+        # one (Codex 4271871228: under a lasting failure that cost the full form every pull). The
+        # night is asked for again by the next full fetch, within 22 hours of the failure.
+        start = datetime.now(timezone.utc)
         user_id = _polar_user(db)
-        data_247.load_and_save_all(db, user_id)
+        with freeze_time(start):
+            data_247.load_and_save_all(db, user_id)
         yesterday = TODAY - timedelta(days=1)
         polar.nights = [yesterday]
         polar.failing_nights = {yesterday}
-        assert isinstance(data_247.load_and_save_all(db, user_id)["sleep_latest"], DataTypeFailure)
+        failed_at = start + timedelta(hours=1)
+        with freeze_time(failed_at):
+            assert isinstance(data_247.load_and_save_all(db, user_id)["sleep_latest"], DataTypeFailure)
         polar.failing_nights = set()
         polar.nights = [TODAY, yesterday]
 
-        result = data_247.load_and_save_all(db, user_id)
+        with freeze_time(failed_at + timedelta(hours=1)):
+            next_pull = data_247.load_and_save_all(db, user_id)
+        assert "sleep" not in next_pull
+        assert _stored_polar_nights(db, user_id) == {TODAY}
 
-        assert "sleep" in result
+        with freeze_time(start + FULL_INTERVAL):
+            data_247.load_and_save_all(db, user_id)
         assert _stored_polar_nights(db, user_id) == {TODAY, yesterday}
+        assert start + FULL_INTERVAL - failed_at <= timedelta(hours=22)
+
+    def test_the_newest_night_is_asked_for_on_every_pull_while_sleep_waits_out_a_gap(
+        self, db: Session, data_247: Polar247Data, polar: FakePolar
+    ) -> None:
+        # Spec cause 3 (v0.6): the newest night is still requested on every pull.
+        start = datetime.now(timezone.utc)
+        user_id = _polar_user(db)
+        old = TODAY - timedelta(days=3)
+        polar.nights = [old]
+        polar.failing_nights = {old}
+        with freeze_time(start):
+            assert isinstance(data_247.load_and_save_all(db, user_id)["sleep"], DataTypeFailure)
+        polar.nights = [TODAY, old]
+        polar.calls.clear()
+
+        with freeze_time(start + timedelta(minutes=10)):
+            first = data_247.load_and_save_all(db, user_id)
+        with freeze_time(start + timedelta(minutes=20)):
+            second = data_247.load_and_save_all(db, user_id)
+
+        assert "sleep_latest" in first
+        assert "sleep_latest" in second
+        assert len(polar.requested("/v3/users/sleep/available")) == 2
+        assert _stored_polar_nights(db, user_id) == {TODAY}
 
 
 _GOOD_NIGHT = TODAY - timedelta(days=1)
@@ -315,6 +356,21 @@ class TestRateLimit:
         assert result["sleep"] == 0
         assert result["spo2"] == DataTypeFailure(code=RATE_LIMITED)
 
+    def test_a_429_after_an_earlier_failed_night_still_ends_the_pull(
+        self, db: Session, data_247: Polar247Data, polar: FakePolar
+    ) -> None:
+        # Codex 4271871222: the earlier night's code used to win, so the pull went on.
+        user_id = _polar_user(db)
+        first, second = TODAY - timedelta(days=2), TODAY - timedelta(days=1)
+        polar.nights = [first, second]
+        polar.night_statuses = {first: 503, second: 429}
+
+        result = data_247.load_and_save_all(db, user_id)
+
+        assert result["sleep"] == DataTypeFailure(code=RATE_LIMITED, saved=0)
+        assert polar.requested("/v3/users/nightly-recharge") == []
+        assert result["nightly_recharge"] == DataTypeFailure(code=RATE_LIMITED)
+
     def test_a_429_on_one_night_ends_the_nights(self, db: Session, data_247: Polar247Data, polar: FakePolar) -> None:
         user_id = _polar_user(db)
         polar.nights = [TODAY - timedelta(days=d) for d in range(1, 4)]
@@ -334,7 +390,9 @@ class TestRateLimit:
         polar.rate_limited = False
         polar.calls.clear()
 
-        result = data_247.load_and_save_all(db, user_id)
+        # Its retry gap (an hour) has passed (spec cause 3, AC4, v0.6).
+        with freeze_time(datetime.now(timezone.utc) + timedelta(hours=1)):
+            result = data_247.load_and_save_all(db, user_id)
 
         assert {"sleep", "daily_activity", *FULL_ONLY} <= result.keys()
         assert not any(isinstance(v, DataTypeFailure) for v in result.values())
