@@ -26,6 +26,9 @@ POLAR_WINDOW_DAYS = 90
 class PolarWorkouts(BaseWorkoutsTemplate):
     """Polar implementation of workouts template."""
 
+    # FORK (2.96.6.1, spec R1): a 429 is not retried; the pull ends on it (see pull_budget).
+    retry_on_rate_limit = False
+
     def get_workouts(
         self,
         db: DbSession,

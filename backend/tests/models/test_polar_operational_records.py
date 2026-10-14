@@ -1,4 +1,4 @@
-"""2.96.6.1 (R-2026-10-13-e): the two operational tables are deleted with the user.
+"""2.96.6.1 (R-2026-10-13-e): the three operational tables are deleted with the user.
 
 Calibra erases the OW user on consent withdrawal and on account deletion, so deleting the user
 is the path both take.
@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import pytest
 from sqlalchemy.orm import Session
 
-from app.models import PolarRegistration, PolarWorkoutTrueTime
+from app.models import PolarPullState, PolarRegistration, PolarWorkoutTrueTime
 from app.schemas.enums import ProviderName
 from app.services.user_service import user_service
 from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectionFactory, UserFactory
@@ -60,3 +60,24 @@ def test_registration_state_is_deleted_with_the_user(db: Session) -> None:
 
     assert db.get(PolarRegistration, connections[user.id]) is None
     assert db.get(PolarRegistration, connections[other.id]) is not None
+
+
+def test_pull_state_is_deleted_with_the_user(db: Session) -> None:
+    user = UserFactory()
+    other = UserFactory()
+    connections = {}
+    for owner in (user, other):
+        connection = UserConnectionFactory(user=owner, provider="polar")
+        now = datetime.now(timezone.utc)
+        db.add(
+            PolarPullState(
+                user_connection_id=connection.id, pull_started_at=now, full_fetched_at={"sleep": now.isoformat()}
+            )
+        )
+        connections[owner.id] = connection.id
+    db.commit()
+
+    user_service.delete(db, user.id)
+
+    assert db.get(PolarPullState, connections[user.id]) is None
+    assert db.get(PolarPullState, connections[other.id]) is not None

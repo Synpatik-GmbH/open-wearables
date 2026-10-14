@@ -260,6 +260,22 @@ class BaseProviderStrategy(ABC):
         """
         return None
 
+    def claim_pull(self, db: DbSession, connection: UserConnection, *, ignore_interval: bool = False) -> bool:
+        """Called before ``prepare_pull``. False skips this pull for ``connection`` entirely.
+
+        FORK (2.96.6.1, spec R1). A provider with a call budget refuses a pull that starts too
+        soon after the last one; ``ignore_interval`` is the pull at connect, which always runs.
+        Most providers have no budget.
+        """
+        return True
+
+    def pull_stops_on(self, code: str | None) -> bool:
+        """True when a failure with ``code`` means the rest of this pull would fail the same way.
+
+        FORK (2.96.6.1, spec R1): Polar's rate limit. The pull then asks for nothing more.
+        """
+        return False
+
     @property
     def default_live_sync_mode(self) -> LiveSyncMode | None:
         """Derive the default live_sync_mode from this provider's capabilities.

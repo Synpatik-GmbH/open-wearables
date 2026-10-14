@@ -51,6 +51,9 @@ logger = getLogger(__name__)
 # types either. Whoop reports a partial sleep fetch this way.
 _NON_COUNT_RESULT_KEYS = frozenset({"sleep_partial"})
 
+# FORK (2.96.6.1, spec R1): what a pull skipped by the provider's call budget reports.
+PULL_INTERVAL_SKIP = "pull_interval"
+
 
 def _emit_sync_status(fn: Any, /, *args: Any, **kwargs: Any) -> None:
     """Best-effort sync status emission — never aborts the sync flow."""
@@ -115,6 +118,7 @@ def sync_vendor_data(
     is_historical: bool = False,
     _skip_linked_fan_out: bool = False,
     _linked_primary_user_id: str | None = None,
+    ignore_pull_interval: bool = False,
 ) -> dict[str, Any]:
     """
     Synchronize workout/exercise/activity data from all providers the user is connected to.
@@ -130,6 +134,9 @@ def sync_vendor_data(
             cursor is not clobbered by a user-initiated historical pull.
         _skip_linked_fan_out: Internal flag set to True when this task was triggered
             by another profile's fan-out.  Prevents infinite fan-out loops.
+        ignore_pull_interval: FORK (2.96.6.1, spec R1). Run even if the provider's call budget
+            would skip a pull this soon after the last one (see claim_pull). The pull at
+            connect sets it.
 
     Returns:
         dict with sync results per provider
@@ -236,6 +243,41 @@ def sync_vendor_data(
                     else (SyncSource.BACKFILL if is_historical else SyncSource.PULL)
                 )
                 sync_scope = SyncScope.HISTORICAL if is_historical else SyncScope.LIVE
+
+                # FORK (2.96.6.1, spec R1, AC17): a provider with a call budget skips a pull that
+                # starts too soon after its last one. Nothing is fetched, no run is opened (a run
+                # every 15 minutes would be noise, and would reach the outgoing webhook), and the
+                # cursor stays put. What was due stays due for the next pull. A claim that cannot
+                # be made lets the pull run: one call too many beats a night not fetched, and the
+                # pull's own handler below reports whatever is wrong.
+                try:
+                    claimed = factory.get_provider(provider_name).claim_pull(
+                        db, connection, ignore_interval=ignore_pull_interval
+                    )
+                except Exception as e:
+                    log_structured(
+                        logger,
+                        "warning",
+                        f"Could not claim the {provider_name} pull; pulling",
+                        provider=provider_name,
+                        task="sync_vendor_data",
+                        user_id=user_id,
+                        error_code=error_code(e),
+                    )
+                    claimed = True
+                if not claimed:
+                    log_structured(
+                        logger,
+                        "info",
+                        f"Skipping {provider_name} pull — the last one started less than its interval ago",
+                        provider=provider_name,
+                        task="sync_vendor_data",
+                        user_id=user_id,
+                    )
+                    result.providers_synced[provider_name] = ProviderSyncResult(
+                        success=True, params={"skipped": PULL_INTERVAL_SKIP}
+                    )
+                    continue
 
                 # If this provider account is shared across OW profiles, only one
                 # should make the API call at a time.  The first to acquire the lock
@@ -379,6 +421,10 @@ def sync_vendor_data(
                             )
                         )
 
+                    # FORK (2.96.6.1, spec R1): set when a failure means the rest of the pull would
+                    # fail the same way (Polar's 429). Nothing more is asked for.
+                    stopped: str | None = None
+
                     # Sync workouts
                     if strategy.workouts and not_ready is None:
                         params = build_sync_params(effective_start, end_date)
@@ -429,9 +475,23 @@ def sync_vendor_data(
                                     error=error_code(e),
                                 )
                             )
+                            if strategy.pull_stops_on(error_code(e)):
+                                stopped = error_code(e)
+
+                    if stopped is not None:
+                        provider_result.params["data_247"] = {"success": False, "error": stopped}
+                        data_type_outcomes.append(
+                            DataTypeOutcome(
+                                data_type="data_247",
+                                kind=DataTypeKind.TASK,
+                                native_type="data_247",
+                                status=SyncStatus.FAILED,
+                                error_code=stopped,
+                            )
+                        )
 
                     # Sync 247 data (sleep, recovery, activity) and SAVE to database
-                    if hasattr(strategy, "data_247") and strategy.data_247 and not_ready is None:
+                    if hasattr(strategy, "data_247") and strategy.data_247 and not_ready is None and stopped is None:
                         # Determine if this is first sync (for API compatibility with providers)
                         is_first_sync = connection.last_synced_at is None
 

@@ -53,19 +53,27 @@ class FakePolar:
         self.failing_nights: set[date] = set()
         self.recharges: list[dict[str, Any]] = []
         self.failing_endpoints: set[str] = set()
+        # What a failing endpoint or night answers; 429 is Polar's rate limit (spec R1).
+        self.failure_status = 503
+        # Every endpoint answers 429 (Polar's daily limit is spent).
+        self.rate_limited = False
 
     def __call__(
         self, db: Session, user_id: UUID, endpoint: str, params: dict | None = None, headers: dict | None = None
     ) -> Any:  # noqa: ARG002
         self.calls.append((endpoint, params))
+        if self.rate_limited:
+            raise HTTPException(status_code=429, detail="Polar API error: rate limit")
         if endpoint in self.failing_endpoints:
-            raise HTTPException(status_code=503, detail="upstream said something with the user's data in it")
+            raise HTTPException(
+                status_code=self.failure_status, detail="upstream said something with the user's data in it"
+            )
         if endpoint == "/v3/users/sleep/available":
             return {"available": [_night(d) for d in self.nights]}
         if endpoint.startswith("/v3/users/sleep/"):
             day = date.fromisoformat(endpoint.rsplit("/", 1)[1])
             if day in self.failing_nights:
-                raise HTTPException(status_code=503, detail="night failed")
+                raise HTTPException(status_code=self.failure_status, detail="night failed")
             return _sleep(day)
         if endpoint == "/v3/users/nightly-recharge":
             return {"recharges": self.recharges}

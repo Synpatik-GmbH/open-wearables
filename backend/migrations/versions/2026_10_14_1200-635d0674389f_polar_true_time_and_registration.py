@@ -1,10 +1,12 @@
 """polar_true_time_and_registration
 
-FORK (2.96.6.1, No lost wearable data): two operational tables, identifiers and state only
+FORK (2.96.6.1, No lost wearable data): three operational tables, identifiers and state only
 (R-2026-10-13-e), each deleted with the user through its foreign key.
 
 - polar_workout_true_time: which Polar workouts hold their true start instant (spec L2).
 - polar_registration: whether Polar accepted the connection's user registration (spec cause 4).
+- polar_pull_state: when Calibra last pulled Polar for the connection, and when each data type
+  was last fetched in full (spec R1, Polar's call limit).
 
 Revision ID: 635d0674389f
 Revises: e4b7a1c9d3f2
@@ -15,6 +17,7 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = "635d0674389f"
@@ -43,8 +46,23 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["user_connection_id"], ["user_connection.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("user_connection_id"),
     )
+    op.create_table(
+        "polar_pull_state",
+        sa.Column("user_connection_id", sa.UUID(), nullable=False),
+        sa.Column("pull_started_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column(
+            "full_fetched_at",
+            postgresql.JSONB(astext_type=sa.Text()),
+            server_default=sa.text("'{}'::jsonb"),
+            nullable=False,
+        ),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.ForeignKeyConstraint(["user_connection_id"], ["user_connection.id"], ondelete="CASCADE"),
+        sa.PrimaryKeyConstraint("user_connection_id"),
+    )
 
 
 def downgrade() -> None:
+    op.drop_table("polar_pull_state")
     op.drop_table("polar_registration")
     op.drop_table("polar_workout_true_time")

@@ -57,6 +57,12 @@ from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.providers.api_client import make_authenticated_request
 from app.services.providers.polar.coverage import ACTIVITY_SERIES
+from app.services.providers.polar.pull_budget import (
+    RATE_LIMITED,
+    forget_full_fetch,
+    full_due,
+    record_full_fetch,
+)
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.raw_payload_storage import store_raw_payload
@@ -69,11 +75,12 @@ _T = TypeVar("_T", bound=BaseModel)
 # FORK (2.96.6.1, spec Q5): nothing whose date is more than this many days back is fetched.
 POLAR_WINDOW_DAYS = 90
 
-# FORK (2.96.6.1, spec causes 1-3 and 8, Andrei's ruling of 14 Oct 2026): every pull asks each
+# FORK (2.96.6.1, spec causes 1-3 and 8, Andrei's ruling of 14 Oct 2026): a full fetch asks each
 # range endpoint for the whole window Polar serves it, capped at POLAR_WINDOW_DAYS, instead of
 # only what came after the connection's cursor. A night or reading that reaches Polar late, or
-# whose earlier fetch failed, is therefore asked for again on the next pull while Polar still
-# serves it. Unchanged rows are not re-emitted (emit_only_written). Per Polar AccessLink v3:
+# whose earlier fetch failed, is therefore asked for again while Polar still serves it. How often
+# a type is fetched in full is set by pull_budget (spec R1, see _FULL_FORM_TYPES). Unchanged rows
+# are not re-emitted (emit_only_written). Per Polar AccessLink v3:
 # - activities accept a ``from`` up to 365 days back in 28-day ranges: the 90-day cap applies;
 # - SleepWise, body and skin temperature, SpO2 and wrist ECG serve "the last 28 days" with a
 #   28-day maximum range; continuous heart rate and cardio load document no older history,
@@ -91,6 +98,21 @@ _RANGE_WINDOW_DAYS: dict[str, int] = {
     "spo2": 27,
     "wrist_ecg": 27,
 }
+
+
+# FORK (2.96.6.1, spec R1, AC2, AC17): the data types pull_budget fetches in full at most once per
+# FULL_INTERVAL. Between full fetches a pull fetches the short form of sleep (the newest night
+# Polar lists, when it is not stored) and of daily activity (yesterday and today), and nothing
+# of the other eight. Nightly Recharge is one call for everything Polar serves, so it is fetched
+# whole on every pull (spec cause 8, AC11), as are workouts (one call, see PolarWorkouts).
+_FULL_FORM_TYPES: tuple[str, ...] = (
+    "sleep",
+    "daily_activity",
+    *(t for t in _RANGE_WINDOW_DAYS if t != "daily_activity"),
+)
+# The key a short-form fetch is reported under, so a run says which form it fetched.
+_SHORT_FORM_KEYS: dict[str, str] = {"sleep": "sleep_latest", "daily_activity": "daily_activity_recent"}
+_SHORT_ACTIVITY_DAYS = 1
 
 
 class Polar247Data(Base247DataTemplate):
@@ -123,6 +145,8 @@ class Polar247Data(Base247DataTemplate):
                 method="GET",
                 params=params,
                 headers=headers,
+                # FORK (2.96.6.1, spec R1): a 429 is not retried; the pull ends on it.
+                retry_on_rate_limit=False,
             )
             store_raw_payload(
                 source="api_response",
@@ -992,7 +1016,9 @@ class Polar247Data(Base247DataTemplate):
                 )
                 return {}
 
-    def _save_missing_sleep(self, db: DbSession, user_id: UUID, now: datetime) -> int | DataTypeFailure:
+    def _save_missing_sleep(
+        self, db: DbSession, user_id: UUID, now: datetime, *, latest_only: bool = False
+    ) -> int | DataTypeFailure:
         """Fetch and store every night Polar lists that is inside the window and not yet stored.
 
         FORK (2.96.6.1, spec causes 1-3, AC1-AC4). Polar lists the nights it holds for its last
@@ -1002,11 +1028,17 @@ class Polar247Data(Base247DataTemplate):
         cursor stands. A night that reached Polar late, or whose fetch failed last time, is
         therefore fetched on the next pull. Each night is fetched and saved on its own, so one
         failing night does not discard the others; the type is then reported failed (with the
-        first failure's code) and the failed night stays missing, so it is asked for again.
+        first failure's code) and the failed night stays missing, so it is asked for again. A 429
+        ends the loop: every later night would be refused too (spec R1).
+
+        ``latest_only`` is the short form (spec R1): only the newest night Polar lists is
+        considered, which is last night once the watch has synced.
         """
         oldest = (now - timedelta(days=POLAR_WINDOW_DAYS)).date()
         response = self._make_api_request(db, user_id, "/v3/users/sleep/available")
         listed = [n for n in (response or {}).get("available", []) if n.get("date")]
+        if latest_only and listed:
+            listed = [max(listed, key=lambda n: date.fromisoformat(n["date"]))]
         missing = [
             n
             for n in listed
@@ -1034,6 +1066,8 @@ class Polar247Data(Base247DataTemplate):
                     user_id=str(user_id),
                     error_code=code,
                 )
+                if code == RATE_LIMITED:
+                    break
         if first_failure is not None:
             return DataTypeFailure(code=first_failure, saved=saved)
         return saved
@@ -1085,22 +1119,32 @@ class Polar247Data(Base247DataTemplate):
         is_first_sync: bool = False,
     ) -> dict[str, int | DataTypeFailure]:
         # FORK (2.96.6.1): the window no longer follows ``start_time`` / ``end_time`` (the
-        # connection's cursor on a live pull). Each data type asks for what Polar serves it,
-        # capped at POLAR_WINDOW_DAYS, on every pull; see _RANGE_WINDOW_DAYS. The parameters stay
-        # for the shared provider interface.
+        # connection's cursor on a live pull). A type fetched in full asks for what Polar serves
+        # it, capped at POLAR_WINDOW_DAYS (see _RANGE_WINDOW_DAYS); which types are fetched in
+        # full, and the short forms, are under _FULL_FORM_TYPES. The parameters stay for the
+        # shared provider interface.
         now = datetime.now(timezone.utc)
 
         def since(data_type: str) -> datetime:
             return now - timedelta(days=_RANGE_WINDOW_DAYS[data_type])
 
-        tasks: dict[str, Callable[[], int | DataTypeFailure]] = {
-            "sleep": lambda: self._save_missing_sleep(db, user_id, now),
-            "daily_activity": lambda: self._save_timeseries(
+        # FORK (2.96.6.1, spec R1): which types this pull fetches in full. Without a connection
+        # (nothing to keep the state on) every type is fetched in full, as before the budget.
+        connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
+        connection_id = connection.id if connection is not None else None
+        due = (
+            full_due(db, connection_id, now, _FULL_FORM_TYPES)
+            if connection_id is not None
+            else frozenset(_FULL_FORM_TYPES)
+        )
+
+        def daily_activity(start: datetime) -> Callable[[], Any]:
+            return lambda: self._save_timeseries(
                 db,
-                self.normalize_daily_activity(
-                    self.get_daily_activity_statistics(db, user_id, since("daily_activity"), now), user_id
-                ),
-            ),
+                self.normalize_daily_activity(self.get_daily_activity_statistics(db, user_id, start, now), user_id),
+            )
+
+        full_only: dict[str, Callable[[], Any]] = {
             "continuous_hr": lambda: self._save_timeseries(
                 db,
                 self.normalize_continuous_hr(
@@ -1110,10 +1154,6 @@ class Polar247Data(Base247DataTemplate):
             "cardio_load": lambda: self._save_scores(
                 db,
                 self.normalize_cardio_load(self.get_cardio_load_data(db, user_id, since("cardio_load"), now), user_id),
-            ),
-            "nightly_recharge": lambda: self._save_nightly_recharge(
-                db,
-                *self.normalize_nightly_recharge(self.get_nightly_recharge_data(db, user_id, now, now), user_id),
             ),
             "alertness": lambda: self._save_scores(
                 db, self.normalize_alertness(self.get_alertness_data(db, user_id, since("alertness"), now), user_id)
@@ -1144,8 +1184,31 @@ class Polar247Data(Base247DataTemplate):
             ),
         }
 
+        # Sleep first: last night is what the morning needs, and a 429 ends the pull.
+        tasks: dict[str, Callable[[], Any]] = {}
+        if "sleep" in due:
+            tasks["sleep"] = lambda: self._save_missing_sleep(db, user_id, now)
+        else:
+            tasks[_SHORT_FORM_KEYS["sleep"]] = lambda: self._save_missing_sleep(db, user_id, now, latest_only=True)
+        tasks["nightly_recharge"] = lambda: self._save_nightly_recharge(
+            db,
+            *self.normalize_nightly_recharge(self.get_nightly_recharge_data(db, user_id, now, now), user_id),
+        )
+        if "daily_activity" in due:
+            tasks["daily_activity"] = daily_activity(since("daily_activity"))
+        else:
+            tasks[_SHORT_FORM_KEYS["daily_activity"]] = daily_activity(now - timedelta(days=_SHORT_ACTIVITY_DAYS))
+        tasks.update({data_type: fn for data_type, fn in full_only.items() if data_type in due})
+
+        full_type_of = {short: full for full, short in _SHORT_FORM_KEYS.items()}
         results: dict[str, int | DataTypeFailure] = {}
+        stopped: str | None = None
         for data_type, fn in tasks.items():
+            if stopped is not None:
+                # FORK (2.96.6.1, spec R1): Polar refused a call for its rate limit, so every later
+                # call would be refused too, and still counted. Not asked; still due next pull.
+                results[data_type] = DataTypeFailure(code=stopped)
+                continue
             try:
                 results[data_type] = fn()
                 db.commit()
@@ -1167,7 +1230,27 @@ class Polar247Data(Base247DataTemplate):
                     user_id=str(user_id),
                     error_code=code,
                 )
+            outcome = results[data_type]
+            if isinstance(outcome, DataTypeFailure):
+                if outcome.code == RATE_LIMITED:
+                    stopped = RATE_LIMITED
+                # A short form that failed makes its full form due, so the next pull asks again
+                # for what failed (spec cause 3, AC4), even once it is no longer the newest.
+                if data_type in full_type_of and connection_id is not None:
+                    forget_full_fetch(db, connection_id, full_type_of[data_type])
+            elif data_type in _FULL_FORM_TYPES and connection_id is not None:
+                record_full_fetch(db, connection_id, data_type, now)
 
+        if stopped is not None:
+            log_structured(
+                self.logger,
+                "warning",
+                "Polar pull stopped at the rate limit",
+                provider="polar",
+                task="load_and_save_all",
+                user_id=str(user_id),
+                error_code=stopped,
+            )
         return results
 
     # -------------------------------------------------------------------------
