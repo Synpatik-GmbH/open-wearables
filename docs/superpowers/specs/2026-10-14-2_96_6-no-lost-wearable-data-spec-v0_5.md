@@ -1,9 +1,10 @@
 # 2.96.6 No lost wearable data
 
-Spec v0.4, Product Studio, 14 Oct 2026. Roadmap item 2.96.6 (parent 2.96 Wearable integrations at launch), build child 2.96.6.1.
-Status: AGREED, ready for build. Predicates agreed by Andrei on 13 Oct 2026 (V6, Q5, N9, L1, L2); N9 scope to every source, R1 and the 24-hour late-data bound agreed 14 Oct 2026. Data-protection ruling R-2026-10-13-e decided 13 Oct 2026.
-Source: Andrei's account on 13 Oct 2026 (no night data before and after the account was re-created at about 13:05 Berlin; a Polar activity at a time later than the screen's clock), the CC read-only trace relayed 13 Oct 2026, 13:43 (code paths only, no stored rows checked), the CC build plan relayed 14 Oct 2026, 08:23, and the CC build report relayed 14 Oct 2026, 14:38 (PRs OW fork #40 and adapter #433 open; Polar call volume).
+Spec v0.5, Product Studio, 14 Oct 2026. Roadmap item 2.96.6 (parent 2.96 Wearable integrations at launch), build child 2.96.6.1.
+Status: AGREED, ready for build. Predicates agreed by Andrei on 13 Oct 2026 (V6, Q5, N9, L1, L2); N9 scope to every source, R1, R2 and the 24-hour late-data bound agreed 14 Oct 2026. Data-protection ruling R-2026-10-13-e decided 13 Oct 2026.
+Source: Andrei's account on 13 Oct 2026 (no night data before and after the account was re-created at about 13:05 Berlin; a Polar activity at a time later than the screen's clock), the CC read-only trace relayed 13 Oct 2026, 13:43 (code paths only, no stored rows checked), the CC build plan relayed 14 Oct 2026, 08:23, the CC build report relayed 14 Oct 2026, 14:38 (PRs OW fork #40 and adapter #433 open; Polar call volume), and the CC R1 report relayed 14 Oct 2026, 14:50.
 Order: first of the four items from the 13 Oct walkthrough. 2.96.7.1 starts after this item's PRs merge (both touch the connection record). 2.97.8 (P18, the 28-day backfill at connect) relies on nights arriving.
+Changes from v0.4 (Andrei, 14 Oct 2026, on the CC R1 report): predicate R2 added: when a Polar member opens the app and last night is not stored, Calibra asks Polar then, and readiness shows within 1 minute of opening if Polar has the night (3.1, AC18). A background pull schedule that delays a new night by up to 60 minutes is accepted only together with R2.
 Changes from v0.3 (Andrei, 14 Oct 2026, on the CC build report): predicate R1 added (Polar calls within Polar's daily limit for 50 Polar members, AC17); late data stored within 24 hours of being served (3.1, cause 2, AC2); design-review readings confirmed: the 90-day window includes day 90, the definition of a shifted activity, of a failed Polar registration and of missing data; stored non-Polar activities that crossed midnight are not re-dated.
 Changes from v0.2 (Andrei, 14 Oct 2026, on the CC plan): activities from every source count on the Berlin day they started (3.4, AC13); section 4 references corrected per the plan; three non-goals added (Polar continuous heart rate and daily-activity start times, heart-rate zone minutes on shifted workouts, the app showing activity times in Berlin time); data-protection condition on operational records added (section 9).
 Changes from v0.1: L1 and L2 agreed; acceptance criterion 16 added (each shifted activity corrected exactly once); data-protection ruling decided as R-2026-10-13-e.
@@ -33,6 +34,7 @@ Changes from v0.1: L1 and L2 agreed; acceptance criterion 16 added (each shifted
 - A date exactly 90 days old is inside the window.
 - Missing data for a night means its sleep is missing, or its HRV from the member's main HRV source is missing.
 - Calibra's Polar calls stay within Polar's daily limit with 50 Polar members connected (R1). A fetch refused by the limit is a failed fetch (cause 3), not a lost one.
+- When a Polar member opens the app and last night is not stored, Calibra asks Polar for it at that moment. If Polar has the night, readiness shows within 1 minute of opening (R2). The background schedule continues for members who do not open the app. A night the watch has not yet synced to Polar is outside Calibra's control.
 
 ### 3.2 The eight causes from the trace, each closed
 
@@ -88,6 +90,7 @@ From the CC read-only trace relayed 13 Oct 2026, 13:43, corrected by the CC plan
 15. Every activity stored with a shifted time before the fix is corrected in place to its true start instant; the Movement usual uses corrected data from the day the correction runs; stored states of past days and cards already sent are unchanged (L2).
 16. Each shifted activity is corrected exactly once; activities stored after the fix are untouched; running the correction a second time changes nothing.
 17. With 50 Polar members connected, Calibra's Polar calls in a day stay within Polar's daily limit; the plan states the calls per member per day and the number of Polar members that fits (R1).
+18. A Polar member whose last night is on Polar but not stored in Calibra opens the app and sees readiness for that night within 1 minute of opening, with no further action (R2). The calls this adds stay within R1.
 
 ## 6. Invariants
 
@@ -118,6 +121,7 @@ From the CC read-only trace relayed 13 Oct 2026, 13:43, corrected by the CC plan
 | N9 | Activity time | True start instant; offset subtracted; every activity, from every source, counts on the Berlin day it started | agreed 13 Oct 2026; every source agreed 14 Oct 2026 |
 | L1 | Failed Polar registration, what the member sees | Settings > Connections shows Polar as "Not connected" with Connect until registration succeeds | agreed 13 Oct 2026 |
 | R1 | Polar call budget | Polar calls stay within Polar's daily limit with 50 Polar members connected (per the CC report of 14 Oct 2026, the limit is 5000 plus 100 per user per day) | agreed 14 Oct 2026 |
+| R2 | Night on app open | When a Polar member opens the app and last night is not stored, Calibra asks Polar then; readiness shows within 1 minute of opening if Polar has the night | agreed 14 Oct 2026 |
 | L2 | Activities already stored with a shifted time | Corrected in place, each exactly once; the usual uses corrected data from the day the correction runs; past days' stored states and sent cards unchanged | agreed 13 Oct 2026 |
 
 ## 9. Data-protection ruling (calibra-dp-desk)
