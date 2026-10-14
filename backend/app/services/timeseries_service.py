@@ -127,9 +127,21 @@ class TimeSeriesService(
         self,
         db_session: DbSession,
         samples: (list[TimeSeriesSampleCreate] | list[HeartRateSampleCreate] | list[StepSampleCreate]),
+        *,
+        emit_only_written: bool = False,
     ) -> WriteCounts:
+        """Upsert the samples and, after commit, emit their webhooks.
+
+        FORK (2.96.6.1): with ``emit_only_written`` the webhooks carry only the samples the
+        merge actually inserted or changed, so re-reading an already-stored window sends
+        nothing for it. Opt-in per call: every other caller still emits every sample it hands in.
+        """
         counts = self.crud.bulk_create(db_session, samples)  # ty:ignore[invalid-argument-type]
-        samples_copy = list(samples)
+        written = getattr(counts, "written_ids", None)
+        if emit_only_written and written is not None:
+            samples_copy = [s for s in samples if s.id in written]
+        else:
+            samples_copy = list(samples)
 
         @sa_event.listens_for(db_session, "after_commit", once=True)
         def _start_webhook_thread(session: DbSession) -> None:  # noqa: ARG001
