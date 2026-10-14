@@ -3,7 +3,7 @@ from logging import getLogger
 from typing import Any
 from uuid import UUID
 
-from celery import shared_task
+from celery import Task, shared_task
 
 from app.config import settings
 from app.constants.sdk_providers import sdk_providers
@@ -73,8 +73,19 @@ def _batch_outcomes(types: list[str], workouts_saved: int, sleep_saved: int, sco
 # FORK (data protection, Notion 2.47.17.2): ignore_result, because a task that raises
 # would have its exception, text and traceback, kept in the result backend for three
 # days. Nothing reads this task's result.
-@shared_task(queue="sdk_sync", ignore_result=True)
+#
+# FORK (2.96.6.1, spec 3.3, Apple Health cause 3): bound and retried. The SDK holds its 202 for
+# a batch and never re-sends it, so a batch whose import failed for a transient reason (an
+# unexpected error, a busy sleep lock) is processed again from the same content or S3 payload,
+# with backoff, before it is reported failed. Re-processing is safe: samples upsert, workouts
+# and sleep are keyed on their times.
+SDK_IMPORT_MAX_RETRIES = 5
+SDK_IMPORT_RETRY_BASE_SECONDS = 30
+
+
+@shared_task(bind=True, queue="sdk_sync", ignore_result=True, max_retries=SDK_IMPORT_MAX_RETRIES)
 def process_sdk_upload(
+    self: Task,
     content: str | None,
     content_type: str,
     user_id: str,
@@ -264,6 +275,8 @@ def process_sdk_upload(
                 # keeps its payload for diagnosis.
                 delete_payload_from_s3(payload_ref)
         else:
+            if result.get("retryable") and self.request.retries < self.max_retries:
+                raise self.retry(countdown=SDK_IMPORT_RETRY_BASE_SECONDS * 2**self.request.retries)
             emit_sync_failed(
                 user_uuid,
                 provider,

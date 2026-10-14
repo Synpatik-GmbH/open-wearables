@@ -12,6 +12,10 @@ class UploadDataResponse(BaseModel):
     response: str = Field(..., description="Human-readable response message")
     user_id: str | None = Field(None, description="User ID associated with the import operation")
     dropped_count: int = Field(0, description="Number of individual records dropped by per-record validation")
+    # FORK (2.96.6.1): True when the import failed for a reason a second attempt can get past
+    # (an unexpected error, a busy sleep lock), so the upload task retries the batch. False for
+    # an invalid payload, which no retry can fix.
+    retryable: bool = Field(False, description="Whether the failed import may succeed if retried")
     records_saved: int = Field(0, description="Time-series samples saved")
     records_inserted: int = Field(0, description="Time-series rows that did not exist before")
     records_updated: int = Field(0, description="Time-series rows refreshed in place")

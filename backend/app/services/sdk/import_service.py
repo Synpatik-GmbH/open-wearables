@@ -592,21 +592,16 @@ class ImportService:
             )
 
         except Exception as e:
-            log_and_capture_error(
-                e,
-                self.log,
-                f"Import failed for user {user_id}",
-                extra={"user_id": user_id, "batch_id": batch_id, "provider": provider},
-            )
             log_structured(
                 self.log,
                 "error",
-                f"Import failed for user {user_id}: {e}",
+                # FORK (2.96.6.1, spec cause 3): a code, never the exception's text.
+                "Import failed",
                 provider=f"{provider}",
                 action=f"{provider}_sdk_import_failed",
                 batch_id=batch_id,
                 user_id=user_id,
-                error_type=type(e).__name__,
+                error_code=error_code(e),
             )
             return UploadDataResponse(
                 status_code=400,
@@ -614,6 +609,9 @@ class ImportService:
                 # task returns, which the worker logs.
                 response=f"Import failed: {error_code(e)}",
                 user_id=user_id,
+                # FORK (2.96.6.1): nothing here says the payload is invalid (that is the
+                # ValidationError branch above), so the batch is worth another attempt.
+                retryable=True,
             )
 
     def _parse_multipart_content(self, content: str) -> dict | None:

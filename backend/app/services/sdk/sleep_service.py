@@ -28,6 +28,7 @@ from app.schemas.providers.mobile_sdk import (
 )
 from app.services.event_record_service import event_record_service
 from app.services.sdk.device_resolution import extract_device_info
+from app.utils.exceptions import SleepLockBusyError
 from app.utils.structured_logging import log_structured
 
 logger = getLogger(__name__)
@@ -234,8 +235,10 @@ def handle_sleep_data(
     try:
         acquired = lock.acquire()
         if not acquired:
-            logger.warning("Could not acquire sleep processing lock for user %s; skipping batch", user_id)
-            return
+            # FORK (2.96.6.1, spec 3.3, Apple Health cause 3): this used to return, dropping the
+            # batch's sleep with no retry. Raising makes the import retryable (process_sdk_upload).
+            logger.warning("Could not acquire sleep processing lock for user %s; batch will be retried", user_id)
+            raise SleepLockBusyError()
 
         current_state = load_sleep_state(user_id)
         provider = request.provider
