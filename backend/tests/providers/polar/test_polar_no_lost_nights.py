@@ -12,9 +12,10 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app.models import DataSource, EventRecord, User, UserConnection
+from app.models import DataSource, EventRecord, HealthScore, User, UserConnection
 from app.schemas.auth import ConnectionStatus
-from app.schemas.enums import ProviderName
+from app.schemas.enums import HealthScoreCategory, ProviderName
+from app.schemas.providers.polar.webhook import PolarWebhookEventType
 from app.schemas.sync_status import DataTypeFailure
 from app.services.providers.polar.data_247 import Polar247Data
 from app.services.providers.polar.strategy import PolarStrategy
@@ -57,6 +58,8 @@ class FakePolar:
         self.failure_status = 503
         # Every endpoint answers 429 (Polar's daily limit is spent).
         self.rate_limited = False
+        # The sleep score each night carries, when set.
+        self.sleep_score: int | None = None
 
     def __call__(
         self, db: Session, user_id: UUID, endpoint: str, params: dict | None = None, headers: dict | None = None
@@ -74,7 +77,10 @@ class FakePolar:
             day = date.fromisoformat(endpoint.rsplit("/", 1)[1])
             if day in self.failing_nights:
                 raise HTTPException(status_code=self.failure_status, detail="night failed")
-            return _sleep(day)
+            sleep = _sleep(day)
+            if self.sleep_score is not None:
+                sleep["sleep_score"] = self.sleep_score
+            return sleep
         if endpoint == "/v3/users/nightly-recharge":
             return {"recharges": self.recharges}
         return [] if endpoint != "/v3/users/continuous-heart-rate" else {"heart_rates": []}
@@ -157,6 +163,18 @@ class TestWindows:
                 assert span <= timedelta(days=27), (endpoint, params)
 
 
+_SCORE_WRITE = "app.services.providers.polar.data_247.health_score_service.bulk_create"
+
+
+def _sleep_scores(db: Session, user_id: UUID) -> list[float]:
+    rows = (
+        db.query(HealthScore)
+        .filter(HealthScore.user_id == user_id, HealthScore.category == HealthScoreCategory.SLEEP)
+        .all()
+    )
+    return [float(r.value) for r in rows]
+
+
 class TestNights:
     def test_every_listed_night_inside_90_days_that_is_not_stored_is_fetched(
         self, db: Session, data_247: Polar247Data, polar: FakePolar
@@ -220,6 +238,63 @@ class TestNights:
 
         assert f"/v3/users/sleep/{TODAY.isoformat()}" in [e for e, _ in polar.calls]
         assert _stored_polar_nights(db, user_id) == {TODAY}
+
+    def test_a_night_whose_score_fails_to_save_is_fetched_again_and_keeps_its_score(
+        self, db: Session, data_247: Polar247Data, polar: FakePolar
+    ) -> None:
+        # Codex 4270734341. The score is saved before the sleep record commits, so a failed score
+        # write leaves the night missing (asked for again) rather than stored without its score.
+        user_id = _polar_user(db)
+        polar.nights = [TODAY]
+        polar.sleep_score = 82
+        with patch(_SCORE_WRITE, side_effect=RuntimeError("down")):
+            first = data_247.load_and_save_all(db, user_id)
+        assert isinstance(first["sleep"], DataTypeFailure)
+        assert _stored_polar_nights(db, user_id) == set()
+
+        polar.calls.clear()
+        second = data_247.load_and_save_all(db, user_id)
+
+        assert second["sleep"] == 1
+        assert f"/v3/users/sleep/{TODAY.isoformat()}" in [e for e, _ in polar.calls]
+        assert _stored_polar_nights(db, user_id) == {TODAY}
+        assert _sleep_scores(db, user_id) == [82]
+
+    def test_a_night_merged_into_an_adjacent_one_keeps_its_score_on_the_merged_record(
+        self, db: Session, data_247: Polar247Data, polar: FakePolar
+    ) -> None:
+        # The merge stores the night under a new record id, not the one normalize_sleep minted;
+        # the score must point at the record that exists, or its foreign key refuses it.
+        user_id = _polar_user(db)
+        night = _night(TODAY)
+        source = DataSourceFactory(user=db.get(User, user_id), provider=ProviderName.POLAR)
+        nap_end = datetime.fromisoformat(night["start_time"]) - timedelta(hours=1)
+        EventRecordFactory(
+            data_source=source,
+            category="sleep",
+            type="sleep_session",
+            start_datetime=nap_end - timedelta(hours=1),
+            end_datetime=nap_end,
+        )
+        polar.nights = [TODAY]
+        polar.sleep_score = 64
+
+        result = data_247.load_and_save_all(db, user_id)
+
+        assert result["sleep"] == 1
+        sleep = (
+            db.query(EventRecord)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user_id, EventRecord.category == "sleep")
+            .one()
+        )
+        score = (
+            db.query(HealthScore)
+            .filter(HealthScore.user_id == user_id, HealthScore.provider == ProviderName.POLAR)
+            .one()
+        )
+        assert score.event_record_id == sleep.id
+        assert float(score.value) == 64
 
     def test_a_failed_night_does_not_lose_the_others_and_is_fetched_again(
         self, db: Session, data_247: Polar247Data, polar: FakePolar
@@ -323,6 +398,55 @@ class TestFailedTypes:
 
 
 class TestTheWebhookPath:
+    def test_a_webhook_for_a_night_already_stored_puts_its_score_on_the_stored_record(
+        self, db: Session, data_247: Polar247Data, polar: FakePolar
+    ) -> None:
+        # The night lands in the record already there (no new record), and its score points at it.
+        user_id = _polar_user(db)
+        polar.nights = [TODAY]
+        data_247.load_and_save_all(db, user_id)  # stored without a score
+        polar.sleep_score = 70
+
+        result = data_247.fetch_and_save_from_webhook(
+            db, user_id, PolarWebhookEventType.SLEEP, f"/v3/users/sleep/{TODAY.isoformat()}"
+        )
+
+        assert result == {"sleep": 1}
+        sleep = (
+            db.query(EventRecord)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user_id, EventRecord.category == "sleep")
+            .one()
+        )
+        score = (
+            db.query(HealthScore)
+            .filter(HealthScore.user_id == user_id, HealthScore.provider == ProviderName.POLAR)
+            .one()
+        )
+        assert score.event_record_id == sleep.id
+
+    def test_a_webhook_night_whose_score_fails_to_save_is_fetched_by_the_next_pull_with_its_score(
+        self, db: Session, data_247: Polar247Data, polar: FakePolar
+    ) -> None:
+        # Codex 4270734341, the webhook's SLEEP case: same order as the pull, so a failed score
+        # write leaves the night missing, not stored without its score.
+        user_id = _polar_user(db)
+        polar.nights = [TODAY]
+        polar.sleep_score = 77
+        with patch(_SCORE_WRITE, side_effect=RuntimeError("down")), pytest.raises(RuntimeError):
+            data_247.fetch_and_save_from_webhook(
+                db, user_id, PolarWebhookEventType.SLEEP, f"/v3/users/sleep/{TODAY.isoformat()}"
+            )
+        db.rollback()  # the webhook's session ends with the failure
+        assert _stored_polar_nights(db, user_id) == set()
+
+        polar.calls.clear()
+        data_247.load_and_save_all(db, user_id)
+
+        assert f"/v3/users/sleep/{TODAY.isoformat()}" in [e for e, _ in polar.calls]
+        assert _stored_polar_nights(db, user_id) == {TODAY}
+        assert _sleep_scores(db, user_id) == [77]
+
     def test_a_failed_webhook_fetch_does_not_mark_the_connection_synced_and_reports_a_code(self, db: Session) -> None:
         user = UserFactory()
         connection = UserConnectionFactory(

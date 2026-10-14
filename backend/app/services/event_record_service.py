@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from logging import Logger, getLogger
@@ -332,6 +332,7 @@ class EventRecordService(
         record: EventRecordCreate,
         detail: EventRecordDetailCreate,
         threshold_minutes: int,
+        before_commit: Callable[[EventRecord], None] | None = None,
     ) -> EventRecord:
         """Create a sleep record, merging with any adjacent session within threshold_minutes.
 
@@ -342,10 +343,18 @@ class EventRecordService(
         average over sessions that have a non-None score.  The merged record is created
         first, and the old record is deleted only after a successful insert — so a failure
         never loses the original data.
+
+        FORK (2.96.6.1): ``before_commit`` is called with the record the night ended up in (the
+        new one, or the one it merged into) inside the same transaction, just before the single
+        commit, so a caller can write rows that must exist whenever the night does (a provider's
+        sleep score, which points at the record). If it raises, nothing is committed.
         """
         result, inserted, final_detail = self._create_or_merge_sleep_inner(
             db_session, user_id, record, detail, threshold_minutes
         )
+        if before_commit is not None:
+            before_commit(result)
+        db_session.commit()
         if inserted:
             eff = final_detail.sleep_efficiency_score
             has_stages = any(
@@ -404,6 +413,7 @@ class EventRecordService(
         detail: EventRecordDetailCreate,
         threshold_minutes: int,
     ) -> tuple[EventRecord, bool, EventRecordDetailCreate]:
+        """The write half of create_or_merge_sleep: everything flushed, nothing committed (the caller commits)."""
         adjacent = self.find_adjacent_sleep_record(
             db_session,
             user_id,
@@ -440,7 +450,6 @@ class EventRecordService(
                         self._local_sleep_date(adjacent.start_datetime, adjacent.zone_offset),
                     },
                 )
-                db_session.commit()
                 return adjacent, False, detail
 
             adj_detail: SleepDetails | None = adjacent.sleep_detail
@@ -568,7 +577,6 @@ class EventRecordService(
                     user_id,
                     {self._local_sleep_date(adjacent.start_datetime, adjacent.zone_offset)},
                 )
-                db_session.commit()
                 return adjacent, False, detail
 
             record = record.model_copy(
@@ -595,7 +603,6 @@ class EventRecordService(
                     user_id,
                     {self._local_sleep_date(adjacent.start_datetime, adjacent.zone_offset)},
                 )
-                db_session.commit()
                 return adjacent, False, detail
 
             merged_final_detail = detail.model_copy(update={"record_id": created_record.id, **merged_detail_fields})
@@ -614,7 +621,6 @@ class EventRecordService(
                     self._local_sleep_date(created_record.start_datetime, created_record.zone_offset),
                 },
             )
-            db_session.commit()
             return created_record, True, merged_final_detail
 
         created_record = self.crud.create_and_flush(db_session, record)
@@ -624,7 +630,6 @@ class EventRecordService(
             new_detail,
             detail_type="sleep",
         )
-        db_session.commit()
         return created_record, True, new_detail
 
     @staticmethod

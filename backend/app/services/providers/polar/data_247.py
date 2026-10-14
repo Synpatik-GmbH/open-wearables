@@ -979,17 +979,8 @@ class Polar247Data(Base247DataTemplate):
 
         match event_type:
             case PolarWebhookEventType.SLEEP:
-                count = 0
-                for record, detail, score, hr_samples in self.normalize_sleep([raw], user_id):
-                    event_record_service.create_or_merge_sleep(
-                        db, user_id, record, detail, settings.sleep_end_gap_minutes
-                    )
-                    count += 1
-                    if score:
-                        health_score_service.bulk_create(db, [score])
-                    if hr_samples:
-                        timeseries_service.bulk_create_samples(db, hr_samples)
-                return {"sleep": count}
+                # FORK (2.96.6.1): the same save as the pull, so the night is stored last.
+                return {"sleep": self._save_sleep_items(db, user_id, [raw])}
 
             case PolarWebhookEventType.ACTIVITY_SUMMARY:
                 return {"daily_activity": self._save_timeseries(db, self.normalize_daily_activity([raw], user_id))}
@@ -1096,15 +1087,38 @@ class Polar247Data(Base247DataTemplate):
         """Store sleep records with their scores and heart-rate samples. Raises on any failure."""
         count = 0
         for record, detail, score, hr in self.normalize_sleep(raw_items, user_id):
-            # The night's heart rate first: the sleep record commits (and is announced) inside
-            # create_or_merge_sleep, and from then on the night counts as stored and is not
-            # fetched again, so anything saved after it and failing would be lost for good.
+            # The night's heart rate first, then the sleep record and its score in ONE commit:
+            # the record commits (and is announced) inside create_or_merge_sleep, and from then on
+            # the night counts as stored and is not fetched again, so anything saved after that
+            # commit and failing would be lost for good. A failure before it leaves the night
+            # missing, so the next pull asks again; the heart-rate and score writes do nothing on
+            # a row already there, so the retry is safe.
             self._save_timeseries(db, hr)
-            event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
+            event_record_service.create_or_merge_sleep(
+                db,
+                user_id,
+                record,
+                detail,
+                settings.sleep_end_gap_minutes,
+                before_commit=self._score_writer(db, score),
+            )
             count += 1
-            if score:
-                self._save_scores(db, [score])
         return count
+
+    def _score_writer(self, db: DbSession, score: HealthScoreCreate | None) -> Callable[[EventRecord], None] | None:
+        """The night's score, written in the sleep record's own transaction and pointing at it.
+
+        The score cannot be written before the record: it references the record (foreign key).
+        It points at the record the night ended up in, which after a merge is not the id
+        ``normalize_sleep`` minted.
+        """
+        if score is None:
+            return None
+
+        def write(stored: EventRecord) -> None:
+            self._save_scores(db, [score.model_copy(update={"event_record_id": stored.id})])
+
+        return write
 
     # -------------------------------------------------------------------------
     # Load and save all — entry point for sync_vendor_data task
