@@ -792,6 +792,16 @@ class EventRecordService(
             hr_trace_completeness=hr_trace_completeness,
         )
 
+    def schedule_workout_created(self, record_id: UUID) -> None:
+        """Schedule ``workout.created`` for a workout whose record and detail the caller has committed.
+
+        FORK (2.96.6.1): for a caller that writes the record and its detail in its own transaction
+        (``create_detail`` commits by itself, so it cannot be part of one). Same gate as
+        ``create_detail``'s workout branch.
+        """
+        if svix_service.is_enabled():
+            self._schedule_workout_finalize(record_id)
+
     @staticmethod
     def _schedule_workout_finalize(record_id: UUID) -> None:
         """Schedule the settle-debounce task that emits ``workout.created`` once the HR

@@ -196,9 +196,10 @@ class PolarWorkouts(BaseWorkoutsTemplate):
           (data source, start, end), so without this check every pull would add a second copy.
           Correcting such a row is ``scripts/data_migrations/correct_polar_workout_start_times.py``'s
           job alone (L2), so that it happens once and is counted.
-        - A new exercise is stored at its true instant and recorded in ``polar_workout_true_time``
-          (``recorded_by = "ingest"``) in the same transaction, which is what keeps the correction
-          from ever touching it (AC16).
+        - A new exercise is stored at its true instant, with its detail, and recorded in
+          ``polar_workout_true_time`` (``recorded_by = "ingest"``), all in one transaction: the
+          true-time row is what keeps the correction from ever touching it (AC16), and the single
+          commit is what keeps a killed worker from leaving a record the next pull would skip.
         """
         oldest_start = datetime.now(timezone.utc) - timedelta(days=POLAR_WINDOW_DAYS)
         count = 0
@@ -207,24 +208,28 @@ class PolarWorkouts(BaseWorkoutsTemplate):
                 continue
             if record.external_id is not None and self._exercise_stored(db, user_id, record.external_id):
                 continue
-            # The record and its true-time row commit together: a record without one would read
-            # as two offsets late to the correction script, which would then move a right time.
-            created = self.workout_repo.create_and_flush(db, record)
-            if created.id != record.id:
-                # Another record already holds this (data source, start, end): not ours to touch.
-                db.rollback()
-                continue
-            db.add(PolarWorkoutTrueTime(event_record_id=created.id, recorded_by="ingest"))
-            db.commit()
+            # The record, its detail and its true-time row commit together, in one transaction.
+            # A record without its true-time row would read as two offsets late to the correction
+            # script, which would then move a right time; a record without its detail would read
+            # as stored to every later pull and never be completed or announced. A worker killed
+            # anywhere before the commit leaves nothing, so the next pull stores the exercise whole.
             try:
-                event_record_service.create_detail(db, detail.model_copy(update={"record_id": created.id}))
-            except Exception:
-                # Without its detail the record would be skipped by every later pull (it is
-                # stored) and never announced. Removing it lets the next pull store it whole.
-                db.rollback()
-                db.query(EventRecord).filter(EventRecord.id == created.id).delete(synchronize_session=False)
+                created = self.workout_repo.create_and_flush(db, record)
+                if created.id != record.id:
+                    # Another record already holds this (data source, start, end): not ours to touch.
+                    db.rollback()
+                    continue
+                db.add(PolarWorkoutTrueTime(event_record_id=created.id, recorded_by="ingest"))
+                event_record_service.event_record_detail_repo.create_and_flush(
+                    db, detail.model_copy(update={"record_id": created.id}), detail_type="workout"
+                )
                 db.commit()
+            except Exception:
+                db.rollback()
                 raise
+            # Announced only once all three rows are committed, so a finalize never runs for a
+            # record that is not there.
+            event_record_service.schedule_workout_created(created.id)
             count += 1
         return count
 

@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.models import EventRecord, PolarWorkoutTrueTime
+from app.models import EventRecord, PolarWorkoutTrueTime, WorkoutDetails
 from app.schemas.enums import ProviderName
 from app.schemas.providers.polar import ExerciseJSON as PolarExerciseJSON
 from app.services.providers.polar.strategy import PolarStrategy
@@ -204,7 +204,7 @@ class TestPolarWorkoutSavePath:
 
         with (
             patch(
-                "app.services.event_record_service.event_record_service.create_detail",
+                "app.repositories.event_record_detail_repository.EventRecordDetailRepository._build_detail",
                 side_effect=RuntimeError("detail down"),
             ),
             pytest.raises(RuntimeError),
@@ -214,6 +214,36 @@ class TestPolarWorkoutSavePath:
 
         assert workouts.load_data(db, user.id) == 1
         assert db.query(EventRecord).filter(EventRecord.external_id == "EX-DETAIL").count() == 1
+
+    def test_a_worker_killed_before_the_detail_leaves_nothing_the_next_pull_skips(
+        self, mock_request: MagicMock, svix_enabled: MagicMock, schedule: MagicMock, db: Session
+    ) -> None:
+        # Codex 4270734324. SystemExit is a BaseException: no ``except Exception`` cleanup runs,
+        # as when the worker process is killed. Whatever had committed before the detail write is
+        # what the next pull finds; a committed record without its detail would read as stored
+        # and be skipped for good, never carrying a detail or a workout.created.
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="polar")
+        mock_request.return_value = [_exercise("EX-KILLED", _now_local_iso(1), 120)]
+        workouts = PolarStrategy().workouts
+
+        with (
+            patch(
+                "app.repositories.event_record_detail_repository.EventRecordDetailRepository._build_detail",
+                side_effect=SystemExit(1),
+            ),
+            pytest.raises(SystemExit),
+        ):
+            workouts.load_data(db, user.id)
+        db.rollback()  # the process is gone: anything it had not committed is lost
+        schedule.assert_not_called()
+
+        assert workouts.load_data(db, user.id) == 1
+
+        row = db.query(EventRecord).filter(EventRecord.external_id == "EX-KILLED").one()
+        assert db.get(WorkoutDetails, row.id) is not None
+        assert db.get(PolarWorkoutTrueTime, row.id).recorded_by == "ingest"
+        schedule.assert_called_once_with(row.id)
 
     def test_two_stored_rows_for_one_exercise_do_not_stop_the_pull(
         self, mock_request: MagicMock, svix_enabled: MagicMock, schedule: MagicMock, db: Session
