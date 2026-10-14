@@ -4,15 +4,16 @@ Polar sends ``start_time`` as local wall-clock time with no zone, plus
 ``start_time_utc_offset`` in minutes. The true UTC instant is local minus offset.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.models import EventRecord
+from app.models import EventRecord, PolarWorkoutTrueTime
+from app.schemas.enums import ProviderName
 from app.services.providers.polar.strategy import PolarStrategy
-from tests.factories import UserConnectionFactory, UserFactory
+from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectionFactory, UserFactory
 
 
 def _exercise(exercise_id: str, start_time: str, offset_minutes: int, duration: str = "PT1H0M0S") -> dict:
@@ -69,3 +70,104 @@ class TestPolarStartInstant:
         assert row.start_datetime == datetime(2026, 10, 13, 8, 25, tzinfo=timezone.utc)
         assert row.end_datetime == datetime(2026, 10, 13, 9, 10, tzinfo=timezone.utc)
         assert row.zone_offset == "+02:00"
+
+
+def _now_local_iso(days_ago: int) -> str:
+    """A Polar-style local start time (no zone) ``days_ago`` days back, at 10:25."""
+    day = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    return day.strftime("%Y-%m-%dT10:25:00")
+
+
+@patch("app.services.event_record_service.EventRecordService._schedule_workout_finalize")
+@patch("app.services.event_record_service.svix_service.is_enabled", return_value=True)
+@patch("app.services.providers.templates.base_workouts.make_authenticated_request")
+class TestPolarWorkoutSavePath:
+    """2.96.6.1 (L2, AC3, AC16): what a pull writes for each exercise Polar lists."""
+
+    def test_a_new_exercise_is_stored_and_recorded_as_true_time(
+        self, mock_request: MagicMock, svix_enabled: MagicMock, schedule: MagicMock, db: Session
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="polar")
+        mock_request.return_value = [_exercise("EX-NEW", _now_local_iso(3), 120)]
+
+        saved = PolarStrategy().workouts.load_data(db, user.id)
+
+        row = db.query(EventRecord).filter(EventRecord.external_id == "EX-NEW").one()
+        assert saved == 1
+        assert db.get(PolarWorkoutTrueTime, row.id).recorded_by == "ingest"
+        schedule.assert_called_once_with(row.id)
+
+    def test_an_exercise_already_stored_is_left_alone_and_sends_nothing(
+        self, mock_request: MagicMock, svix_enabled: MagicMock, schedule: MagicMock, db: Session
+    ) -> None:
+        # The shifted row a pre-fix pull wrote. Its true time is two offsets earlier, so the
+        # fixed arithmetic no longer collides with it on (data source, start, end): without the
+        # external-id check, every hourly pull would add a second copy and a second workout.created.
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="polar")
+        source = DataSourceFactory(user=user, provider=ProviderName.POLAR, source="polar")
+        shifted_start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=3)
+        shifted = EventRecordFactory(
+            data_source=source, external_id="EX-OLD", start_datetime=shifted_start, zone_offset="+02:00"
+        )
+        mock_request.return_value = [_exercise("EX-OLD", _now_local_iso(3), 120)]
+
+        saved = PolarStrategy().workouts.load_data(db, user.id)
+
+        rows = db.query(EventRecord).filter(EventRecord.external_id == "EX-OLD").all()
+        assert saved == 0
+        assert [r.id for r in rows] == [shifted.id]
+        assert rows[0].start_datetime == shifted_start
+        assert db.get(PolarWorkoutTrueTime, shifted.id) is None
+        schedule.assert_not_called()
+
+    def test_a_second_pull_of_a_recorded_exercise_writes_nothing(
+        self, mock_request: MagicMock, svix_enabled: MagicMock, schedule: MagicMock, db: Session
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="polar")
+        mock_request.return_value = [_exercise("EX-TWICE", _now_local_iso(2), 120)]
+        workouts = PolarStrategy().workouts
+        workouts.load_data(db, user.id)
+        schedule.reset_mock()
+
+        saved = workouts.load_data(db, user.id)
+
+        assert saved == 0
+        assert db.query(EventRecord).filter(EventRecord.external_id == "EX-TWICE").count() == 1
+        schedule.assert_not_called()
+
+    def test_an_exercise_older_than_90_days_is_not_stored(
+        self, mock_request: MagicMock, svix_enabled: MagicMock, schedule: MagicMock, db: Session
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="polar")
+        mock_request.return_value = [
+            _exercise("EX-91", _now_local_iso(91), 120),
+            _exercise("EX-89", _now_local_iso(89), 120),
+        ]
+
+        saved = PolarStrategy().workouts.load_data(db, user.id)
+
+        stored = {r.external_id for r in db.query(EventRecord).filter(EventRecord.external_id.like("EX-%")).all()}
+        assert saved == 1
+        assert stored == {"EX-89"}
+
+    def test_the_webhook_path_follows_the_same_rules(
+        self, mock_request: MagicMock, svix_enabled: MagicMock, schedule: MagicMock, db: Session
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="polar")
+        source = DataSourceFactory(user=user, provider=ProviderName.POLAR, source="polar")
+        EventRecordFactory(data_source=source, external_id="EX-HOOK-OLD", zone_offset="+02:00")
+        workouts = PolarStrategy().workouts
+
+        mock_request.return_value = _exercise("EX-HOOK-OLD", _now_local_iso(1), 120)
+        assert workouts.fetch_and_save_exercise(db, user.id, "/v3/exercises/EX-HOOK-OLD") == 0
+        mock_request.return_value = _exercise("EX-HOOK-NEW", _now_local_iso(1), 120)
+        assert workouts.fetch_and_save_exercise(db, user.id, "/v3/exercises/EX-HOOK-NEW") == 1
+
+        new_row = db.query(EventRecord).filter(EventRecord.external_id == "EX-HOOK-NEW").one()
+        assert db.get(PolarWorkoutTrueTime, new_row.id).recorded_by == "ingest"
+        assert db.query(EventRecord).filter(EventRecord.external_id == "EX-HOOK-OLD").count() == 1

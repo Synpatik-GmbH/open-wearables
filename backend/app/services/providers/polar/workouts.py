@@ -7,6 +7,8 @@ import isodate
 
 from app.constants.workout_types.polar import get_unified_workout_type
 from app.database import DbSession
+from app.models import PolarWorkoutTrueTime
+from app.schemas.enums import ProviderName
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -16,6 +18,9 @@ from app.schemas.providers.polar import ExerciseJSON as PolarExerciseJSON
 from app.services.event_record_service import event_record_service
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
 from app.utils.dates import offset_to_iso
+
+# FORK (2.96.6.1, spec Q5): nothing whose date is more than this many days back is fetched or stored.
+POLAR_WINDOW_DAYS = 90
 
 
 class PolarWorkouts(BaseWorkoutsTemplate):
@@ -166,25 +171,47 @@ class PolarWorkouts(BaseWorkoutsTemplate):
     ) -> int:
         """Load data from Polar API."""
         workouts_data = self.get_workouts_from_api(db, user_id, **kwargs)
-        workouts = [PolarExerciseJSON(**w) for w in workouts_data]
-
-        count = 0
-        for record, detail in self._build_bundles(workouts, user_id):
-            created_record = event_record_service.create(db, record)
-            detail_for_record = detail.model_copy(update={"record_id": created_record.id})
-            event_record_service.create_detail(db, detail_for_record)
-            count += 1
-
-        return count
+        return self._save_exercises(db, user_id, [PolarExerciseJSON(**w) for w in workouts_data])
 
     def fetch_and_save_exercise(self, db: DbSession, user_id: UUID, path: str) -> int:
         """Fetch a single exercise by URL path and save it. Used by webhook handler."""
         raw = self._make_api_request(db, user_id, path)
         if not raw:
             return 0
+        return self._save_exercises(db, user_id, [PolarExerciseJSON(**raw)])
+
+    def _save_exercises(self, db: DbSession, user_id: UUID, exercises: list[PolarExerciseJSON]) -> int:
+        """Store each exercise Polar listed that is new, and record it as holding its true time.
+
+        FORK (2.96.6.1). Three rules, the same for the hourly pull and the webhook:
+
+        - An exercise that started more than ``POLAR_WINDOW_DAYS`` ago is not stored (spec Q5, AC3).
+        - An exercise already stored for this user (matched on Polar's exercise id) is left exactly
+          as it is: no write, no detail, no ``workout.created``. Before 2.96.6.1 the pull re-saved
+          every exercise Polar lists (its last 30 days) every hour and re-scheduled its webhook.
+          After the offset fix a row stored by the old arithmetic no longer collides on
+          (data source, start, end), so without this check every pull would add a second copy.
+          Correcting such a row is ``scripts/data_migrations/correct_polar_workout_start_times.py``'s
+          job alone (L2), so that it happens once and is counted.
+        - A new exercise is stored at its true instant and recorded in ``polar_workout_true_time``
+          (``recorded_by = "ingest"``) in the same transaction, which is what keeps the correction
+          from ever touching it (AC16).
+        """
+        oldest_start = datetime.now(timezone.utc) - timedelta(days=POLAR_WINDOW_DAYS)
         count = 0
-        for record, detail in self._build_bundles([PolarExerciseJSON(**raw)], user_id):
+        for record, detail in self._build_bundles(exercises, user_id):
+            if record.start_datetime < oldest_start:
+                continue
+            if record.external_id is not None and self.workout_repo.get_by_external_id(
+                db, user_id, record.external_id, provider=ProviderName.POLAR
+            ):
+                continue
             created = event_record_service.create(db, record)
+            if created.id != record.id:
+                # Another record already holds this (data source, start, end): not ours to touch.
+                continue
+            db.add(PolarWorkoutTrueTime(event_record_id=created.id, recorded_by="ingest"))
+            db.commit()
             event_record_service.create_detail(db, detail.model_copy(update={"record_id": created.id}))
             count += 1
         return count
