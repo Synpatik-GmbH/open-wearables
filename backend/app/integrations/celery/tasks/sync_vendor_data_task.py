@@ -472,7 +472,8 @@ def sync_vendor_data(
                                     kind=DataTypeKind.TASK,
                                     native_type="workouts",
                                     status=SyncStatus.FAILED,
-                                    error=error_code(e),
+                                    # A code goes in error_code; error stays empty (AC5).
+                                    error_code=error_code(e),
                                 )
                             )
                             if strategy.pull_stops_on(error_code(e)):
@@ -602,7 +603,8 @@ def sync_vendor_data(
                                     kind=DataTypeKind.TASK,
                                     native_type="data_247",
                                     status=SyncStatus.FAILED,
-                                    error=error_code(e),
+                                    # A code goes in error_code; error stays empty (AC5).
+                                    error_code=error_code(e),
                                 )
                             )
 

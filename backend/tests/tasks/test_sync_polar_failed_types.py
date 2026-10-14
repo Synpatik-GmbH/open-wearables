@@ -4,11 +4,14 @@ The failed type is recorded FAILED with a code and no text, and the connection's
 not move past the pull. Polar is faked at ``_make_api_request``; storage is real.
 """
 
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.sync_vendor_data_task import cursor_after_failed_pull, sync_vendor_data
@@ -29,7 +32,15 @@ def polar() -> FakePolar:
 class TestTheSyncRun:
     """The run record and the cursor, for a real Polar pull through the task."""
 
-    def _pull(self, db: Session, session_local: MagicMock, polar: FakePolar) -> UUID:
+    def _pull(
+        self,
+        db: Session,
+        session_local: MagicMock,
+        polar: FakePolar,
+        *,
+        workouts_answer: dict[str, Any] | None = None,
+        load_and_save_all: dict[str, Any] | None = None,
+    ) -> UUID:
         user = UserFactory()
         connection = UserConnectionFactory(user=user, provider="polar", status=ConnectionStatus.ACTIVE)
         connection.last_synced_at = datetime.now(timezone.utc) - timedelta(hours=1)
@@ -48,7 +59,13 @@ class TestTheSyncRun:
             patch("app.services.sync_status_service.SessionLocal", session_local),
             patch("app.services.sync_status_service.settings.persist_live_sync_runs", True),
             patch.object(Polar247Data, "_make_api_request", side_effect=polar),
-            patch("app.services.providers.templates.base_workouts.make_authenticated_request", return_value=[]),
+            patch(
+                "app.services.providers.templates.base_workouts.make_authenticated_request",
+                **(workouts_answer or {"return_value": []}),
+            ),
+            patch.object(Polar247Data, "load_and_save_all", **load_and_save_all)
+            if load_and_save_all is not None
+            else nullcontext(),
         ):
             sync_vendor_data(str(user.id), providers=["polar"])
         return connection.id
@@ -74,6 +91,34 @@ class TestTheSyncRun:
         assert row.status == SyncStatus.FAILED
         assert row.error_code == "HTTPException_503"
         assert row.error is None
+
+    def test_a_failure_caught_by_the_outer_handlers_is_recorded_with_its_code_and_no_text(
+        self, session_local: MagicMock, db: Session, polar: FakePolar, mock_celery_app: MagicMock
+    ) -> None:
+        # Codex 4270734360 (AC5): the workouts call and load_and_save_all each raise, so their
+        # outcomes come from the task's own exception handlers, not from a DataTypeFailure.
+        down = HTTPException(status_code=503, detail="upstream said something with the user's data in it")
+
+        self._pull(
+            db,
+            session_local,
+            polar,
+            workouts_answer={"side_effect": down},
+            load_and_save_all={"side_effect": down},
+        )
+
+        rows = {
+            r.data_type: r
+            for r in db.query(SyncRunDataType)
+            .join(SyncRun, SyncRunDataType.run_id == SyncRun.id)
+            .filter(SyncRun.provider == "polar", SyncRunDataType.data_type.in_(["workouts", "data_247"]))
+            .all()
+        }
+        assert set(rows) == {"workouts", "data_247"}
+        for row in rows.values():
+            assert row.status == SyncStatus.FAILED
+            assert row.error_code == "HTTPException_503"
+            assert row.error is None
 
     def test_the_cursor_does_not_move_past_a_pull_with_a_failed_type(
         self, session_local: MagicMock, db: Session, polar: FakePolar, mock_celery_app: MagicMock
