@@ -219,6 +219,35 @@ def test_a_retry_gap_on_sleep_does_not_hold_back_an_ask(client: TestClient, db: 
     assert LAST_NIGHT in _stored_polar_nights(db, user_id)
 
 
+def test_a_malformed_older_entry_still_lets_recharge_be_fetched(
+    client: TestClient, db: Session, polar: FakePolar
+) -> None:
+    # Codex 4273701335: a sleep failure other than a 429 used to skip Nightly Recharge, where a
+    # Polar night's HRV comes from, so readiness could not show within the minute (R2).
+    user_id = _member(db)
+    polar.extra_available = ["not an entry"]
+    polar.nights = [LAST_NIGHT]
+
+    answer = _ask(client, user_id)
+
+    assert "/v3/users/nightly-recharge" in [e for e, _ in polar.calls]
+    assert LAST_NIGHT in _stored_polar_nights(db, user_id)
+    assert answer["outcome"] == "failed"
+    assert answer["reason"] == "polar_sleep_listing_malformed"
+
+
+def test_a_429_on_the_night_list_still_asks_nothing_more(client: TestClient, db: Session, polar: FakePolar) -> None:
+    # The one sleep failure that still ends the ask: Polar has said its limit is spent.
+    user_id = _member(db)
+    polar.failing_endpoints = {"/v3/users/sleep/available"}
+    polar.failure_status = 429
+
+    answer = _ask(client, user_id)
+
+    assert [e for e, _ in polar.calls] == ["/v3/users/sleep/available"]
+    assert answer == {"outcome": "failed", "reason": "HTTPException_429", "stored": 0}
+
+
 def test_the_route_needs_the_api_key(client: TestClient, db: Session, polar: FakePolar) -> None:
     user_id = _member(db)
 

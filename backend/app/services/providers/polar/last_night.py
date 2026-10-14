@@ -29,7 +29,7 @@ from app.schemas.enums import ProviderName
 from app.schemas.sync_status import DataTypeFailure
 from app.services.providers.polar.data_247 import Polar247Data
 from app.services.providers.polar.oauth import polar_registration_pending
-from app.services.providers.polar.pull_budget import claim_on_open
+from app.services.providers.polar.pull_budget import RATE_LIMITED, claim_on_open
 from app.services.sync_error_code import UNKNOWN, error_code
 from app.utils.structured_logging import log_structured
 
@@ -79,14 +79,16 @@ def ask_polar_for_last_night(db: DbSession, data_247: Polar247Data, user_id: UUI
         stored += nights
         db.commit()
 
-    if failure is None:
+    # Nightly Recharge is where a Polar night's HRV comes from, so it is asked for after any
+    # sleep failure but a 429: Polar has then said its limit is spent (Codex 4273701335).
+    if failure != RATE_LIMITED:
         try:
             recharges = data_247.get_nightly_recharge_data(db, user_id, now, now)
             stored += data_247._save_nightly_recharge(db, *data_247.normalize_nightly_recharge(recharges, user_id))
             db.commit()
         except Exception as e:
             db.rollback()
-            failure = error_code(e) or UNKNOWN
+            failure = failure or error_code(e) or UNKNOWN
 
     # A code, never the exception's text (spec cause 3).
     log_structured(
