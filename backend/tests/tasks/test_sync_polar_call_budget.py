@@ -9,6 +9,7 @@ Polar is faked at ``_make_api_request`` (24/7 data) and at the request the worko
 every call is counted; storage is real.
 """
 
+import logging
 from collections.abc import Iterator
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -25,7 +26,9 @@ from app.models import PolarRegistration, SyncRun, SyncRunDataType, UserConnecti
 from app.schemas.auth import ConnectionStatus
 from app.schemas.sync_status import SyncStatus
 from app.services.providers.polar.data_247 import Polar247Data
+from app.services.providers.polar.last_night import ask_polar_for_last_night
 from app.services.providers.polar.pull_budget import PULL_INTERVAL, RATE_LIMITED
+from app.services.providers.polar.strategy import PolarStrategy
 from tests.factories import UserConnectionFactory, UserFactory
 from tests.providers.polar.test_polar_no_lost_nights import FakePolar, _stored_polar_nights
 
@@ -185,7 +188,15 @@ class TestRateLimit:
         assert row.error_code == RATE_LIMITED
 
 
-def _worst_case_day(member: UUID, polar: FakePolar, hourly_minute: int) -> int:
+def _polar_data() -> Polar247Data:
+    data = PolarStrategy().data_247
+    assert isinstance(data, Polar247Data)
+    return data
+
+
+def _worst_case_day(
+    member: UUID, polar: FakePolar, hourly_minute: int, more: list[tuple[datetime, Any]] | None = None
+) -> int:
     """One member's Polar calls over DAY. Returns the count."""
     # Every night Polar lists (its last 28 days) is missing when the day starts; last night
     # reaches Polar at 06:00, when the watch syncs.
@@ -193,7 +204,7 @@ def _worst_case_day(member: UUID, polar: FakePolar, hourly_minute: int) -> int:
     polar.calls.clear()
     morning_ticks = [_at(h, m) for h in range(2, 12) for m in (0, 15, 30, 45)] + [_at(12)]
     events = sorted(
-        [(_at(h, hourly_minute), hourly) for h in range(24)] + [(t, force_sync) for t in morning_ticks],
+        [(_at(h, hourly_minute), hourly) for h in range(24)] + [(t, force_sync) for t in morning_ticks] + (more or []),
         key=lambda e: e[0],
     )
     for at, pull in events:
@@ -236,6 +247,30 @@ class TestADay:
         force_sync(member, _at(6, 45))
 
         assert DAY in _stored_polar_nights(db, member)
+
+
+@pytest.mark.usefixtures("mock_celery_app")
+def test_a_worst_case_day_with_the_app_opened_all_morning_stays_inside_the_limit(
+    db: Session, member: UUID, polar_api: FakePolar
+) -> None:
+    # AC17 with AC18's asks: on the worst-case day, the member also opens the app every five
+    # minutes from 04:00 to 12:00 UTC. Calibra asks only while last night is missing, but the
+    # worst case is that it asks every time. The asks are capped at twelve a day of three calls.
+    ask_calls: list[int] = []
+
+    def ask(member: UUID, at: datetime) -> None:
+        before = len(polar_api.calls)
+        with freeze_time(at):
+            ask_polar_for_last_night(db, _polar_data(), member, logging.getLogger("test"))
+        ask_calls.append(len(polar_api.calls) - before)
+
+    asks = [(_at(4) + timedelta(minutes=5 * n), ask) for n in range(97)]
+
+    calls = _worst_case_day(member, polar_api, hourly_minute=7, more=asks)
+
+    assert sum(1 for c in ask_calls if c > 0) == 12, "the daily cap, and nothing called on a refused ask"
+    assert sum(ask_calls) <= 12 * 3
+    assert calls <= POLAR_DAILY_CALLS_PER_MEMBER_AT_50, calls
 
 
 @pytest.mark.usefixtures("mock_celery_app")

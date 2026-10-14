@@ -7,7 +7,10 @@ from sqlalchemy.orm import Session
 from app.models import PolarPullState
 from app.services.providers.polar.pull_budget import (
     FULL_INTERVAL,
+    ON_OPEN_INTERVAL,
     PULL_INTERVAL,
+    TOO_SOON,
+    claim_on_open,
     claim_pull,
     forget_full_fetch,
     full_due,
@@ -57,7 +60,38 @@ class TestClaimPull:
         assert claim_pull(db, second.id, T0) is True
 
 
+class TestClaimOnOpen:
+    """Spec R2: asks for last night on open are limited on their own, apart from the pull interval."""
+
+    def test_a_pull_is_claimed_on_a_row_an_ask_on_open_made(self, db: Session) -> None:
+        connection = UserConnectionFactory(provider="polar")
+        assert claim_on_open(db, connection.id, T0) is None
+
+        assert claim_pull(db, connection.id, T0) is True
+
+    def test_an_ask_on_open_is_claimed_right_after_a_pull(self, db: Session) -> None:
+        connection = UserConnectionFactory(provider="polar")
+        claim_pull(db, connection.id, T0)
+
+        assert claim_on_open(db, connection.id, T0 + timedelta(seconds=1)) is None
+
+    def test_a_refused_ask_records_nothing(self, db: Session) -> None:
+        connection = UserConnectionFactory(provider="polar")
+        claim_on_open(db, connection.id, T0)
+
+        assert claim_on_open(db, connection.id, T0 + ON_OPEN_INTERVAL - timedelta(seconds=1)) == TOO_SOON
+        db.expire_all()
+        state = db.get(PolarPullState, connection.id)
+        assert (state.on_open_at, state.on_open_count) == (T0, 1)
+
+
 class TestFullFetch:
+    def test_a_fetch_recorded_before_any_pull_starts_no_pull_clock(self, db: Session) -> None:
+        connection = UserConnectionFactory(provider="polar")
+        record_full_fetch(db, connection.id, "sleep", T0)
+
+        assert claim_pull(db, connection.id, T0 + timedelta(minutes=1)) is True
+
     def test_every_type_is_due_for_a_connection_never_fetched_in_full(self, db: Session) -> None:
         connection = UserConnectionFactory(provider="polar")
 
