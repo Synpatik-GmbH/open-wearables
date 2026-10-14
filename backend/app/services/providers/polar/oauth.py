@@ -84,7 +84,9 @@ class PolarOAuth(BaseOAuthTemplate):
         recorded as pending, retried at the start of every pull, and announced when it succeeds.
         """
         connection, announce, connected_at = self._store_connection(db, user_id, token_response, user_info)
-        was_pending = polar_registration_pending(db, connection.id)
+        # A failed earlier attempt, not "no row": a connection without one was announced when made.
+        previous = db.get(PolarRegistration, connection.id)
+        was_pending = previous is not None and not previous.registered
         if user_info.get("user_id"):
             failure = self._register_user(token_response.access_token, str(user_id))
         else:
@@ -97,8 +99,9 @@ class PolarOAuth(BaseOAuthTemplate):
         """Retry a registration that has not succeeded. None when registered, else a failure code.
 
         FORK (2.96.6.1, spec cause 4, AC6). Called at the start of every pull. A connection with
-        no registration row predates 2.96.6.1: it is attempted like a pending one, so a
-        registration that failed silently before the fix is retried as well. If that first attempt
+        no registration row predates 2.96.6.1: it is attempted like a pending one (and reported
+        pending until then, see ``polar_registration_pending``), so a registration that failed
+        silently before the fix is retried as well. If that first attempt
         succeeds it is not announced again (it was announced when it was made); if it fails and a
         later one succeeds, the success is announced like any pending one's, so such a connection
         can be announced twice. Calibra records a connection idempotently, so that is harmless.
@@ -130,9 +133,14 @@ class PolarOAuth(BaseOAuthTemplate):
 
 
 def polar_registration_pending(db: DbSession, connection_id: UUID) -> bool:
-    """True when the last registration attempt for this connection failed."""
+    """True until a registration attempt for this connection has succeeded.
+
+    FORK (2.96.6.1, spec cause 4, AC6): no row is pending too. Such a connection predates
+    2.96.6.1, and its registration may have failed silently then, so it is not reported as
+    connected until its next pull's attempt (``ensure_registered``) succeeds.
+    """
     row = db.get(PolarRegistration, connection_id)
-    return row is not None and not row.registered
+    return row is None or not row.registered
 
 
 def record_polar_registration(db: DbSession, connection_id: UUID, failure: str | None) -> PolarRegistration:

@@ -111,6 +111,24 @@ class TestAtReconnect:
         assert _registration(db, connection.id).registered is True
         assert [a["connection_id"] for a in announced] == [connection.id]
 
+    def test_a_reconnect_of_a_connection_made_before_the_fix_is_not_announced_again(
+        self, db: Session, announced: list[dict]
+    ) -> None:
+        # No registration row: it was announced when made (before 2.96.6.1), so a successful
+        # reconnect records the registration without a second connection.created. "No row" reads
+        # as pending to the connections API, not as "a failed attempt to announce".
+        user = UserFactory()
+        connection = UserConnectionFactory(
+            user=user, provider="polar", provider_user_id="4711", status=ConnectionStatus.ACTIVE
+        )
+        db.commit()
+
+        with patch("app.services.providers.polar.oauth.httpx.post", return_value=_answer(200)):
+            _callback(db, user.id)
+
+        assert _registration(db, connection.id).registered is True
+        assert announced == []
+
 
 class TestAtEveryPull:
     def _connection(self, db: Session, *, registered: bool | None) -> UserConnection:

@@ -18,8 +18,9 @@ class PolarRegistration(BaseDbModel):
     - ``registered`` false: the last attempt failed; it is retried at the start of every pull,
       the pull fetches nothing for the connection until it succeeds, and the connections API
       reports ``registration_pending``.
-    - no row: never attempted under this code (a connection made before 2.96.6.1). The next
-      pull attempts it, so a registration that failed silently before the fix is retried too.
+    - no row: never attempted under this code (a connection made before 2.96.6.1). It reads as
+      pending like a failed one (``registration_pending``), because a registration that failed
+      silently before the fix looks the same; the next pull attempts it and writes the row.
 
     Identifiers and state only (R-2026-10-13-e): ``last_error_code`` is a code from
     ``app.services.sync_error_code.error_code``, never a message. Deleted with the connection, which is deleted with
