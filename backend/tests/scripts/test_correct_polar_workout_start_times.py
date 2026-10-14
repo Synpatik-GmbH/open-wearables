@@ -6,9 +6,11 @@ See scripts/data_migrations/correct_polar_workout_start_times.py.
 """
 
 import importlib.util
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import text
@@ -180,6 +182,38 @@ class TestStopsBeforeChangingAnything:
         assert report.stopped is True
         assert report.collisions == 1
         assert report.corrected == 0
+
+    def test_two_candidates_that_correct_to_the_same_times_stop_the_run(self, db: Session) -> None:
+        # Codex 4270734395. Neither target is held by a row today (each candidate sits at a
+        # different shifted time), so only a check across the candidates sees that applying both
+        # would put two rows on one (data source, start, end), which the unique index refuses.
+        two_hours_late = _shifted_polar_workout(db, offset="+01:00")
+        four_hours_late = EventRecordFactory(
+            data_source=db.get(DataSource, two_hours_late.data_source_id),
+            category="workout",
+            external_id="EX-OTHER",
+            start_datetime=TRUE_START + timedelta(hours=4),
+            end_datetime=TRUE_START + timedelta(hours=4, minutes=45),
+            duration_seconds=45 * 60,
+            zone_offset="+02:00",
+        )
+        db.commit()
+        stored = {r.id: (r.start_datetime, r.end_datetime) for r in (two_hours_late, four_hours_late)}
+
+        report = correct(db, dry_run=False)
+
+        assert report.candidates == 2
+        assert report.stopped is True
+        assert report.collisions >= 1
+        assert report.corrected == 0
+        for record_id, (start, end) in stored.items():
+            row = _reload(db, record_id)
+            assert (row.start_datetime, row.end_datetime) == (start, end)
+        assert db.query(PolarWorkoutTrueTime).count() == 0
+
+        with patch.object(script, "SessionLocal", return_value=nullcontext(db)):
+            assert script.main(dry_run=True) == 2
+            assert script.main(dry_run=False) == 2
 
     def test_a_session_time_zone_other_than_utc_stops(self, db: Session) -> None:
         row = _shifted_polar_workout(db)

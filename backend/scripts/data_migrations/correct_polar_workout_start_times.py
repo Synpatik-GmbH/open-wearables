@@ -30,7 +30,9 @@ and reports every count, so a dry run tells the operator whether the run will go
 - ``unreadable_zone_offset``: an offset that is not ``+HH:MM`` / ``-HH:MM``;
 - ``older_than_90_days``: a candidate whose true start is more than 90 days ago (Q5);
 - ``collisions``: a candidate whose corrected (data source, start, end) is already held by
-  another row, which the unique index would reject half-way;
+  another row, plus every candidate that corrects to the same (data source, start, end) as
+  another candidate (two pre-fix copies of one exercise stored under different offsets);
+  the unique index would reject either half-way;
 - a session time zone other than UTC: the arithmetic above is exact only if the rows were
   written in a UTC session, and a non-UTC default now is the sign that they were not.
 
@@ -88,7 +90,11 @@ _COUNTS = text(f"""
                        WHERE o.data_source_id = k.data_source_id
                          AND o.start_datetime = k.true_start
                          AND o.end_datetime = k.true_end
-                         AND o.id <> k.id)) AS collisions,
+                         AND o.id <> k.id))
+      + (SELECT CAST(coalesce(sum(g.n), 0) AS bigint) FROM (
+          SELECT count(*) AS n FROM ({_CORRECTABLE}) k
+          GROUP BY k.data_source_id, k.true_start, k.true_end
+          HAVING count(*) > 1) g) AS collisions,
       current_setting('TimeZone') AS session_time_zone
 """)
 
