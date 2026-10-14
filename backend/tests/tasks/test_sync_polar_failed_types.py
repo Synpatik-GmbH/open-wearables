@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
-from app.models import SyncRun, SyncRunDataType, UserConnection
+from app.models import PolarRegistration, SyncRun, SyncRunDataType, UserConnection
 from app.schemas.auth import ConnectionStatus
 from app.schemas.sync_status import SyncStatus
 from app.services.providers.polar.data_247 import Polar247Data
@@ -33,6 +33,12 @@ class TestTheSyncRun:
         user = UserFactory()
         connection = UserConnectionFactory(user=user, provider="polar", status=ConnectionStatus.ACTIVE)
         connection.last_synced_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        # Polar accepted this user's registration, so the pull goes ahead.
+        db.add(
+            PolarRegistration(
+                user_connection_id=connection.id, registered=True, attempts=1, updated_at=datetime.now(timezone.utc)
+            )
+        )
         db.commit()
         session_local.return_value.__enter__.return_value = db
         session_local.return_value.__exit__.return_value = None
@@ -108,3 +114,41 @@ class TestTheSyncRun:
         assert "HTTPException_503" in logged
         assert "upstream said something" not in logged
         assert "night failed" not in logged
+
+
+@patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+def test_a_pull_fetches_nothing_while_the_polar_registration_still_fails(
+    session_local: MagicMock, db: Session, polar: FakePolar, mock_celery_app: MagicMock
+) -> None:
+    # Spec cause 4: the pull retries the registration first, and fetches nothing until it succeeds.
+    user = UserFactory()
+    connection = UserConnectionFactory(
+        user=user, provider="polar", provider_user_id="4711", status=ConnectionStatus.ACTIVE
+    )
+    connection.last_synced_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    db.add(
+        PolarRegistration(
+            user_connection_id=connection.id, registered=False, attempts=1, updated_at=datetime.now(timezone.utc)
+        )
+    )
+    db.commit()
+    cursor_before = connection.last_synced_at
+    session_local.return_value.__enter__.return_value = db
+    session_local.return_value.__exit__.return_value = None
+    refused = MagicMock(status_code=503)
+    with (
+        patch("app.services.sync_status_service.SessionLocal", session_local),
+        patch("app.services.sync_status_service.settings.persist_live_sync_runs", True),
+        patch("app.services.providers.polar.oauth.httpx.post", return_value=refused),
+        patch.object(Polar247Data, "_make_api_request", side_effect=polar),
+        patch("app.services.providers.templates.base_workouts.make_authenticated_request") as workouts_api,
+    ):
+        sync_vendor_data(str(user.id), providers=["polar"])
+
+    db.expire_all()
+    assert polar.calls == []
+    workouts_api.assert_not_called()
+    assert db.get(UserConnection, connection.id).last_synced_at == cursor_before
+    outcome = db.query(SyncRunDataType).filter(SyncRunDataType.data_type == "registration").one()
+    assert outcome.status == SyncStatus.FAILED
+    assert outcome.error_code == "HTTPStatusError_503"

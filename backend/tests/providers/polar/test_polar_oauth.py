@@ -226,7 +226,8 @@ class TestPolarOAuthUserInfo:
         # Assert
         assert user_info["user_id"] == "12345"
         assert user_info["username"] is None
-        mock_post.assert_called_once()
+        # 2.96.6.1: registration moved to _save_connection, after the connection exists.
+        mock_post.assert_not_called()
 
     def test_get_provider_user_info_without_x_user_id(self, db: Session) -> None:
         """Test extracting user info when x_user_id is None."""

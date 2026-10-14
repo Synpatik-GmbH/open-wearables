@@ -336,8 +336,26 @@ def sync_vendor_data(
                         with suppress(ValueError):
                             end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
 
+                    # FORK (2.96.6.1, spec cause 4): a provider may refuse the pull until it is
+                    # ready (Polar: until Polar accepted the user's registration). The refusal is a
+                    # FAILED outcome with its code, nothing is fetched, and the cursor stays put.
+                    not_ready = strategy.prepare_pull(db, connection)
+                    if not isinstance(not_ready, str):  # the contract is a code or None
+                        not_ready = None
+                    if not_ready is not None:
+                        provider_result.params["registration"] = {"success": False, "error": not_ready}
+                        data_type_outcomes.append(
+                            DataTypeOutcome(
+                                data_type="registration",
+                                kind=DataTypeKind.TASK,
+                                native_type="registration",
+                                status=SyncStatus.FAILED,
+                                error_code=not_ready,
+                            )
+                        )
+
                     # Sync workouts
-                    if strategy.workouts:
+                    if strategy.workouts and not_ready is None:
                         params = build_sync_params(effective_start, end_date)
                         _emit_sync_status(
                             emit_sync_progress,
@@ -388,7 +406,7 @@ def sync_vendor_data(
                             )
 
                     # Sync 247 data (sleep, recovery, activity) and SAVE to database
-                    if hasattr(strategy, "data_247") and strategy.data_247:
+                    if hasattr(strategy, "data_247") and strategy.data_247 and not_ready is None:
                         # Determine if this is first sync (for API compatibility with providers)
                         is_first_sync = connection.last_synced_at is None
 

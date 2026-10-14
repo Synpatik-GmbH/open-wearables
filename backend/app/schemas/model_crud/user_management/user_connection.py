@@ -78,3 +78,7 @@ class UserConnectionWithCapabilities(UserConnectionRead):
     webhook_callback: bool = False
     live_sync_mode: LiveSyncMode | None = None
     linked_user_ids: list[UUID] = Field(default_factory=list)
+    # FORK (2.96.6.1, spec cause 4, L1): true while the provider has not accepted this user's
+    # registration (Polar). The connection then delivers nothing, and a consumer must not show
+    # it as connected. False for every other provider and state.
+    registration_pending: bool = False

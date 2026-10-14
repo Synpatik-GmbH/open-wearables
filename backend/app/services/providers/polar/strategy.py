@@ -1,3 +1,5 @@
+from app.database import DbSession
+from app.models import UserConnection
 from app.services.providers.base_strategy import BaseProviderStrategy, ProviderCapabilities, ProviderCoverage
 from app.services.providers.polar.coverage import HEALTH_SCORES, SLEEP_FIELDS, TIMESERIES, WORKOUT_FIELDS
 from app.services.providers.polar.data_247 import Polar247Data
@@ -12,12 +14,13 @@ class PolarStrategy(BaseProviderStrategy):
 
     def __init__(self):
         super().__init__()
-        self.oauth = PolarOAuth(
+        self.polar_oauth = PolarOAuth(
             user_repo=self.user_repo,
             connection_repo=self.connection_repo,
             provider_name=self.name,
             api_base_url=self.api_base_url,
         )
+        self.oauth = self.polar_oauth
         self.workouts = PolarWorkouts(
             workout_repo=self.workout_repo,
             connection_repo=self.connection_repo,
@@ -32,6 +35,10 @@ class PolarStrategy(BaseProviderStrategy):
         )
         self.webhooks = PolarWebhookHandler(workouts=self.workouts, data_247=self.data_247)
         self.webhook_service = polar_webhook_service
+
+    def prepare_pull(self, db: DbSession, connection: UserConnection) -> str | None:
+        """FORK (2.96.6.1, spec cause 4, AC6): nothing is pulled until Polar accepted the user."""
+        return self.polar_oauth.ensure_registered(db, connection)
 
     @property
     def name(self) -> str:

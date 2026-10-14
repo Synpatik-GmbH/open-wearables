@@ -30,8 +30,10 @@ UNCLASSIFIED = "unclassified"
 UNKNOWN = "unknown"
 ALL_SUBTASKS_FAILED = "all_subtasks_failed"
 SDK_IMPORT_FAILED = "sdk_import_failed"
+# FORK (2.96.6.1): Polar's token response carried no x_user_id, so the user cannot be registered.
+POLAR_USER_ID_MISSING = "polar_user_id_missing"
 
-_FIXED_WORDS = frozenset({UNCLASSIFIED, UNKNOWN, ALL_SUBTASKS_FAILED, SDK_IMPORT_FAILED})
+_FIXED_WORDS = frozenset({UNCLASSIFIED, UNKNOWN, ALL_SUBTASKS_FAILED, SDK_IMPORT_FAILED, POLAR_USER_ID_MISSING})
 
 # Every module of this backend that defines an exception class. A test finds the classes
 # and fails when one is missing from here.

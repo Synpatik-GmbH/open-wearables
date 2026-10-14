@@ -12,6 +12,7 @@ from app.schemas.model_crud.user_management import UserConnectionWithCapabilitie
 from app.services import ApiKeyDep, user_connection_service
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
+from app.services.providers.polar.oauth import polar_registration_pending
 from app.utils.auth import CombinedAuthDep
 
 router = APIRouter()
@@ -62,7 +63,7 @@ def get_connections_endpoint(
         if c.provider_user_id and c.status == ConnectionStatus.ACTIVE
     ]
     linked_map = user_connection_service.get_linked_user_ids(db, user_id, provider_pairs)
-    return [
+    enriched = [
         _with_capabilities(
             conn,
             settings_map,
@@ -70,6 +71,11 @@ def get_connections_endpoint(
         )
         for conn in connections
     ]
+    # FORK (2.96.6.1, spec cause 4, L1): a Polar connection whose registration has not succeeded.
+    for item in enriched:
+        if item.provider == ProviderName.POLAR:
+            item.registration_pending = polar_registration_pending(db, item.id)
+    return enriched
 
 
 def _assert_sdk_token_may_disconnect(

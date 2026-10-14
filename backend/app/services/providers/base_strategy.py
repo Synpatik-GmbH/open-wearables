@@ -6,7 +6,8 @@ from uuid import UUID
 
 from celery import current_app as celery_app
 
-from app.models import EventRecord, User
+from app.database import DbSession
+from app.models import EventRecord, User, UserConnection
 from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
@@ -248,6 +249,16 @@ class BaseProviderStrategy(ABC):
         """
         caps = self.capabilities
         return caps.rest_pull and (caps.webhook_stream or caps.webhook_ping)
+
+    def prepare_pull(self, db: DbSession, connection: UserConnection) -> str | None:
+        """Called before a pull fetches anything for ``connection``. None to go ahead.
+
+        FORK (2.96.6.1). A provider returns a failure code when nothing can be fetched yet, and
+        the pull then records that code as a FAILED outcome, fetches nothing for the connection
+        and leaves its cursor where it is. Polar uses it to retry a user registration that has
+        not succeeded (spec cause 4). Most providers have nothing to prepare.
+        """
+        return None
 
     @property
     def default_live_sync_mode(self) -> LiveSyncMode | None:

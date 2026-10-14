@@ -458,7 +458,24 @@ class BaseOAuthTemplate(ABC):
         user_info: dict[str, str | None],
         oauth_state: OAuthState,
     ) -> None:
-        """Saves or updates the user connection."""
+        """Saves or updates the user connection, and announces it when it is new or reactivated."""
+        connection, announce, connected_at = self._store_connection(db, user_id, token_response, user_info)
+        if announce:
+            self._announce_connection(user_id, connection.id, connected_at)
+
+    def _store_connection(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        token_response: OAuthTokenResponse,
+        user_info: dict[str, str | None],
+    ) -> tuple[Any, bool, str]:
+        """Create or update the connection. Returns it, whether it is new or reactivated, and when.
+
+        FORK (2.96.6.1): split out of ``_save_connection`` so a provider can do work between
+        storing the connection and announcing it (Polar registers the user first and announces
+        only once Polar accepted it). The behaviour of ``_save_connection`` is unchanged.
+        """
         provider_user_id = user_info.get("user_id")
         provider_username = user_info.get("username")
 
@@ -485,28 +502,26 @@ class BaseOAuthTemplate(ABC):
                 provider_username=provider_username,
                 scope=scope,
             )
-            if was_inactive:
-                on_connection_created(
-                    user_id=user_id,
-                    provider=self.provider_name,
-                    connection_id=existing_connection.id,
-                    connected_at=datetime.now(timezone.utc).isoformat(),
-                )
-        else:
-            connection_create = UserConnectionCreate(
-                user_id=user_id,
-                provider=self.provider_name,
-                provider_user_id=provider_user_id,
-                provider_username=provider_username,
-                access_token=token_response.access_token,
-                refresh_token=token_response.refresh_token,
-                token_expires_at=token_expires_at,
-                scope=scope,
-            )
-            new_connection = self.connection_repo.create(db, connection_create)
-            on_connection_created(
-                user_id=user_id,
-                provider=self.provider_name,
-                connection_id=new_connection.id,  # ty:ignore[unresolved-attribute]
-                connected_at=new_connection.created_at.isoformat(),  # ty:ignore[unresolved-attribute]
-            )
+            return existing_connection, was_inactive, datetime.now(timezone.utc).isoformat()
+
+        connection_create = UserConnectionCreate(
+            user_id=user_id,
+            provider=self.provider_name,
+            provider_user_id=provider_user_id,
+            provider_username=provider_username,
+            access_token=token_response.access_token,
+            refresh_token=token_response.refresh_token,
+            token_expires_at=token_expires_at,
+            scope=scope,
+        )
+        new_connection = self.connection_repo.create(db, connection_create)
+        return new_connection, True, new_connection.created_at.isoformat()  # ty:ignore[unresolved-attribute]
+
+    def _announce_connection(self, user_id: UUID, connection_id: UUID, connected_at: str) -> None:
+        """Emit ``connection.created`` for this provider."""
+        on_connection_created(
+            user_id=user_id,
+            provider=self.provider_name,
+            connection_id=connection_id,
+            connected_at=connected_at,
+        )
