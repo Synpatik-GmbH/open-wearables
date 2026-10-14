@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable
 from uuid import UUID, uuid4
@@ -65,10 +65,19 @@ class PolarWorkouts(BaseWorkoutsTemplate):
         start_time_utc_offset: int,
         duration: str,
     ) -> tuple[datetime, datetime]:
-        """Extract start and end dates from timestamps with UTC offset."""
-        start_date = isodate.parse_datetime(start_time)
-        offset = timedelta(minutes=start_time_utc_offset)
-        start_date = start_date + offset
+        """Extract start and end instants (UTC-aware) from Polar's local start time and offset.
+
+        FORK (2.96.6.1, spec N9): Polar's ``start_time`` is local wall-clock time with no zone, so the
+        true instant is local MINUS ``start_time_utc_offset``. This used to ADD it and return a naive
+        value, which Postgres then read in the session time zone: every stored exercise sat two
+        offsets late. A ``start_time`` that already carries a zone is converted as given and the
+        offset is not applied a second time.
+        """
+        parsed = isodate.parse_datetime(start_time)
+        if parsed.tzinfo is None:
+            start_date = (parsed - timedelta(minutes=start_time_utc_offset)).replace(tzinfo=timezone.utc)
+        else:
+            start_date = parsed.astimezone(timezone.utc)
         duration_td = isodate.parse_duration(duration)
         end_date = start_date + duration_td
         return start_date, end_date
