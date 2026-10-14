@@ -66,7 +66,7 @@ from app.services.providers.polar.pull_budget import (
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.raw_payload_storage import store_raw_payload
-from app.services.sync_error_code import UNKNOWN, error_code
+from app.services.sync_error_code import POLAR_SLEEP_LISTING_MALFORMED, UNKNOWN, error_code
 from app.services.timeseries_service import timeseries_service
 from app.utils.structured_logging import log_structured
 
@@ -1024,17 +1024,18 @@ class Polar247Data(Base247DataTemplate):
 
         ``latest_only`` is the short form (spec R1): only the newest night Polar lists is
         considered, which is last night once the watch has synced.
+
+        A listed entry whose date, start or end cannot be read is skipped on its own, so it
+        cannot stop the valid nights being fetched (the newest valid one, in the short form);
+        the type is then reported failed with ``POLAR_SLEEP_LISTING_MALFORMED``, unless a night's
+        own failure gives an earlier code (a 429 above all, which ends the pull).
         """
         oldest = (now - timedelta(days=POLAR_WINDOW_DAYS)).date()
         response = self._make_api_request(db, user_id, "/v3/users/sleep/available")
-        listed = [n for n in (response or {}).get("available", []) if n.get("date")]
+        listed, malformed = self._readable_available_nights(response, user_id)
         if latest_only and listed:
-            listed = [max(listed, key=lambda n: date.fromisoformat(n["date"]))]
-        missing = [
-            n
-            for n in listed
-            if date.fromisoformat(n["date"]) >= oldest and not self._polar_sleep_stored(db, user_id, n)
-        ]
+            listed = [max(listed, key=lambda listed_night: listed_night[0])]
+        missing = [night for day, night in listed if day >= oldest and not self._polar_sleep_stored(db, user_id, night)]
 
         saved = 0
         first_failure: str | None = None
@@ -1059,9 +1060,45 @@ class Polar247Data(Base247DataTemplate):
                 )
                 if code == RATE_LIMITED:
                     break
+        if first_failure is None and malformed:
+            first_failure = POLAR_SLEEP_LISTING_MALFORMED
         if first_failure is not None:
             return DataTypeFailure(code=first_failure, saved=saved)
         return saved
+
+    def _readable_available_nights(self, response: Any, user_id: UUID) -> tuple[list[tuple[date, dict[str, Any]]], int]:
+        """The /sleep/available entries whose date, start and end can be read, and how many could not.
+
+        An entry with no date is left out as before (there is no night to ask for); a start or
+        end that is absent is allowed, as before. A value that is present and unreadable, or an
+        entry that is not an object, makes the entry malformed. Logged as a code with a count.
+        """
+        readable: list[tuple[date, dict[str, Any]]] = []
+        malformed = 0
+        for entry in (response or {}).get("available", []):
+            try:
+                if not entry.get("date"):
+                    continue
+                day = date.fromisoformat(entry["date"])
+                for key in ("start_time", "end_time"):
+                    if entry.get(key):
+                        datetime.fromisoformat(entry[key])
+            except (AttributeError, TypeError, ValueError):
+                malformed += 1
+                continue
+            readable.append((day, entry))
+        if malformed:
+            log_structured(
+                self.logger,
+                "warning",
+                "Skipped unreadable Polar sleep listing entries",
+                provider="polar",
+                task="_save_missing_sleep",
+                user_id=str(user_id),
+                error_code=POLAR_SLEEP_LISTING_MALFORMED,
+                count=malformed,
+            )
+        return readable, malformed
 
     @staticmethod
     def _polar_sleep_stored(db: DbSession, user_id: UUID, night: dict[str, Any]) -> bool:

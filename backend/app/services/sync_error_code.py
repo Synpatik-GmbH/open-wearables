@@ -33,7 +33,20 @@ SDK_IMPORT_FAILED = "sdk_import_failed"
 # FORK (2.96.6.1): Polar's token response carried no x_user_id, so the user cannot be registered.
 POLAR_USER_ID_MISSING = "polar_user_id_missing"
 
-_FIXED_WORDS = frozenset({UNCLASSIFIED, UNKNOWN, ALL_SUBTASKS_FAILED, SDK_IMPORT_FAILED, POLAR_USER_ID_MISSING})
+# FORK (2.96.6.1): an entry of Polar's /sleep/available list could not be read (date, start or
+# end), so that entry was skipped; the other listed nights were still fetched.
+POLAR_SLEEP_LISTING_MALFORMED = "polar_sleep_listing_malformed"
+
+_FIXED_WORDS = frozenset(
+    {
+        UNCLASSIFIED,
+        UNKNOWN,
+        ALL_SUBTASKS_FAILED,
+        SDK_IMPORT_FAILED,
+        POLAR_USER_ID_MISSING,
+        POLAR_SLEEP_LISTING_MALFORMED,
+    }
+)
 
 # Every module of this backend that defines an exception class. A test finds the classes
 # and fails when one is missing from here.

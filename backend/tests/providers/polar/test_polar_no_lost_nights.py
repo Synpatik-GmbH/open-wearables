@@ -60,6 +60,8 @@ class FakePolar:
         self.rate_limited = False
         # The sleep score each night carries, when set.
         self.sleep_score: int | None = None
+        # Entries /sleep/available lists ahead of the nights, as given (a malformed one, say).
+        self.extra_available: list[Any] = []
 
     def __call__(
         self, db: Session, user_id: UUID, endpoint: str, params: dict | None = None, headers: dict | None = None
@@ -72,7 +74,7 @@ class FakePolar:
                 status_code=self.failure_status, detail="upstream said something with the user's data in it"
             )
         if endpoint == "/v3/users/sleep/available":
-            return {"available": [_night(d) for d in self.nights]}
+            return {"available": [*self.extra_available, *(_night(d) for d in self.nights)]}
         if endpoint.startswith("/v3/users/sleep/"):
             day = date.fromisoformat(endpoint.rsplit("/", 1)[1])
             if day in self.failing_nights:

@@ -21,7 +21,14 @@ from app.services.providers.polar.data_247 import Polar247Data
 from app.services.providers.polar.pull_budget import FULL_INTERVAL, RATE_LIMITED
 from app.services.providers.polar.strategy import PolarStrategy
 from app.services.providers.polar.workouts import PolarWorkouts
-from tests.providers.polar.test_polar_no_lost_nights import TODAY, FakePolar, _polar_user, _stored_polar_nights
+from app.services.sync_error_code import POLAR_SLEEP_LISTING_MALFORMED
+from tests.providers.polar.test_polar_no_lost_nights import (
+    TODAY,
+    FakePolar,
+    _night,
+    _polar_user,
+    _stored_polar_nights,
+)
 
 # The eight range types that have no short form, by the endpoint each one calls.
 FULL_ONLY = {
@@ -215,6 +222,71 @@ class TestNights:
 
         assert "sleep" in result
         assert _stored_polar_nights(db, user_id) == {TODAY, yesterday}
+
+
+_GOOD_NIGHT = TODAY - timedelta(days=1)
+# One /sleep/available entry each, unreadable in one field. The two with a readable date list
+# TODAY, newer than the good night, so the short form would pick them as the newest.
+MALFORMED = {
+    "date": {"date": "2026-13-45", **{k: v for k, v in _night(TODAY).items() if k != "date"}},
+    "start_time": {**_night(TODAY), "start_time": "yesterday at eleven"},
+    "end_time": {**_night(TODAY), "end_time": "07:00 or so"},
+    "not_an_object": "2026-10-14",
+}
+
+
+class TestAMalformedListedNight:
+    """Codex 4270734399: one unreadable /sleep/available entry costs that entry, not the others."""
+
+    def _assert_the_good_night_is_stored_and_sleep_failed(
+        self, db: Session, user_id: UUID, polar: FakePolar, outcome: object
+    ) -> None:
+        fetched = [e for e, _ in polar.calls if e.startswith("/v3/users/sleep/2")]
+        assert fetched == [f"/v3/users/sleep/{_GOOD_NIGHT.isoformat()}"]
+        assert _stored_polar_nights(db, user_id) == {_GOOD_NIGHT}
+        assert outcome == DataTypeFailure(code=POLAR_SLEEP_LISTING_MALFORMED, saved=1)
+
+    @pytest.mark.parametrize("field", MALFORMED)
+    def test_the_full_form_stores_every_valid_night_and_reports_sleep_failed(
+        self, db: Session, data_247: Polar247Data, polar: FakePolar, field: str
+    ) -> None:
+        user_id = _polar_user(db)
+        polar.extra_available = [MALFORMED[field]]
+        polar.nights = [_GOOD_NIGHT]
+
+        result = data_247.load_and_save_all(db, user_id)
+
+        self._assert_the_good_night_is_stored_and_sleep_failed(db, user_id, polar, result["sleep"])
+
+    @pytest.mark.parametrize("field", MALFORMED)
+    def test_the_short_form_takes_the_newest_valid_night_and_reports_sleep_failed(
+        self, db: Session, data_247: Polar247Data, polar: FakePolar, field: str
+    ) -> None:
+        user_id = _polar_user(db)
+        data_247.load_and_save_all(db, user_id)  # the full pull; the next one is short
+        polar.extra_available = [MALFORMED[field]]
+        polar.nights = [_GOOD_NIGHT]
+        polar.calls.clear()
+
+        result = data_247.load_and_save_all(db, user_id)
+
+        assert "sleep" not in result
+        self._assert_the_good_night_is_stored_and_sleep_failed(db, user_id, polar, result["sleep_latest"])
+
+    def test_a_429_on_a_night_still_ends_the_pull_when_an_entry_is_malformed(
+        self, db: Session, data_247: Polar247Data, polar: FakePolar
+    ) -> None:
+        # The listing's code must not hide Polar's rate limit, which is what ends the pull.
+        user_id = _polar_user(db)
+        polar.extra_available = [MALFORMED["start_time"]]
+        polar.nights = [_GOOD_NIGHT]
+        polar.failing_nights = {_GOOD_NIGHT}
+        polar.failure_status = 429
+
+        result = data_247.load_and_save_all(db, user_id)
+
+        assert result["sleep"] == DataTypeFailure(code=RATE_LIMITED, saved=0)
+        assert polar.requested("/v3/users/nightly-recharge") == []
 
 
 class TestRateLimit:
