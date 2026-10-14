@@ -7,10 +7,11 @@ See scripts/data_migrations/correct_polar_workout_start_times.py.
 
 import importlib.util
 from contextlib import nullcontext
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import text
@@ -160,6 +161,33 @@ class TestStopsBeforeChangingAnything:
         assert report.corrected == 0
         assert _reload(db, good.id).start_datetime == stored
         assert db.query(PolarWorkoutTrueTime).count() == 0
+
+    def test_a_row_whose_true_start_is_on_day_90_in_berlin_is_inside_the_window(self, db: Session) -> None:
+        # Codex 4274696752, spec Q5: the window counts Berlin dates, and day 90 is inside it at
+        # any hour. A true start one second after Berlin midnight of day 90 used to count as
+        # older than 90 days at any later time of the day, and stopped the run.
+        berlin = ZoneInfo("Europe/Berlin")
+        day90 = datetime.now(berlin).date() - timedelta(days=90)
+        start = datetime.combine(day90, time(0, 0, 1), tzinfo=berlin).astimezone(timezone.utc)
+        row = _shifted_polar_workout(db, true_start=start)
+
+        report = correct(db, dry_run=False)
+
+        assert report.older_than_90_days == 0
+        assert report.stopped is False
+        assert _reload(db, row.id).start_datetime == start
+
+    def test_a_row_whose_true_start_is_on_day_91_in_berlin_stops(self, db: Session) -> None:
+        berlin = ZoneInfo("Europe/Berlin")
+        day91 = datetime.now(berlin).date() - timedelta(days=91)
+        _shifted_polar_workout(
+            db, true_start=datetime.combine(day91, time(23, 59), tzinfo=berlin).astimezone(timezone.utc)
+        )
+
+        report = correct(db, dry_run=True)
+
+        assert report.older_than_90_days == 1
+        assert report.stopped is True
 
     def test_a_corrected_time_that_collides_with_a_stored_row_stops(self, db: Session) -> None:
         # The other row already holds the true times and is recorded, so it is not a candidate

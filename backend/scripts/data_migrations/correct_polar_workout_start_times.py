@@ -28,7 +28,8 @@ and reports every count, so a dry run tells the operator whether the run will go
 
 - ``null_zone_offset``: a candidate with no offset, so its true time cannot be recomputed;
 - ``unreadable_zone_offset``: an offset that is not ``+HH:MM`` / ``-HH:MM``;
-- ``older_than_90_days``: a candidate whose true start is more than 90 days ago (Q5);
+- ``older_than_90_days``: a candidate whose true start falls on a Berlin date more than 90 days
+  back (Q5: day 90 is inside the window, at any hour);
 - ``collisions``: a candidate whose corrected (data source, start, end) is already held by
   another row, plus every candidate that corrects to the same (data source, start, end) as
   another candidate (two pre-fix copies of one exercise stored under different offsets);
@@ -84,7 +85,8 @@ _COUNTS = text(f"""
       (SELECT count(*) FROM ({_CANDIDATES}) c
         WHERE c.zone_offset IS NOT NULL AND c.zone_offset !~ '{_OFFSET_SHAPE}') AS unreadable_zone_offset,
       (SELECT count(*) FROM ({_CORRECTABLE}) k
-        WHERE k.true_start < now() - interval '{_WINDOW_DAYS} days') AS older_than_90_days,
+        WHERE (k.true_start AT TIME ZONE 'Europe/Berlin')::date
+              < (now() AT TIME ZONE 'Europe/Berlin')::date - {_WINDOW_DAYS}) AS older_than_90_days,
       (SELECT count(*) FROM ({_CORRECTABLE}) k
         WHERE EXISTS (SELECT 1 FROM event_record o
                        WHERE o.data_source_id = k.data_source_id

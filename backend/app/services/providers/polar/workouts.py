@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 import isodate
 
@@ -21,6 +22,9 @@ from app.utils.dates import offset_to_iso
 
 # FORK (2.96.6.1, spec Q5): nothing whose date is more than this many days back is fetched or stored.
 POLAR_WINDOW_DAYS = 90
+
+
+_BERLIN = ZoneInfo("Europe/Berlin")
 
 
 class PolarWorkouts(BaseWorkoutsTemplate):
@@ -201,10 +205,12 @@ class PolarWorkouts(BaseWorkoutsTemplate):
           true-time row is what keeps the correction from ever touching it (AC16), and the single
           commit is what keeps a killed worker from leaving a record the next pull would skip.
         """
-        oldest_start = datetime.now(timezone.utc) - timedelta(days=POLAR_WINDOW_DAYS)
+        # The window counts Berlin dates, and day 90 is inside it at any hour (spec Q5; Codex
+        # 4274696752): an instant 90 days back dropped a morning of day 90 from an evening pull.
+        oldest_day = datetime.now(_BERLIN).date() - timedelta(days=POLAR_WINDOW_DAYS)
         count = 0
         for record, detail in self._build_bundles(exercises, user_id):
-            if record.start_datetime < oldest_start:
+            if record.start_datetime.astimezone(_BERLIN).date() < oldest_day:
                 continue
             if record.external_id is not None and self._exercise_stored(db, user_id, record.external_id):
                 continue

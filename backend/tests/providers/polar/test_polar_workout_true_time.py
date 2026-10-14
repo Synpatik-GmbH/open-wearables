@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from freezegun import freeze_time
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -156,6 +157,25 @@ class TestPolarWorkoutSavePath:
         stored = {r.external_id for r in db.query(EventRecord).filter(EventRecord.external_id.like("EX-%")).all()}
         assert saved == 1
         assert stored == {"EX-89"}
+
+    def test_an_exercise_on_day_90_in_berlin_is_stored_whatever_its_hour(
+        self, mock_request: MagicMock, svix_enabled: MagicMock, schedule: MagicMock, db: Session
+    ) -> None:
+        # Codex 4274696752, spec Q5 (a date exactly 90 days old is inside): at 18:00 Berlin on
+        # 14 October, 08:00 on 16 July is day 90 and inside; 23:00 on 15 July is day 91.
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="polar")
+        mock_request.return_value = [
+            _exercise("EX-DAY90", "2026-07-16T08:00:00", 120),
+            _exercise("EX-DAY91", "2026-07-15T23:00:00", 120),
+        ]
+
+        with freeze_time("2026-10-14T16:00:00Z"):
+            saved = PolarStrategy().workouts.load_data(db, user.id)
+
+        stored = {r.external_id for r in db.query(EventRecord).filter(EventRecord.external_id.like("EX-DAY%")).all()}
+        assert saved == 1
+        assert stored == {"EX-DAY90"}
 
     def test_the_webhook_path_follows_the_same_rules(
         self, mock_request: MagicMock, svix_enabled: MagicMock, schedule: MagicMock, db: Session
