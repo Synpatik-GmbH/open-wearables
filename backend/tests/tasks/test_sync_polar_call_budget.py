@@ -340,6 +340,22 @@ def test_a_profile_that_loses_the_shared_account_lock_still_gets_its_fan_out(db:
 
 
 @pytest.mark.usefixtures("mock_celery_app")
+def test_a_primary_whose_claim_is_refused_lets_go_of_the_shared_account(db: Session, polar_api: FakePolar) -> None:
+    # The first profile pulled at 06:00; at 06:20 it takes the shared lock, is refused its claim
+    # and must release the lock, or the second profile's own pull is shut out too.
+    first = _member_on(db, "polar-account-2")
+    second = _member_on(db, "polar-account-2")
+    hourly(first, _at(6))
+    skipped = hourly(first, _at(6, 20))
+    assert skipped["providers_synced"]["polar"]["params"] == {"skipped": PULL_INTERVAL_SKIP}
+    polar_api.calls.clear()
+
+    hourly(second, _at(6, 21))
+
+    assert polar_api.calls != [], "the second profile became primary and pulled"
+
+
+@pytest.mark.usefixtures("mock_celery_app")
 def test_a_pull_whose_claim_cannot_be_recorded_calls_nothing_and_says_so_in_the_sync_status(
     db: Session, member: UUID, polar_api: FakePolar
 ) -> None:
