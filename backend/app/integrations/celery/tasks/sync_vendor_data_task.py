@@ -29,7 +29,7 @@ from app.services.sync_coordination import (
     release_stale_primary,
     try_become_primary,
 )
-from app.services.sync_error_code import ALL_SUBTASKS_FAILED, UNCLASSIFIED, error_code
+from app.services.sync_error_code import ALL_SUBTASKS_FAILED, PULL_CLAIM_FAILED, UNCLASSIFIED, error_code
 from app.services.sync_status_service import (
     emit_sync_completed,
     emit_sync_failed,
@@ -244,41 +244,6 @@ def sync_vendor_data(
                 )
                 sync_scope = SyncScope.HISTORICAL if is_historical else SyncScope.LIVE
 
-                # FORK (2.96.6.1, spec R1, AC17): a provider with a call budget skips a pull that
-                # starts too soon after its last one. Nothing is fetched, no run is opened (a run
-                # every 15 minutes would be noise, and would reach the outgoing webhook), and the
-                # cursor stays put. What was due stays due for the next pull. A claim that cannot
-                # be made lets the pull run: one call too many beats a night not fetched, and the
-                # pull's own handler below reports whatever is wrong.
-                try:
-                    claimed = factory.get_provider(provider_name).claim_pull(
-                        db, connection, ignore_interval=ignore_pull_interval
-                    )
-                except Exception as e:
-                    log_structured(
-                        logger,
-                        "warning",
-                        f"Could not claim the {provider_name} pull; pulling",
-                        provider=provider_name,
-                        task="sync_vendor_data",
-                        user_id=user_id,
-                        error_code=error_code(e),
-                    )
-                    claimed = True
-                if not claimed:
-                    log_structured(
-                        logger,
-                        "info",
-                        f"Skipping {provider_name} pull — the last one started less than its interval ago",
-                        provider=provider_name,
-                        task="sync_vendor_data",
-                        user_id=user_id,
-                    )
-                    result.providers_synced[provider_name] = ProviderSyncResult(
-                        success=True, params={"skipped": PULL_INTERVAL_SKIP}
-                    )
-                    continue
-
                 # If this provider account is shared across OW profiles, only one
                 # should make the API call at a time.  The first to acquire the lock
                 # is primary; concurrent duplicates skip and wait for the fan-out.
@@ -337,6 +302,66 @@ def sync_vendor_data(
                             success=True, params={"linked_account": True, "skipped": True}
                         )
                         continue
+
+                # FORK (2.96.6.1, spec R1, AC17): a provider with a call budget skips a pull that
+                # starts too soon after its last one. Nothing is fetched, no run is opened (a run
+                # every 15 minutes would be noise, and would reach the outgoing webhook), and the
+                # cursor stays put. What was due stays due for the next pull. It comes after the
+                # shared-account check (Codex 4271871209): a profile that loses that check pulls
+                # nothing, so it must not spend the claim its fan-out from the primary needs.
+                # A claim that cannot be made skips the pull too (Codex 4271871240, Andrei's
+                # ruling): with the interval unrecorded nothing would hold the budget, and the
+                # next pull tries again. That is recorded in the sync status with a code, not
+                # only logged.
+                try:
+                    claimed = factory.get_provider(provider_name).claim_pull(
+                        db, connection, ignore_interval=ignore_pull_interval
+                    )
+                except Exception as e:
+                    log_structured(
+                        logger,
+                        "warning",
+                        f"Could not claim the {provider_name} pull; skipping it",
+                        provider=provider_name,
+                        task="sync_vendor_data",
+                        user_id=user_id,
+                        error_code=error_code(e),
+                    )
+                    _emit_sync_status(
+                        emit_sync_failed,
+                        user_uuid,
+                        provider_name,
+                        sync_source,
+                        scope=sync_scope,
+                        run_id=run_id,
+                        error=PULL_CLAIM_FAILED,
+                        message=f"Skipped {provider_name} pull: its call budget could not be recorded",
+                        primary_user_id=primary_uuid,
+                        metadata={"is_historical": is_historical, "cause": error_code(e)},
+                    )
+                    if shared_token and connection.provider_user_id:
+                        release_primary(
+                            provider_name, connection.provider_user_id, user_uuid, shared_token, scope="pull"
+                        )
+                    result.errors[provider_name] = error_code(e) or UNCLASSIFIED
+                    continue
+                if not claimed:
+                    log_structured(
+                        logger,
+                        "info",
+                        f"Skipping {provider_name} pull — the last one started less than its interval ago",
+                        provider=provider_name,
+                        task="sync_vendor_data",
+                        user_id=user_id,
+                    )
+                    if shared_token and connection.provider_user_id:
+                        release_primary(
+                            provider_name, connection.provider_user_id, user_uuid, shared_token, scope="pull"
+                        )
+                    result.providers_synced[provider_name] = ProviderSyncResult(
+                        success=True, params={"skipped": PULL_INTERVAL_SKIP}
+                    )
+                    continue
 
                 _emit_sync_status(
                     emit_sync_started,

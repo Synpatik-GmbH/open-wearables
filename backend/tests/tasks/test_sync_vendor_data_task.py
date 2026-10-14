@@ -297,8 +297,8 @@ class TestSyncVendorDataTask:
         mock_strategy = MagicMock()
         mock_strategy.capabilities.rest_pull = True
         mock_strategy.capabilities.webhook_stream = False
-        # The first call picks the providers to pull; the second claims the pull (2.96.6.1, which
-        # lets the pull run when the claim fails); the third is the pull itself.
+        # The first call picks the providers to pull; the second claims the pull (2.96.6.1). A
+        # claim that fails skips the pull and reports its code, so the third is never reached.
         mock_get_provider.side_effect = [
             mock_strategy,
             LookupError("value 187.5 for user"),

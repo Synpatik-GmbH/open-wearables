@@ -37,6 +37,9 @@ POLAR_USER_ID_MISSING = "polar_user_id_missing"
 # end), so that entry was skipped; the other listed nights were still fetched.
 POLAR_SLEEP_LISTING_MALFORMED = "polar_sleep_listing_malformed"
 
+# FORK (2.96.6.1): a provider's call budget could not be recorded, so its pull was skipped.
+PULL_CLAIM_FAILED = "pull_claim_failed"
+
 _FIXED_WORDS = frozenset(
     {
         UNCLASSIFIED,
@@ -45,6 +48,7 @@ _FIXED_WORDS = frozenset(
         SDK_IMPORT_FAILED,
         POLAR_USER_ID_MISSING,
         POLAR_SLEEP_LISTING_MALFORMED,
+        PULL_CLAIM_FAILED,
     }
 )
 

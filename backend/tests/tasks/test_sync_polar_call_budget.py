@@ -19,6 +19,7 @@ from uuid import UUID
 import pytest
 from fastapi import HTTPException
 from freezegun import freeze_time
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.sync_vendor_data_task import PULL_INTERVAL_SKIP, sync_vendor_data
@@ -29,6 +30,8 @@ from app.services.providers.polar.data_247 import Polar247Data
 from app.services.providers.polar.last_night import ask_polar_for_last_night
 from app.services.providers.polar.pull_budget import PULL_INTERVAL, RATE_LIMITED
 from app.services.providers.polar.strategy import PolarStrategy
+from app.services.sync_coordination import release_primary, try_become_primary
+from app.services.sync_error_code import PULL_CLAIM_FAILED
 from tests.factories import UserConnectionFactory, UserFactory
 from tests.providers.polar.test_polar_no_lost_nights import FakePolar, _stored_polar_nights
 
@@ -64,6 +67,8 @@ def polar_api(db: Session, polar: FakePolar) -> Iterator[FakePolar]:
         polar.calls.append((kwargs["endpoint"], None))
         if polar.rate_limited:
             raise HTTPException(status_code=429, detail="Polar API error: rate limit")
+        if polar.failing_all:
+            raise HTTPException(status_code=polar.failure_status, detail="Polar API error: down")
         return []
 
     session_local = MagicMock()
@@ -297,3 +302,66 @@ def test_a_night_polar_serves_late_is_stored_within_24_hours(db: Session, member
     # Not taken by the first short pull after it was served: this is the full pull's job.
     assert stored_at - served > timedelta(hours=1)
     assert stored_at - served <= timedelta(hours=24)
+
+
+def _member_on(db: Session, polar_user_id: str) -> UUID:
+    """A Polar member whose connection is the Polar account ``polar_user_id``."""
+    user = UserFactory()
+    connection = UserConnectionFactory(
+        user=user, provider="polar", status=ConnectionStatus.ACTIVE, provider_user_id=polar_user_id
+    )
+    connection.last_synced_at = _at(0) - timedelta(hours=1)
+    db.add(PolarRegistration(user_connection_id=connection.id, registered=True, attempts=1, updated_at=_at(0)))
+    db.commit()
+    return user.id
+
+
+@pytest.mark.usefixtures("mock_celery_app")
+def test_a_profile_that_loses_the_shared_account_lock_still_gets_its_fan_out(db: Session, polar_api: FakePolar) -> None:
+    # Codex 4271871209. Two Calibra profiles connected to one Polar account. The second
+    # profile's own pull finds the first pulling, and skips. The primary then queues a fan-out
+    # for it; the second profile's skipped pull must not have spent the claim that fan-out needs.
+    first = _member_on(db, "polar-account-1")
+    second = _member_on(db, "polar-account-1")
+    held, token, _ = try_become_primary("polar", "polar-account-1", first, scope="pull")
+    assert held
+
+    skipped = hourly(second, _at(6))
+    assert skipped["providers_synced"]["polar"]["params"] == {"linked_account": True, "skipped": True}
+    release_primary("polar", "polar-account-1", first, token, scope="pull")
+    polar_api.calls.clear()
+
+    with freeze_time(_at(6, 2)):
+        sync_vendor_data(
+            str(second), providers=["polar"], _skip_linked_fan_out=True, _linked_primary_user_id=str(first)
+        )
+
+    assert polar_api.calls != [], "the fan-out pulled for the second profile"
+
+
+@pytest.mark.usefixtures("mock_celery_app")
+def test_a_pull_whose_claim_cannot_be_recorded_calls_nothing_and_says_so_in_the_sync_status(
+    db: Session, member: UUID, polar_api: FakePolar
+) -> None:
+    # Codex 4271871240, Andrei's ruling: skip the pull, and record a code beyond the logs.
+    with patch(
+        "app.services.providers.polar.strategy.claim_pull", side_effect=OperationalError("UPDATE", {}, Exception())
+    ):
+        result = hourly(member, _at(6))
+
+    assert polar_api.calls == []
+    assert result["errors"] == {"polar": "OperationalError"}
+    run = db.query(SyncRun).filter(SyncRun.user_id == member, SyncRun.provider == "polar").one()
+    assert run.status == SyncStatus.FAILED
+    assert run.error == PULL_CLAIM_FAILED
+
+
+@pytest.mark.usefixtures("mock_celery_app")
+def test_a_day_on_which_polar_fails_every_endpoint_stays_inside_the_limit(member: UUID, polar_api: FakePolar) -> None:
+    # Codex 4271871228, spec AC4 (v0.6) and AC17: Polar answers 503 to every call all day. The
+    # failed full fetches wait out growing gaps instead of being asked for on every pull.
+    polar_api.failing_all = True
+
+    calls = _worst_case_day(member, polar_api, hourly_minute=7)
+
+    assert calls <= POLAR_DAILY_CALLS_PER_MEMBER_AT_50, calls
