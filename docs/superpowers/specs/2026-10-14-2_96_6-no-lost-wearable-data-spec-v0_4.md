@@ -1,9 +1,10 @@
 # 2.96.6 No lost wearable data
 
-Spec v0.3, Product Studio, 14 Oct 2026. Roadmap item 2.96.6 (parent 2.96 Wearable integrations at launch), build child 2.96.6.1.
-Status: AGREED, ready for build. Predicates agreed by Andrei on 13 Oct 2026 (V6, Q5, N9, L1, L2); N9 scope to every source agreed 14 Oct 2026. Data-protection ruling R-2026-10-13-e decided 13 Oct 2026.
-Source: Andrei's account on 13 Oct 2026 (no night data before and after the account was re-created at about 13:05 Berlin; a Polar activity at a time later than the screen's clock), the CC read-only trace relayed 13 Oct 2026, 13:43 (code paths only, no stored rows checked), and the CC build plan relayed 14 Oct 2026, 08:23.
+Spec v0.4, Product Studio, 14 Oct 2026. Roadmap item 2.96.6 (parent 2.96 Wearable integrations at launch), build child 2.96.6.1.
+Status: AGREED, ready for build. Predicates agreed by Andrei on 13 Oct 2026 (V6, Q5, N9, L1, L2); N9 scope to every source, R1 and the 24-hour late-data bound agreed 14 Oct 2026. Data-protection ruling R-2026-10-13-e decided 13 Oct 2026.
+Source: Andrei's account on 13 Oct 2026 (no night data before and after the account was re-created at about 13:05 Berlin; a Polar activity at a time later than the screen's clock), the CC read-only trace relayed 13 Oct 2026, 13:43 (code paths only, no stored rows checked), the CC build plan relayed 14 Oct 2026, 08:23, and the CC build report relayed 14 Oct 2026, 14:38 (PRs OW fork #40 and adapter #433 open; Polar call volume).
 Order: first of the four items from the 13 Oct walkthrough. 2.96.7.1 starts after this item's PRs merge (both touch the connection record). 2.97.8 (P18, the 28-day backfill at connect) relies on nights arriving.
+Changes from v0.3 (Andrei, 14 Oct 2026, on the CC build report): predicate R1 added (Polar calls within Polar's daily limit for 50 Polar members, AC17); late data stored within 24 hours of being served (3.1, cause 2, AC2); design-review readings confirmed: the 90-day window includes day 90, the definition of a shifted activity, of a failed Polar registration and of missing data; stored non-Polar activities that crossed midnight are not re-dated.
 Changes from v0.2 (Andrei, 14 Oct 2026, on the CC plan): activities from every source count on the Berlin day they started (3.4, AC13); section 4 references corrected per the plan; three non-goals added (Polar continuous heart rate and daily-activity start times, heart-rate zone minutes on shifted workouts, the app showing activity times in Berlin time); data-protection condition on operational records added (section 9).
 Changes from v0.1: L1 and L2 agreed; acceptance criterion 16 added (each shifted activity corrected exactly once); data-protection ruling decided as R-2026-10-13-e.
 
@@ -28,14 +29,17 @@ Changes from v0.1: L1 and L2 agreed; acceptance criterion 16 added (each shifted
 
 ### 3.1 The rule (V6)
 
-- Data available at the source within the last 90 days (Q5) is fetched and stored, whenever it becomes available.
+- Data available at the source within the last 90 days (Q5) is fetched and stored within 24 hours of becoming available.
+- A date exactly 90 days old is inside the window.
+- Missing data for a night means its sleep is missing, or its HRV from the member's main HRV source is missing.
+- Calibra's Polar calls stay within Polar's daily limit with 50 Polar members connected (R1). A fetch refused by the limit is a failed fetch (cause 3), not a lost one.
 
 ### 3.2 The eight causes from the trace, each closed
 
 1. **Noon cutoff.** A date still missing data after 12:00 Berlin keeps being requested until its data arrives or it is older than 90 days. Last night is always requested for a new connection, whatever the time of connection.
-2. **Late data.** Data that reaches the source after its date has passed is fetched on a later sync, up to 90 days after its date.
+2. **Late data.** Data that reaches the source after its date has passed is fetched within 24 hours of reaching it, up to 90 days after its date.
 3. **Failed fetch.** A failed fetch for a date or data type is retried; the sync never moves past a date whose fetch failed. A failure is logged as a code, not free text (R-2026-10-06-a, R-2026-10-06-b).
-4. **Polar registration.** A failed registration is retried. Until it succeeds, Settings > Connections shows Polar as "Not connected" with Connect (L1). The member is never shown Polar as Connected while registration has not succeeded.
+4. **Polar registration.** A registration has failed when Polar answers anything other than success (2xx) or already registered (409), does not answer, or no Polar user id is held. A failed registration is retried. Until it succeeds, Settings > Connections shows Polar as "Not connected" with Connect (L1). The member is never shown Polar as Connected while registration has not succeeded.
 5. **Connection record.** The connection record that decides which sources are requested is written when the member connects, not when the app first lists connections.
 6. **HRV source.** A member with exactly one HRV source has it used without choosing; their HRV is stored. Choosing between several sources stays parked.
 7. **Consent and account link.** Data that arrives before the member's account link exists is fetched again once the link exists. Data for a member without the required consent is not stored (invariant).
@@ -49,7 +53,8 @@ Changes from v0.1: L1 and L2 agreed; acceptance criterion 16 added (each shifted
 
 - Every activity is stored with its true start instant. Polar's local start time is converted to UTC by subtracting its offset.
 - Every activity, from every source, counts on the Berlin day it started, including one that ends after midnight (agreed 14 Oct 2026).
-- Activities already stored with a shifted time are corrected in place to their true start instant, each exactly once (L2). The Movement usual uses the corrected data from the day the correction runs. Stored states of past days and cards already sent are not changed.
+- Activities already stored with a shifted time are corrected in place to their true start instant, each exactly once (L2). Shifted means: in Open Wearables, a Polar workout with no record that its time is true; in the adapter, a row whose start equals the Open Wearables start plus twice the offset.
+- Stored activities from other sources that crossed midnight keep their stored day; only new or re-ingested activities count on their start day. The Movement usual uses the corrected data from the day the correction runs. Stored states of past days and cards already sent are not changed.
 - The plan confirms that the true start of every stored shifted activity can be recomputed. If any cannot, the build stops at the plan and L2 reopens with Andrei before any stored activity is changed.
 
 ### 3.5 Finding what hit Andrei's account
@@ -67,7 +72,7 @@ From the CC read-only trace relayed 13 Oct 2026, 13:43, corrected by the CC plan
 ## 5. Acceptance criteria
 
 1. A member who connects Polar after 12:00 Berlin gets last night stored once Polar serves it.
-2. A night that Polar first serves 1 to 90 days after its date is stored on the next sync after it is served.
+2. A night that Polar first serves 1 to 90 days after its date is stored within 24 hours of being served.
 3. A night or activity older than 90 days when first served is not fetched by the hourly sync.
 4. When a fetch for a date fails, the next sync requests that date again; no later date is marked synced past it until it succeeds or turns 90 days old.
 5. A failure record holds a code and no free-text error message.
@@ -82,6 +87,7 @@ From the CC read-only trace relayed 13 Oct 2026, 13:43, corrected by the CC plan
 14. The plan states, for Apple Health, which of the eight causes can occur, and each one that can is closed with its own test.
 15. Every activity stored with a shifted time before the fix is corrected in place to its true start instant; the Movement usual uses corrected data from the day the correction runs; stored states of past days and cards already sent are unchanged (L2).
 16. Each shifted activity is corrected exactly once; activities stored after the fix are untouched; running the correction a second time changes nothing.
+17. With 50 Polar members connected, Calibra's Polar calls in a day stay within Polar's daily limit; the plan states the calls per member per day and the number of Polar members that fits (R1).
 
 ## 6. Invariants
 
@@ -111,6 +117,7 @@ From the CC read-only trace relayed 13 Oct 2026, 13:43, corrected by the CC plan
 | Q5 | Window | Data is fetched as far back as the source serves it, up to 90 days after its date | agreed 13 Oct 2026 |
 | N9 | Activity time | True start instant; offset subtracted; every activity, from every source, counts on the Berlin day it started | agreed 13 Oct 2026; every source agreed 14 Oct 2026 |
 | L1 | Failed Polar registration, what the member sees | Settings > Connections shows Polar as "Not connected" with Connect until registration succeeds | agreed 13 Oct 2026 |
+| R1 | Polar call budget | Polar calls stay within Polar's daily limit with 50 Polar members connected (per the CC report of 14 Oct 2026, the limit is 5000 plus 100 per user per day) | agreed 14 Oct 2026 |
 | L2 | Activities already stored with a shifted time | Corrected in place, each exactly once; the usual uses corrected data from the day the correction runs; past days' stored states and sent cards unchanged | agreed 13 Oct 2026 |
 
 ## 9. Data-protection ruling (calibra-dp-desk)
