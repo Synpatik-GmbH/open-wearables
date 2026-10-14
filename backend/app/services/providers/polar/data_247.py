@@ -1062,11 +1062,14 @@ class Polar247Data(Base247DataTemplate):
         """Store sleep records with their scores and heart-rate samples. Raises on any failure."""
         count = 0
         for record, detail, score, hr in self.normalize_sleep(raw_items, user_id):
+            # The night's heart rate first: the sleep record commits (and is announced) inside
+            # create_or_merge_sleep, and from then on the night counts as stored and is not
+            # fetched again, so anything saved after it and failing would be lost for good.
+            self._save_timeseries(db, hr)
             event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
             count += 1
             if score:
                 self._save_scores(db, [score])
-            self._save_timeseries(db, hr)
         return count
 
     # -------------------------------------------------------------------------

@@ -94,6 +94,24 @@ class TestAtConnect:
         assert announced == []
 
 
+class TestAtReconnect:
+    def test_a_reconnect_that_turns_a_pending_registration_into_success_is_announced(
+        self, db: Session, announced: list[dict]
+    ) -> None:
+        # The connection stays ACTIVE across the reconnect, so the base save does not announce it;
+        # the pending registration it had never was, and is now.
+        user = UserFactory()
+        with patch("app.services.providers.polar.oauth.httpx.post", return_value=_answer(503)):
+            connection = _callback(db, user.id)
+        assert announced == []
+
+        with patch("app.services.providers.polar.oauth.httpx.post", return_value=_answer(200)):
+            _callback(db, user.id)
+
+        assert _registration(db, connection.id).registered is True
+        assert [a["connection_id"] for a in announced] == [connection.id]
+
+
 class TestAtEveryPull:
     def _connection(self, db: Session, *, registered: bool | None) -> UserConnection:
         user = UserFactory()

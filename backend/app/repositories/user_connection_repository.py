@@ -361,9 +361,11 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         db_session.refresh(connection)
         return connection
 
-    def update_last_synced_at(self, db_session: DbSession, connection: UserConnection) -> UserConnection:
-        """Update the last synced timestamp."""
-        connection.last_synced_at = datetime.now(timezone.utc)
+    def update_last_synced_at(
+        self, db_session: DbSession, connection: UserConnection, at: datetime | None = None
+    ) -> UserConnection:
+        """Update the last synced timestamp (now, unless ``at`` names the instant; FORK 2.96.6.1)."""
+        connection.last_synced_at = at or datetime.now(timezone.utc)
         db_session.add(connection)
         db_session.commit()
         db_session.refresh(connection)

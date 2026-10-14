@@ -198,6 +198,8 @@ def handle_sleep_data(
     db_session: DbSession,
     request: SDKSyncRequest,
     user_id: str,
+    *,
+    raise_when_busy: bool = False,
 ) -> None:
     """
     Process SDK sleep data and track sleep sessions using Redis state.
@@ -235,10 +237,15 @@ def handle_sleep_data(
     try:
         acquired = lock.acquire()
         if not acquired:
-            # FORK (2.96.6.1, spec 3.3, Apple Health cause 3): this used to return, dropping the
-            # batch's sleep with no retry. Raising makes the import retryable (process_sdk_upload).
-            logger.warning("Could not acquire sleep processing lock for user %s; batch will be retried", user_id)
-            raise SleepLockBusyError()
+            # FORK (2.96.6.1, spec 3.3, Apple Health cause 3): the SDK import passes
+            # raise_when_busy, so a busy lock makes its batch retryable (process_sdk_upload) rather
+            # than dropping the batch's sleep. Opt-in per call: the XML and AWS imports call this
+            # per chunk with no retry, and raising there would abort the rest of the file.
+            if raise_when_busy:
+                logger.warning("Could not acquire sleep processing lock for user %s; batch will be retried", user_id)
+                raise SleepLockBusyError()
+            logger.warning("Could not acquire sleep processing lock for user %s; skipping batch", user_id)
+            return
 
         current_state = load_sleep_state(user_id)
         provider = request.provider

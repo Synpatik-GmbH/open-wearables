@@ -12,13 +12,13 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app.models import DataSource, EventRecord, UserConnection
+from app.models import DataSource, EventRecord, User, UserConnection
 from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import ProviderName
 from app.schemas.sync_status import DataTypeFailure
 from app.services.providers.polar.data_247 import Polar247Data
 from app.services.providers.polar.strategy import PolarStrategy
-from tests.factories import UserConnectionFactory, UserFactory
+from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectionFactory, UserFactory
 
 TODAY = datetime.now(timezone.utc).date()
 
@@ -175,6 +175,43 @@ class TestNights:
         data_247.load_and_save_all(db, user_id)
 
         assert [e for e, _ in polar.calls if e.startswith("/v3/users/sleep/2")] == []
+
+    @pytest.mark.parametrize(("provider", "category"), [(ProviderName.APPLE, "sleep"), (ProviderName.POLAR, "workout")])
+    def test_only_a_polar_sleep_counts_as_the_night_stored(
+        self, db: Session, data_247: Polar247Data, polar: FakePolar, provider: ProviderName, category: str
+    ) -> None:
+        # An Apple night, or a Polar workout, over the same hours is not this Polar night.
+        user_id = _polar_user(db)
+        night = _night(TODAY)
+        source = DataSourceFactory(user=db.get(User, user_id), provider=provider)
+        EventRecordFactory(
+            data_source=source,
+            category=category,
+            start_datetime=datetime.fromisoformat(night["start_time"]),
+            end_datetime=datetime.fromisoformat(night["end_time"]),
+        )
+        polar.nights = [TODAY]
+
+        data_247.load_and_save_all(db, user_id)
+
+        assert f"/v3/users/sleep/{TODAY.isoformat()}" in [e for e, _ in polar.calls]
+
+    def test_a_night_whose_heart_rate_fails_to_save_is_fetched_again(
+        self, db: Session, data_247: Polar247Data, polar: FakePolar
+    ) -> None:
+        # The heart rate is saved before the sleep record, so a failure there leaves the night
+        # missing rather than stored without it.
+        user_id = _polar_user(db)
+        polar.nights = [TODAY]
+        with patch.object(Polar247Data, "_save_timeseries", side_effect=RuntimeError("down")):
+            data_247.load_and_save_all(db, user_id)
+        assert _stored_polar_nights(db, user_id) == set()
+
+        polar.calls.clear()
+        data_247.load_and_save_all(db, user_id)
+
+        assert f"/v3/users/sleep/{TODAY.isoformat()}" in [e for e, _ in polar.calls]
+        assert _stored_polar_nights(db, user_id) == {TODAY}
 
     def test_a_failed_night_does_not_lose_the_others_and_is_fetched_again(
         self, db: Session, data_247: Polar247Data, polar: FakePolar

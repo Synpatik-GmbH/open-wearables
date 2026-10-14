@@ -11,7 +11,7 @@ from uuid import UUID
 import pytest
 from sqlalchemy.orm import Session
 
-from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
+from app.integrations.celery.tasks.sync_vendor_data_task import cursor_after_failed_pull, sync_vendor_data
 from app.models import PolarRegistration, SyncRun, SyncRunDataType, UserConnection
 from app.schemas.auth import ConnectionStatus
 from app.schemas.sync_status import SyncStatus
@@ -152,3 +152,52 @@ def test_a_pull_fetches_nothing_while_the_polar_registration_still_fails(
     outcome = db.query(SyncRunDataType).filter(SyncRunDataType.data_type == "registration").one()
     assert outcome.status == SyncStatus.FAILED
     assert outcome.error_code == "HTTPStatusError_503"
+
+
+@patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+def test_a_first_pull_that_fails_leaves_a_cursor_at_its_start(
+    session_local: MagicMock, db: Session, polar: FakePolar, mock_celery_app: MagicMock
+) -> None:
+    # Left unset, the next pull would start at its own "now" and never ask for the failed span.
+    user = UserFactory()
+    connection = UserConnectionFactory(user=user, provider="polar", status=ConnectionStatus.ACTIVE)
+    db.add(
+        PolarRegistration(
+            user_connection_id=connection.id, registered=True, attempts=1, updated_at=datetime.now(timezone.utc)
+        )
+    )
+    db.commit()
+    session_local.return_value.__enter__.return_value = db
+    session_local.return_value.__exit__.return_value = None
+    polar.failing_endpoints = {"/v3/users/nightly-recharge"}
+    before = datetime.now(timezone.utc)
+    with (
+        patch("app.services.sync_status_service.SessionLocal", session_local),
+        patch.object(Polar247Data, "_make_api_request", side_effect=polar),
+        patch("app.services.providers.templates.base_workouts.make_authenticated_request", return_value=[]),
+    ):
+        sync_vendor_data(str(user.id), providers=["polar"])
+
+    db.expire_all()
+    cursor = db.get(UserConnection, connection.id).last_synced_at
+    assert cursor is not None
+    assert cursor <= datetime.now(timezone.utc)
+    assert cursor >= before - timedelta(seconds=5)
+
+
+class TestCursorAfterFailedPull:
+    NOW = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+
+    def test_a_cursor_inside_90_days_is_held(self) -> None:
+        assert cursor_after_failed_pull(self.NOW - timedelta(days=3), self.NOW - timedelta(days=3), self.NOW) is None
+
+    def test_a_cursor_older_than_90_days_moves_up_to_90_days(self) -> None:
+        held = cursor_after_failed_pull(self.NOW - timedelta(days=120), self.NOW - timedelta(days=120), self.NOW)
+        assert held == self.NOW - timedelta(days=90)
+
+    def test_no_cursor_becomes_the_start_of_the_failed_pull(self) -> None:
+        run_start = self.NOW - timedelta(minutes=5)
+        assert cursor_after_failed_pull(None, run_start, self.NOW) == run_start
+
+    def test_a_naive_cursor_is_read_as_utc(self) -> None:
+        assert cursor_after_failed_pull(datetime(2026, 10, 1, 12, 0), self.NOW, self.NOW) is None

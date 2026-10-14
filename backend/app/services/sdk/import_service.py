@@ -419,7 +419,8 @@ class ImportService:
 
         # Process sleep (count sleep segments from input)
         if request.data.sleep:
-            handle_sleep_data(db_session, request, user_id)
+            # FORK (2.96.6.1): a busy sleep lock makes this batch retryable (process_sdk_upload).
+            handle_sleep_data(db_session, request, user_id, raise_when_busy=True)
             sleep_saved = len(request.data.sleep)
 
         return {

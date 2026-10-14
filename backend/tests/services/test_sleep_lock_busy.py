@@ -9,8 +9,9 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.schemas.providers.mobile_sdk import SyncRequest
-from app.services.sdk.import_service import ImportService
+from app.services.sdk.import_service import ImportService, import_service
 from app.services.sdk.sleep_service import SleepLockBusyError, handle_sleep_data
+from tests.factories import UserFactory
 from tests.services.test_sleep_service import OLD_WATCH_PAYLOAD
 
 
@@ -19,7 +20,24 @@ def test_a_sleep_batch_that_cannot_take_the_lock_raises(mock_redis: MagicMock, d
     mock_redis.return_value.lock.return_value.acquire.return_value = False
 
     with pytest.raises(SleepLockBusyError):
-        handle_sleep_data(db, SyncRequest.model_validate(OLD_WATCH_PAYLOAD), str(uuid4()))
+        handle_sleep_data(db, SyncRequest.model_validate(OLD_WATCH_PAYLOAD), str(uuid4()), raise_when_busy=True)
+
+
+@patch("app.services.sdk.sleep_service.get_redis_client")
+def test_other_callers_still_skip_a_batch_whose_lock_is_busy(mock_redis: MagicMock, db: Session) -> None:
+    # The XML and AWS imports call it per chunk with no retry: raising there would abort the file.
+    mock_redis.return_value.lock.return_value.acquire.return_value = False
+
+    handle_sleep_data(db, SyncRequest.model_validate(OLD_WATCH_PAYLOAD), str(uuid4()))
+
+
+@patch("app.services.sdk.sleep_service.get_redis_client")
+def test_the_sdk_import_raises_on_a_busy_lock(mock_redis: MagicMock, db: Session) -> None:
+    mock_redis.return_value.lock.return_value.acquire.return_value = False
+    user = UserFactory()
+
+    with pytest.raises(SleepLockBusyError):
+        import_service.load_data(db, OLD_WATCH_PAYLOAD, user_id=str(user.id))
 
 
 def test_an_unexpected_import_failure_is_retryable_and_reports_a_code(db: Session) -> None:

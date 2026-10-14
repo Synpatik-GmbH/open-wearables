@@ -97,9 +97,11 @@ class PolarOAuth(BaseOAuthTemplate):
         """Retry a registration that has not succeeded. None when registered, else a failure code.
 
         FORK (2.96.6.1, spec cause 4, AC6). Called at the start of every pull. A connection with
-        no registration row predates 2.96.6.1: it is attempted once like a pending one, so a
-        registration that failed silently before the fix is retried as well, but it is not
-        announced again when it succeeds (it was announced when it was made).
+        no registration row predates 2.96.6.1: it is attempted like a pending one, so a
+        registration that failed silently before the fix is retried as well. If that first attempt
+        succeeds it is not announced again (it was announced when it was made); if it fails and a
+        later one succeeds, the success is announced like any pending one's, so such a connection
+        can be announced twice. Calibra records a connection idempotently, so that is harmless.
         """
         row = db.get(PolarRegistration, connection.id)
         if row is not None and row.registered:

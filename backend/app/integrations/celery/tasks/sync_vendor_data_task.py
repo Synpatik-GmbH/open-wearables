@@ -65,6 +65,31 @@ def _emit_sync_status(fn: Any, /, *args: Any, **kwargs: Any) -> None:
         )
 
 
+# FORK (2.96.6.1, spec Q5, AC4): how far back a held cursor may fall.
+CURSOR_HOLD_MAX = timedelta(days=90)
+
+
+def cursor_after_failed_pull(last: datetime | None, run_start: datetime, now: datetime) -> datetime | None:
+    """Where the cursor goes after a live pull in which a data type failed. None leaves it as it is.
+
+    FORK (2.96.6.1, spec cause 3, AC4). The cursor is held so the failed span is asked for again,
+    but not without end: "no later date is marked synced past it until it succeeds or turns 90 days
+    old". So:
+
+    - no cursor yet: it is set to the start of this pull, which the next pull then asks from (left
+      unset, the next pull would start at its own "now" and never ask for the failed span);
+    - a cursor more than 90 days back: it moves up to 90 days back, so a type that fails on every
+      pull cannot widen every later pull past the 90-day window (spec section 6);
+    - otherwise: unchanged.
+    """
+    floor = now - CURSOR_HOLD_MAX
+    if last is None:
+        return max(run_start, floor)
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return floor if last < floor else None
+
+
 def _include_in_periodic_pull(caps: Any, live_sync_mode: LiveSyncMode | None, is_historical: bool) -> bool:
     """True if the provider should be included in this REST pull run.
 
@@ -522,9 +547,17 @@ def sync_vendor_data(
                             )
 
                     # FORK (2.96.6.1, spec cause 3, AC4): the cursor does not move past a pull in
-                    # which any data type failed, so the next pull asks for that span again.
-                    if not is_historical and not any(o.status == SyncStatus.FAILED for o in data_type_outcomes):
-                        user_connection_repo.update_last_synced_at(db, connection)
+                    # which any data type failed, so the next pull asks for that span again, up to
+                    # the 90-day window (see cursor_after_failed_pull).
+                    if not is_historical:
+                        if not any(o.status == SyncStatus.FAILED for o in data_type_outcomes):
+                            user_connection_repo.update_last_synced_at(db, connection)
+                        elif (
+                            held := cursor_after_failed_pull(
+                                connection.last_synced_at, start_dt, datetime.now(timezone.utc)
+                            )
+                        ) is not None:
+                            user_connection_repo.update_last_synced_at(db, connection, at=held)
 
                     if shared_token and connection.provider_user_id:
                         # Stop renewing first, or the renewer can retake the lock we just released.

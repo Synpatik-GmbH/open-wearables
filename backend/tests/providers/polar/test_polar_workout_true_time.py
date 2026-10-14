@@ -6,12 +6,15 @@ Polar sends ``start_time`` as local wall-clock time with no zone, plus
 
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
+import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models import EventRecord, PolarWorkoutTrueTime
 from app.schemas.enums import ProviderName
+from app.schemas.providers.polar import ExerciseJSON as PolarExerciseJSON
 from app.services.providers.polar.strategy import PolarStrategy
 from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectionFactory, UserFactory
 
@@ -171,3 +174,69 @@ class TestPolarWorkoutSavePath:
         new_row = db.query(EventRecord).filter(EventRecord.external_id == "EX-HOOK-NEW").one()
         assert db.get(PolarWorkoutTrueTime, new_row.id).recorded_by == "ingest"
         assert db.query(EventRecord).filter(EventRecord.external_id == "EX-HOOK-OLD").count() == 1
+
+    def test_a_record_that_already_holds_the_times_is_not_recorded_as_ours(
+        self, mock_request: MagicMock, svix_enabled: MagicMock, schedule: MagicMock, db: Session
+    ) -> None:
+        # Another record (another id) already holds this data source, start and end.
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="polar")
+        start = datetime.now(timezone.utc).replace(hour=8, minute=25, second=0, microsecond=0) - timedelta(days=2)
+        exercise = _exercise("EX-NEW", (start + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S"), 120)
+        workouts = PolarStrategy().workouts
+        normalized, _ = workouts._normalize_workout(PolarExerciseJSON(**exercise), user.id)
+        holder = workouts.workout_repo.create(db, normalized.model_copy(update={"id": uuid4(), "external_id": "OTHER"}))
+        mock_request.return_value = [exercise]
+
+        saved = workouts.load_data(db, user.id)
+
+        assert saved == 0
+        assert db.get(PolarWorkoutTrueTime, holder.id) is None
+        schedule.assert_not_called()
+
+    def test_a_detail_that_cannot_be_written_leaves_the_exercise_to_the_next_pull(
+        self, mock_request: MagicMock, svix_enabled: MagicMock, schedule: MagicMock, db: Session
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="polar")
+        mock_request.return_value = [_exercise("EX-DETAIL", _now_local_iso(1), 120)]
+        workouts = PolarStrategy().workouts
+
+        with (
+            patch(
+                "app.services.event_record_service.event_record_service.create_detail",
+                side_effect=RuntimeError("detail down"),
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            workouts.load_data(db, user.id)
+        assert db.query(EventRecord).filter(EventRecord.external_id == "EX-DETAIL").count() == 0
+
+        assert workouts.load_data(db, user.id) == 1
+        assert db.query(EventRecord).filter(EventRecord.external_id == "EX-DETAIL").count() == 1
+
+    def test_two_stored_rows_for_one_exercise_do_not_stop_the_pull(
+        self, mock_request: MagicMock, svix_enabled: MagicMock, schedule: MagicMock, db: Session
+    ) -> None:
+        # A pre-fix duplicate (Polar revised the duration, so the end differed) must read as stored,
+        # not raise and fail every other exercise in the list.
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="polar")
+        source = DataSourceFactory(user=user, provider=ProviderName.POLAR, source="polar")
+        start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=4)
+        for minutes in (45, 50):
+            EventRecordFactory(
+                data_source=source,
+                external_id="EX-DUP",
+                start_datetime=start,
+                end_datetime=start + timedelta(minutes=minutes),
+            )
+        mock_request.return_value = [
+            _exercise("EX-DUP", _now_local_iso(4), 120),
+            _exercise("EX-AFTER", _now_local_iso(3), 120),
+        ]
+
+        saved = PolarStrategy().workouts.load_data(db, user.id)
+
+        assert saved == 1
+        assert db.query(EventRecord).filter(EventRecord.external_id == "EX-AFTER").count() == 1

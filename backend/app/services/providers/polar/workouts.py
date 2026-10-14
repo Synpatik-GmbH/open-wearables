@@ -7,7 +7,7 @@ import isodate
 
 from app.constants.workout_types.polar import get_unified_workout_type
 from app.database import DbSession
-from app.models import PolarWorkoutTrueTime
+from app.models import DataSource, EventRecord, PolarWorkoutTrueTime
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -202,19 +202,44 @@ class PolarWorkouts(BaseWorkoutsTemplate):
         for record, detail in self._build_bundles(exercises, user_id):
             if record.start_datetime < oldest_start:
                 continue
-            if record.external_id is not None and self.workout_repo.get_by_external_id(
-                db, user_id, record.external_id, provider=ProviderName.POLAR
-            ):
+            if record.external_id is not None and self._exercise_stored(db, user_id, record.external_id):
                 continue
-            created = event_record_service.create(db, record)
+            # The record and its true-time row commit together: a record without one would read
+            # as two offsets late to the correction script, which would then move a right time.
+            created = self.workout_repo.create_and_flush(db, record)
             if created.id != record.id:
                 # Another record already holds this (data source, start, end): not ours to touch.
+                db.rollback()
                 continue
             db.add(PolarWorkoutTrueTime(event_record_id=created.id, recorded_by="ingest"))
             db.commit()
-            event_record_service.create_detail(db, detail.model_copy(update={"record_id": created.id}))
+            try:
+                event_record_service.create_detail(db, detail.model_copy(update={"record_id": created.id}))
+            except Exception:
+                # Without its detail the record would be skipped by every later pull (it is
+                # stored) and never announced. Removing it lets the next pull store it whole.
+                db.rollback()
+                db.query(EventRecord).filter(EventRecord.id == created.id).delete(synchronize_session=False)
+                db.commit()
+                raise
             count += 1
         return count
+
+    @staticmethod
+    def _exercise_stored(db: DbSession, user_id: UUID, external_id: str) -> bool:
+        """Whether any Polar workout of this user holds Polar's exercise id (a pre-fix duplicate included)."""
+        return (
+            db.query(EventRecord.id)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == ProviderName.POLAR,
+                EventRecord.category == "workout",
+                EventRecord.external_id == external_id,
+            )
+            .first()
+            is not None
+        )
 
     def get_exercise_detail(
         self,
