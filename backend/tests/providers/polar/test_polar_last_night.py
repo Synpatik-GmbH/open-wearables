@@ -255,3 +255,21 @@ def test_the_route_needs_the_api_key(client: TestClient, db: Session, polar: Fak
 
     assert response.status_code == 401
     assert polar.calls == []
+
+
+def test_a_provider_that_is_not_polars_answers_500_without_asking(client: TestClient, db: Session) -> None:
+    # Dragan's review of #40: an explicit check, where an assert would vanish under python -O.
+    user_id = _member(db)
+    with (
+        patch("app.api.routes.v1.sync_data.factory.get_provider") as get_provider,
+        patch("app.api.routes.v1.sync_data.ask_polar_for_last_night") as ask,
+    ):
+        get_provider.return_value.data_247 = object()
+        ask.return_value = {"outcome": "fetched", "reason": None, "stored": 0}
+        response = client.post(
+            f"/api/v1/providers/polar/users/{user_id}/sync/last-night",
+            headers={"X-Open-Wearables-API-Key": ApiKeyFactory().plain_key},
+        )
+
+    assert response.status_code == 500
+    ask.assert_not_called()

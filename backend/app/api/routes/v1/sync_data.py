@@ -278,7 +278,9 @@ def sync_polar_last_night(user_id: UUID, db: DbSession, _api_key: ApiKeyDep) -> 
     ``app/services/providers/polar/last_night.py``.
     """
     data_247 = factory.get_provider(ProviderName.POLAR.value).data_247
-    assert isinstance(data_247, Polar247Data)
+    # An explicit check, not an assert: python -O drops asserts.
+    if not isinstance(data_247, Polar247Data):
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Polar is not configured")
     return dict(ask_polar_for_last_night(db, data_247, user_id, logger))
 
 
