@@ -130,6 +130,26 @@ class TestTheSyncRun:
 
         assert self._connection_cursor(db, connection_id) < started
 
+    def test_the_cursor_does_not_move_past_a_pull_in_which_only_the_workouts_failed(
+        self, session_local: MagicMock, db: Session, polar: FakePolar, mock_celery_app: MagicMock
+    ) -> None:
+        # Dragan's review of #40, item 3: workouts are a type like any other. For a provider that
+        # fetches them by cursor (WHOOP), a cursor moved past a failed workouts fetch loses that span.
+        started = datetime.now(timezone.utc)
+
+        connection_id = self._pull(
+            db, session_local, polar, workouts_answer={"side_effect": HTTPException(status_code=503)}
+        )
+
+        failed = (
+            db.query(SyncRunDataType.data_type)
+            .join(SyncRun, SyncRunDataType.run_id == SyncRun.id)
+            .filter(SyncRun.provider == "polar", SyncRunDataType.status == SyncStatus.FAILED)
+            .all()
+        )
+        assert [row.data_type for row in failed] == ["workouts"]
+        assert self._connection_cursor(db, connection_id) < started
+
     def test_the_cursor_moves_after_a_pull_in_which_nothing_failed(
         self, session_local: MagicMock, db: Session, polar: FakePolar, mock_celery_app: MagicMock
     ) -> None:
