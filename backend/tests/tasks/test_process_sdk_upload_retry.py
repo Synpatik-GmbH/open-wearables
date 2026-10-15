@@ -192,3 +192,18 @@ def test_a_failure_before_the_import_with_no_retry_left_is_reported_failed_and_r
     assert failed.args[0] == user.id
     assert failed.kwargs["error"] == SDK_IMPORT_FAILED
     assert failed.kwargs["metadata"]["cause"] == "OperationalError"
+
+
+@pytest.mark.parametrize("step", sorted(_PRE_IMPORT_FAILURES))
+def test_a_failure_before_the_import_is_still_retried_on_the_fifth_attempt(
+    task_env: dict[str, MagicMock], step: str
+) -> None:
+    # Dragan's re-review of #40: with the case above (no retry left at the sixth attempt), this
+    # pins five retries before the import too, not only in it.
+    user = UserFactory()
+
+    with _PRE_IMPORT_FAILURES[step](), pytest.raises(Retry):
+        _at_attempt(4, lambda: _run_from_s3(user.id) if step == "s3_load" else _run(user.id))
+
+    assert [c.kwargs["countdown"] for c in task_env["retry"].call_args_list] == [480]
+    task_env["failed"].assert_not_called()
