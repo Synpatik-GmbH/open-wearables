@@ -6,7 +6,8 @@ from uuid import UUID
 
 from celery import current_app as celery_app
 
-from app.models import EventRecord, User
+from app.database import DbSession
+from app.models import EventRecord, User, UserConnection
 from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
@@ -248,6 +249,32 @@ class BaseProviderStrategy(ABC):
         """
         caps = self.capabilities
         return caps.rest_pull and (caps.webhook_stream or caps.webhook_ping)
+
+    def prepare_pull(self, db: DbSession, connection: UserConnection) -> str | None:
+        """Called before a pull fetches anything for ``connection``. None to go ahead.
+
+        FORK (2.96.6.1). A provider returns a failure code when nothing can be fetched yet, and
+        the pull then records that code as a FAILED outcome, fetches nothing for the connection
+        and leaves its cursor where it is. Polar uses it to retry a user registration that has
+        not succeeded (spec cause 4). Most providers have nothing to prepare.
+        """
+        return None
+
+    def claim_pull(self, db: DbSession, connection: UserConnection, *, ignore_interval: bool = False) -> bool:
+        """Called before ``prepare_pull``. False skips this pull for ``connection`` entirely.
+
+        FORK (2.96.6.1, spec R1). A provider with a call budget refuses a pull that starts too
+        soon after the last one; ``ignore_interval`` is the pull at connect, which always runs.
+        Most providers have no budget.
+        """
+        return True
+
+    def pull_stops_on(self, code: str | None) -> bool:
+        """True when a failure with ``code`` means the rest of this pull would fail the same way.
+
+        FORK (2.96.6.1, spec R1): Polar's rate limit. The pull then asks for nothing more.
+        """
+        return False
 
     @property
     def default_live_sync_mode(self) -> LiveSyncMode | None:

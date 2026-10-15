@@ -14,6 +14,8 @@ from app.integrations.celery.tasks import (
 from app.schemas.enums import ProviderName
 from app.services import ApiKeyDep
 from app.services.providers.factory import ProviderFactory
+from app.services.providers.polar.data_247 import Polar247Data
+from app.services.providers.polar.last_night import ask_polar_for_last_night
 from app.utils.exceptions import UnsupportedProviderError
 from app.utils.sync_params import build_sync_params
 
@@ -263,6 +265,23 @@ def get_garmin_backfill_status_endpoint(
 # =============================================================================
 # Historical Sync — user-initiated, provider-agnostic
 # =============================================================================
+
+
+@router.post("/polar/users/{user_id}/sync/last-night")
+def sync_polar_last_night(user_id: UUID, db: DbSession, _api_key: ApiKeyDep) -> dict[str, Any]:
+    """FORK (2.96.6.1, spec R2, AC18): ask Polar now for the member's newest night and Nightly Recharge.
+
+    Calibra calls this when a Polar member opens the app and last night is not stored. It runs in
+    the request and answers once what Polar served is stored: ``{"outcome", "reason", "stored"}``,
+    ``outcome`` one of ``fetched``, ``refused`` and ``failed``. Not held back by the pull interval;
+    limited to one ask every 30 seconds and twelve a Berlin day. See
+    ``app/services/providers/polar/last_night.py``.
+    """
+    data_247 = factory.get_provider(ProviderName.POLAR.value).data_247
+    # An explicit check, not an assert: python -O drops asserts.
+    if not isinstance(data_247, Polar247Data):
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Polar is not configured")
+    return dict(ask_polar_for_last_night(db, data_247, user_id, logger))
 
 
 @router.post("/{provider}/users/{user_id}/sync/historical")

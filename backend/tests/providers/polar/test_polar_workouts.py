@@ -4,7 +4,7 @@ Tests for Polar workouts implementation.
 Tests the PolarWorkouts class for fetching and processing workout data from Polar API.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.constants.workout_types.polar import get_unified_workout_type
+from app.models import WorkoutDetails
 from app.schemas.enums import WorkoutType
 from app.schemas.providers.polar import ExerciseJSON as PolarExerciseJSON
 from app.services.providers.polar.workouts import PolarWorkouts
@@ -477,12 +478,8 @@ class TestPolarWorkoutsDataLoading:
     """Tests for loading workout data from Polar API."""
 
     @patch("app.services.providers.templates.base_workouts.make_authenticated_request")
-    @patch("app.services.event_record_service.event_record_service.create")
-    @patch("app.services.event_record_service.event_record_service.create_detail")
     def test_load_data_success(
         self,
-        mock_create_detail: MagicMock,
-        mock_create: MagicMock,
         mock_request: MagicMock,
         db: Session,
         sample_polar_exercise: dict,
@@ -515,15 +512,19 @@ class TestPolarWorkoutsDataLoading:
             oauth=oauth,
         )
 
-        mock_request.return_value = [sample_polar_exercise]
+        # 2.96.6.1: a pull stores nothing that started more than 90 days ago, so the
+        # fixture's 2024 date is moved to yesterday.
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%dT08:00:00")
+        mock_request.return_value = [{**sample_polar_exercise, "start_time": yesterday}]
 
         # Act
         result = workouts.load_data(db, user.id)
 
         # Assert
         assert result == 1
-        mock_create.assert_called_once()
-        mock_create_detail.assert_called_once()
+        row = db.query(EventRecord).filter(EventRecord.external_id == sample_polar_exercise["id"]).one()
+        # 2.96.6.1: the detail is written in the record's own transaction, not by create_detail.
+        assert db.get(WorkoutDetails, row.id) is not None
 
     @patch("app.services.providers.templates.base_workouts.make_authenticated_request")
     def test_load_data_empty_response(self, mock_request: MagicMock, db: Session) -> None:

@@ -1,12 +1,15 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 import isodate
 
 from app.constants.workout_types.polar import get_unified_workout_type
 from app.database import DbSession
+from app.models import DataSource, EventRecord, PolarWorkoutTrueTime
+from app.schemas.enums import ProviderName
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -17,9 +20,18 @@ from app.services.event_record_service import event_record_service
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
 from app.utils.dates import offset_to_iso
 
+# FORK (2.96.6.1, spec Q5): nothing whose date is more than this many days back is fetched or stored.
+POLAR_WINDOW_DAYS = 90
+
+
+_BERLIN = ZoneInfo("Europe/Berlin")
+
 
 class PolarWorkouts(BaseWorkoutsTemplate):
     """Polar implementation of workouts template."""
+
+    # FORK (2.96.6.1, spec R1): a 429 is not retried; the pull ends on it (see pull_budget).
+    retry_on_rate_limit = False
 
     def get_workouts(
         self,
@@ -65,10 +77,19 @@ class PolarWorkouts(BaseWorkoutsTemplate):
         start_time_utc_offset: int,
         duration: str,
     ) -> tuple[datetime, datetime]:
-        """Extract start and end dates from timestamps with UTC offset."""
-        start_date = isodate.parse_datetime(start_time)
-        offset = timedelta(minutes=start_time_utc_offset)
-        start_date = start_date + offset
+        """Extract start and end instants (UTC-aware) from Polar's local start time and offset.
+
+        FORK (2.96.6.1, spec N9): Polar's ``start_time`` is local wall-clock time with no zone, so the
+        true instant is local MINUS ``start_time_utc_offset``. This used to ADD it and return a naive
+        value, which Postgres then read in the session time zone: every stored exercise sat two
+        offsets late. A ``start_time`` that already carries a zone is converted as given and the
+        offset is not applied a second time.
+        """
+        parsed = isodate.parse_datetime(start_time)
+        if parsed.tzinfo is None:
+            start_date = (parsed - timedelta(minutes=start_time_utc_offset)).replace(tzinfo=timezone.utc)
+        else:
+            start_date = parsed.astimezone(timezone.utc)
         duration_td = isodate.parse_duration(duration)
         end_date = start_date + duration_td
         return start_date, end_date
@@ -157,28 +178,82 @@ class PolarWorkouts(BaseWorkoutsTemplate):
     ) -> int:
         """Load data from Polar API."""
         workouts_data = self.get_workouts_from_api(db, user_id, **kwargs)
-        workouts = [PolarExerciseJSON(**w) for w in workouts_data]
-
-        count = 0
-        for record, detail in self._build_bundles(workouts, user_id):
-            created_record = event_record_service.create(db, record)
-            detail_for_record = detail.model_copy(update={"record_id": created_record.id})
-            event_record_service.create_detail(db, detail_for_record)
-            count += 1
-
-        return count
+        return self._save_exercises(db, user_id, [PolarExerciseJSON(**w) for w in workouts_data])
 
     def fetch_and_save_exercise(self, db: DbSession, user_id: UUID, path: str) -> int:
         """Fetch a single exercise by URL path and save it. Used by webhook handler."""
         raw = self._make_api_request(db, user_id, path)
         if not raw:
             return 0
+        return self._save_exercises(db, user_id, [PolarExerciseJSON(**raw)])
+
+    def _save_exercises(self, db: DbSession, user_id: UUID, exercises: list[PolarExerciseJSON]) -> int:
+        """Store each exercise Polar listed that is new, and record it as holding its true time.
+
+        FORK (2.96.6.1). Three rules, the same for the hourly pull and the webhook:
+
+        - An exercise that started more than ``POLAR_WINDOW_DAYS`` ago is not stored (spec Q5, AC3).
+        - An exercise already stored for this user (matched on Polar's exercise id) is left exactly
+          as it is: no write, no detail, no ``workout.created``. Before 2.96.6.1 the pull re-saved
+          every exercise Polar lists (its last 30 days) every hour and re-scheduled its webhook.
+          After the offset fix a row stored by the old arithmetic no longer collides on
+          (data source, start, end), so without this check every pull would add a second copy.
+          Correcting such a row is ``scripts/data_migrations/correct_polar_workout_start_times.py``'s
+          job alone (L2), so that it happens once and is counted.
+        - A new exercise is stored at its true instant, with its detail, and recorded in
+          ``polar_workout_true_time`` (``recorded_by = "ingest"``), all in one transaction: the
+          true-time row is what keeps the correction from ever touching it (AC16), and the single
+          commit is what keeps a killed worker from leaving a record the next pull would skip.
+        """
+        # The window counts Berlin dates, and day 90 is inside it at any hour (spec Q5; Codex
+        # 4274696752): an instant 90 days back dropped a morning of day 90 from an evening pull.
+        oldest_day = datetime.now(_BERLIN).date() - timedelta(days=POLAR_WINDOW_DAYS)
         count = 0
-        for record, detail in self._build_bundles([PolarExerciseJSON(**raw)], user_id):
-            created = event_record_service.create(db, record)
-            event_record_service.create_detail(db, detail.model_copy(update={"record_id": created.id}))
+        for record, detail in self._build_bundles(exercises, user_id):
+            if record.start_datetime.astimezone(_BERLIN).date() < oldest_day:
+                continue
+            if record.external_id is not None and self._exercise_stored(db, user_id, record.external_id):
+                continue
+            # The record, its detail and its true-time row commit together, in one transaction.
+            # A record without its true-time row would read as two offsets late to the correction
+            # script, which would then move a right time; a record without its detail would read
+            # as stored to every later pull and never be completed or announced. A worker killed
+            # anywhere before the commit leaves nothing, so the next pull stores the exercise whole.
+            try:
+                created = self.workout_repo.create_and_flush(db, record)
+                if created.id != record.id:
+                    # Another record already holds this (data source, start, end): not ours to touch.
+                    db.rollback()
+                    continue
+                db.add(PolarWorkoutTrueTime(event_record_id=created.id, recorded_by="ingest"))
+                event_record_service.event_record_detail_repo.create_and_flush(
+                    db, detail.model_copy(update={"record_id": created.id}), detail_type="workout"
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            # Announced only once all three rows are committed, so a finalize never runs for a
+            # record that is not there.
+            event_record_service.schedule_workout_created(created.id)
             count += 1
         return count
+
+    @staticmethod
+    def _exercise_stored(db: DbSession, user_id: UUID, external_id: str) -> bool:
+        """Whether any Polar workout of this user holds Polar's exercise id (a pre-fix duplicate included)."""
+        return (
+            db.query(EventRecord.id)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == ProviderName.POLAR,
+                EventRecord.category == "workout",
+                EventRecord.external_id == external_id,
+            )
+            .first()
+            is not None
+        )
 
     def get_exercise_detail(
         self,

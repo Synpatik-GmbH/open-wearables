@@ -13,6 +13,7 @@ from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.auth import LiveSyncMode
 from app.schemas.responses.upload import ProviderSyncResult, SyncVendorDataResult
 from app.schemas.sync_status import (
+    DataTypeFailure,
     DataTypeKind,
     DataTypeOutcome,
     SyncScope,
@@ -28,7 +29,7 @@ from app.services.sync_coordination import (
     release_stale_primary,
     try_become_primary,
 )
-from app.services.sync_error_code import ALL_SUBTASKS_FAILED, UNCLASSIFIED, error_code
+from app.services.sync_error_code import ALL_SUBTASKS_FAILED, PULL_CLAIM_FAILED, UNCLASSIFIED, error_code
 from app.services.sync_status_service import (
     emit_sync_completed,
     emit_sync_failed,
@@ -50,6 +51,9 @@ logger = getLogger(__name__)
 # types either. Whoop reports a partial sleep fetch this way.
 _NON_COUNT_RESULT_KEYS = frozenset({"sleep_partial"})
 
+# FORK (2.96.6.1, spec R1): what a pull skipped by the provider's call budget reports.
+PULL_INTERVAL_SKIP = "pull_interval"
+
 
 def _emit_sync_status(fn: Any, /, *args: Any, **kwargs: Any) -> None:
     """Best-effort sync status emission — never aborts the sync flow."""
@@ -62,6 +66,31 @@ def _emit_sync_status(fn: Any, /, *args: Any, **kwargs: Any) -> None:
             "Failed to emit sync status event",
             extra={"detail": str(exc)},
         )
+
+
+# FORK (2.96.6.1, spec Q5, AC4): how far back a held cursor may fall.
+CURSOR_HOLD_MAX = timedelta(days=90)
+
+
+def cursor_after_failed_pull(last: datetime | None, run_start: datetime, now: datetime) -> datetime | None:
+    """Where the cursor goes after a live pull in which a data type failed. None leaves it as it is.
+
+    FORK (2.96.6.1, spec cause 3, AC4). The cursor is held so the failed span is asked for again,
+    but not without end: "no later date is marked synced past it until it succeeds or turns 90 days
+    old". So:
+
+    - no cursor yet: it is set to the start of this pull, which the next pull then asks from (left
+      unset, the next pull would start at its own "now" and never ask for the failed span);
+    - a cursor more than 90 days back: it moves up to 90 days back, so a type that fails on every
+      pull cannot widen every later pull past the 90-day window (spec section 6);
+    - otherwise: unchanged.
+    """
+    floor = now - CURSOR_HOLD_MAX
+    if last is None:
+        return max(run_start, floor)
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return floor if last < floor else None
 
 
 def _include_in_periodic_pull(caps: Any, live_sync_mode: LiveSyncMode | None, is_historical: bool) -> bool:
@@ -89,6 +118,7 @@ def sync_vendor_data(
     is_historical: bool = False,
     _skip_linked_fan_out: bool = False,
     _linked_primary_user_id: str | None = None,
+    ignore_pull_interval: bool = False,
 ) -> dict[str, Any]:
     """
     Synchronize workout/exercise/activity data from all providers the user is connected to.
@@ -104,6 +134,9 @@ def sync_vendor_data(
             cursor is not clobbered by a user-initiated historical pull.
         _skip_linked_fan_out: Internal flag set to True when this task was triggered
             by another profile's fan-out.  Prevents infinite fan-out loops.
+        ignore_pull_interval: FORK (2.96.6.1, spec R1). Run even if the provider's call budget
+            would skip a pull this soon after the last one (see claim_pull). The pull at
+            connect sets it.
 
     Returns:
         dict with sync results per provider
@@ -270,6 +303,66 @@ def sync_vendor_data(
                         )
                         continue
 
+                # FORK (2.96.6.1, spec R1, AC17): a provider with a call budget skips a pull that
+                # starts too soon after its last one. Nothing is fetched, no run is opened (a run
+                # every 15 minutes would be noise, and would reach the outgoing webhook), and the
+                # cursor stays put. What was due stays due for the next pull. It comes after the
+                # shared-account check (Codex 4271871209): a profile that loses that check pulls
+                # nothing, so it must not spend the claim its fan-out from the primary needs.
+                # A claim that cannot be made skips the pull too (Codex 4271871240, Andrei's
+                # ruling): with the interval unrecorded nothing would hold the budget, and the
+                # next pull tries again. That is recorded in the sync status with a code, not
+                # only logged.
+                try:
+                    claimed = factory.get_provider(provider_name).claim_pull(
+                        db, connection, ignore_interval=ignore_pull_interval
+                    )
+                except Exception as e:
+                    log_structured(
+                        logger,
+                        "warning",
+                        f"Could not claim the {provider_name} pull; skipping it",
+                        provider=provider_name,
+                        task="sync_vendor_data",
+                        user_id=user_id,
+                        error_code=error_code(e),
+                    )
+                    _emit_sync_status(
+                        emit_sync_failed,
+                        user_uuid,
+                        provider_name,
+                        sync_source,
+                        scope=sync_scope,
+                        run_id=run_id,
+                        error=PULL_CLAIM_FAILED,
+                        message=f"Skipped {provider_name} pull: its call budget could not be recorded",
+                        primary_user_id=primary_uuid,
+                        metadata={"is_historical": is_historical, "cause": error_code(e)},
+                    )
+                    if shared_token and connection.provider_user_id:
+                        release_primary(
+                            provider_name, connection.provider_user_id, user_uuid, shared_token, scope="pull"
+                        )
+                    result.errors[provider_name] = error_code(e) or UNCLASSIFIED
+                    continue
+                if not claimed:
+                    log_structured(
+                        logger,
+                        "info",
+                        f"Skipping {provider_name} pull — the last one started less than its interval ago",
+                        provider=provider_name,
+                        task="sync_vendor_data",
+                        user_id=user_id,
+                    )
+                    if shared_token and connection.provider_user_id:
+                        release_primary(
+                            provider_name, connection.provider_user_id, user_uuid, shared_token, scope="pull"
+                        )
+                    result.providers_synced[provider_name] = ProviderSyncResult(
+                        success=True, params={"skipped": PULL_INTERVAL_SKIP}
+                    )
+                    continue
+
                 _emit_sync_status(
                     emit_sync_started,
                     user_uuid,
@@ -335,8 +428,30 @@ def sync_vendor_data(
                         with suppress(ValueError):
                             end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
 
+                    # FORK (2.96.6.1, spec cause 4): a provider may refuse the pull until it is
+                    # ready (Polar: until Polar accepted the user's registration). The refusal is a
+                    # FAILED outcome with its code, nothing is fetched, and the cursor stays put.
+                    not_ready = strategy.prepare_pull(db, connection)
+                    if not isinstance(not_ready, str):  # the contract is a code or None
+                        not_ready = None
+                    if not_ready is not None:
+                        provider_result.params["registration"] = {"success": False, "error": not_ready}
+                        data_type_outcomes.append(
+                            DataTypeOutcome(
+                                data_type="registration",
+                                kind=DataTypeKind.TASK,
+                                native_type="registration",
+                                status=SyncStatus.FAILED,
+                                error_code=not_ready,
+                            )
+                        )
+
+                    # FORK (2.96.6.1, spec R1): set when a failure means the rest of the pull would
+                    # fail the same way (Polar's 429). Nothing more is asked for.
+                    stopped: str | None = None
+
                     # Sync workouts
-                    if strategy.workouts:
+                    if strategy.workouts and not_ready is None:
                         params = build_sync_params(effective_start, end_date)
                         _emit_sync_status(
                             emit_sync_progress,
@@ -363,24 +478,17 @@ def sync_vendor_data(
                                 )
                             )
                         except Exception as e:
+                            # FORK (2.96.6.1, spec cause 3): a failure is logged as a code, never
+                            # the exception's text (R-2026-10-06-b); no traceback.
                             log_structured(
                                 logger,
                                 "warning",
-                                f"Workouts sync failed for {provider_name}: {e}",
+                                "Workouts sync failed",
                                 provider=provider_name,
                                 task="sync_vendor_data",
                                 user_id=user_id,
-                            )
-                            log_and_capture_error(
-                                e,
-                                logger,
-                                f"Workouts sync failed for {provider_name}: {e}",
-                                extra={
-                                    "user_id": user_id,
-                                    "provider": provider_name,
-                                    "task": "sync_vendor_data",
-                                    "trace_id": trace_id,
-                                },
+                                trace_id=trace_id,
+                                error_code=error_code(e),
                             )
                             provider_result.params["workouts"] = {"success": False, "error": error_code(e)}
                             data_type_outcomes.append(
@@ -389,12 +497,27 @@ def sync_vendor_data(
                                     kind=DataTypeKind.TASK,
                                     native_type="workouts",
                                     status=SyncStatus.FAILED,
-                                    error=error_code(e),
+                                    # A code goes in error_code; error stays empty (AC5).
+                                    error_code=error_code(e),
                                 )
                             )
+                            if strategy.pull_stops_on(error_code(e)):
+                                stopped = error_code(e)
+
+                    if stopped is not None:
+                        provider_result.params["data_247"] = {"success": False, "error": stopped}
+                        data_type_outcomes.append(
+                            DataTypeOutcome(
+                                data_type="data_247",
+                                kind=DataTypeKind.TASK,
+                                native_type="data_247",
+                                status=SyncStatus.FAILED,
+                                error_code=stopped,
+                            )
+                        )
 
                     # Sync 247 data (sleep, recovery, activity) and SAVE to database
-                    if hasattr(strategy, "data_247") and strategy.data_247:
+                    if hasattr(strategy, "data_247") and strategy.data_247 and not_ready is None and stopped is None:
                         # Determine if this is first sync (for API compatibility with providers)
                         is_first_sync = connection.last_synced_at is None
 
@@ -420,10 +543,31 @@ def sync_vendor_data(
                                     end_time=end_dt,
                                     is_first_sync=is_first_sync,
                                 )
-                                provider_result.params["data_247"] = {"success": True, "saved": True, **results_247}
+                                provider_result.params["data_247"] = {
+                                    "success": True,
+                                    "saved": True,
+                                    **{
+                                        k: {"error": v.code} if isinstance(v, DataTypeFailure) else v
+                                        for k, v in results_247.items()
+                                    },
+                                }
                                 for _task, _count in results_247.items():
                                     # Some providers put flags in the same dict as counts.
                                     if _task in _NON_COUNT_RESULT_KEYS:
+                                        continue
+                                    # FORK (2.96.6.1, spec cause 3, AC4/AC5): a type the provider
+                                    # reports as failed is FAILED with its code, not "nothing new".
+                                    if isinstance(_count, DataTypeFailure):
+                                        data_type_outcomes.append(
+                                            DataTypeOutcome(
+                                                data_type=_task,
+                                                kind=DataTypeKind.TASK,
+                                                native_type=_task,
+                                                status=SyncStatus.FAILED,
+                                                items_inserted=_count.saved,
+                                                error_code=_count.code,
+                                            )
+                                        )
                                         continue
                                     pull_inserted += getattr(_count, "inserted", 0)
                                     pull_updated += getattr(_count, "updated", 0)
@@ -465,24 +609,17 @@ def sync_vendor_data(
                                 user_id=user_id,
                             )
                         except Exception as e:
+                            # FORK (2.96.6.1, spec cause 3): a failure is logged as a code, never
+                            # the exception's text (R-2026-10-06-b); no traceback.
                             log_structured(
                                 logger,
                                 "warning",
-                                f"247 data sync failed for {provider_name}: {e}",
+                                "247 data sync failed",
                                 provider=provider_name,
                                 task="sync_vendor_data",
                                 user_id=user_id,
-                            )
-                            log_and_capture_error(
-                                e,
-                                logger,
-                                f"247 data sync failed for {provider_name}: {e}",
-                                extra={
-                                    "user_id": user_id,
-                                    "provider": provider_name,
-                                    "task": "sync_vendor_data",
-                                    "trace_id": trace_id,
-                                },
+                                trace_id=trace_id,
+                                error_code=error_code(e),
                             )
                             provider_result.params["data_247"] = {"success": False, "error": error_code(e)}
                             data_type_outcomes.append(
@@ -491,12 +628,23 @@ def sync_vendor_data(
                                     kind=DataTypeKind.TASK,
                                     native_type="data_247",
                                     status=SyncStatus.FAILED,
-                                    error=error_code(e),
+                                    # A code goes in error_code; error stays empty (AC5).
+                                    error_code=error_code(e),
                                 )
                             )
 
+                    # FORK (2.96.6.1, spec cause 3, AC4): the cursor does not move past a pull in
+                    # which any data type failed, so the next pull asks for that span again, up to
+                    # the 90-day window (see cursor_after_failed_pull).
                     if not is_historical:
-                        user_connection_repo.update_last_synced_at(db, connection)
+                        if not any(o.status == SyncStatus.FAILED for o in data_type_outcomes):
+                            user_connection_repo.update_last_synced_at(db, connection)
+                        elif (
+                            held := cursor_after_failed_pull(
+                                connection.last_synced_at, start_dt, datetime.now(timezone.utc)
+                            )
+                        ) is not None:
+                            user_connection_repo.update_last_synced_at(db, connection, at=held)
 
                     if shared_token and connection.provider_user_id:
                         # Stop renewing first, or the renewer can retake the lock we just released.
@@ -560,6 +708,9 @@ def sync_vendor_data(
                             primary_user_id=primary_uuid,
                             metadata={"is_historical": is_historical, "params": provider_result.params},
                         )
+                        # FORK (2.96.6.1, AC5): a failed run keeps its per-type outcomes too, so the
+                        # failure record says which type failed and with what code.
+                        try_record_data_types(run_id, data_type_outcomes, scope=sync_scope)
                     else:
                         # inserted/updated are run-level totals across all timeseries
                         # types: a single sync (historical included) can have both —

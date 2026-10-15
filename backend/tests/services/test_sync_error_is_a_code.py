@@ -47,6 +47,9 @@ from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEve
 from app.services.sdk.import_service import import_service
 from app.services.sync_error_code import (
     ALL_SUBTASKS_FAILED,
+    POLAR_SLEEP_LISTING_MALFORMED,
+    POLAR_USER_ID_MISSING,
+    PULL_CLAIM_FAILED,
     SDK_IMPORT_FAILED,
     UNCLASSIFIED,
     UNKNOWN,
@@ -78,6 +81,11 @@ class TestErrorCode:
             "HTTPException_599",
             ALL_SUBTASKS_FAILED,
             SDK_IMPORT_FAILED,
+            POLAR_SLEEP_LISTING_MALFORMED,
+            # Dragan's review of #40: both were missing here, so dropping either from the fixed
+            # words stayed green while the outcome it names became "unclassified".
+            POLAR_USER_ID_MISSING,
+            PULL_CLAIM_FAILED,
             UNKNOWN,
             UNCLASSIFIED,
         ],

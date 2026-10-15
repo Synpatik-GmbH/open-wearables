@@ -90,12 +90,17 @@ class WriteCounts(int):
     covered_start/covered_end are the oldest and newest ``recorded_at`` actually
     written. This is the span of the data itself, which is not the window that was
     requested: asking for 90 days and getting two weight readings covers two days.
+
+    FORK (2.96.6.1): written_ids is the ids of the samples handed in whose row the merge
+    actually inserted or changed. A sample identical to its stored row is not in it. None
+    when the result was not built by the merge (callers treat None as "unknown").
     """
 
     inserted: int
     updated: int
     covered_start: datetime | None
     covered_end: datetime | None
+    written_ids: frozenset[UUID] | None
 
     def __new__(
         cls,
@@ -103,12 +108,14 @@ class WriteCounts(int):
         updated: int,
         covered_start: datetime | None = None,
         covered_end: datetime | None = None,
+        written_ids: frozenset[UUID] | None = None,
     ) -> "WriteCounts":
         obj = super().__new__(cls, inserted + updated)
         obj.inserted = inserted
         obj.updated = updated
         obj.covered_start = covered_start
         obj.covered_end = covered_end
+        obj.written_ids = written_ids
         return obj
 
     def __add__(self, other: int) -> "WriteCounts":
@@ -341,14 +348,23 @@ class DataPointSeriesRepository(
                            OR data_point_series.external_id IS DISTINCT FROM excluded.external_id
                            OR data_point_series.zone_offset IS DISTINCT FROM excluded.zone_offset
                            OR data_point_series.is_daily_total IS DISTINCT FROM excluded.is_daily_total
-                        RETURNING (xmax = 0) AS was_insert
+                        RETURNING data_source_id, series_type_definition_id, recorded_at, (xmax = 0) AS was_insert
                     )
-                    SELECT count(*) FILTER (WHERE was_insert) FROM merged
+                    SELECT s.id, m.was_insert
+                    FROM merged m
+                    JOIN data_point_series_staging s
+                      ON s.data_source_id = m.data_source_id
+                     AND s.series_type_definition_id = m.series_type_definition_id
+                     AND s.recorded_at = m.recorded_at
                 """
             )
-            merge_result = cursor.fetchone()
-            assert merge_result is not None, "count(*) always returns exactly one row"
-            inserted = merge_result[0]
+            merged = cursor.fetchall()
+            inserted = sum(1 for row in merged if row[1])
+            # FORK (2.96.6.1): which of the samples handed in were actually written. The merge
+            # skips a row whose values are unchanged, so it is absent here. Matched back to the
+            # staged sample in SQL, where both sides went through the same timestamp conversion
+            # (a naive recorded_at would not compare equal to the stored value in Python).
+            written_ids = frozenset(row[0] for row in merged)
         # One pass over rows already in memory, so the span costs no extra query. This is
         # the span of the data staged for the merge, which is what the sync covered.
         recorded = [row.recorded_at for row in rows if row.recorded_at is not None]
@@ -357,6 +373,7 @@ class DataPointSeriesRepository(
             len(rows) - inserted,
             min(recorded, default=None),
             max(recorded, default=None),
+            written_ids,
         )
 
     def try_commit(self, db_session: DbSession, creation: DataPointSeries) -> DataPointSeries:

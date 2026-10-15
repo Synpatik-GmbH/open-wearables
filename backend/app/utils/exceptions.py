@@ -12,6 +12,14 @@ if TYPE_CHECKING:
     from app.services import AppService
 
 
+class SleepLockBusyError(Exception):
+    """FORK (2.96.6.1): a batch's sleep could not take the per-user sleep lock in time.
+
+    Raised instead of skipping the batch, so the SDK import reports a retryable failure and the
+    upload task processes the batch again. The SDK already holds its 202 and never re-sends.
+    """
+
+
 class UnsupportedProviderError(Exception):
     def __init__(self, provider: str, operation: str = "this operation"):
         self.detail = f"Provider '{provider}' does not support {operation}."

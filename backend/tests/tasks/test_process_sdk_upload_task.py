@@ -172,17 +172,25 @@ class TestOffloadedPayload:
 
     @patch(f"{_MODULE}.get_payload_from_s3")
     def test_read_failure_propagates(self, mock_get_payload: MagicMock) -> None:
-        """Swallowing this would drop the batch silently; raising reports it to Sentry."""
+        """Swallowing this would drop the batch silently; raising reports it to Sentry.
+
+        FORK (2.96.6.1): a read failure is retried first (test_process_sdk_upload_retry.py), so
+        this is the last attempt, the one that raises.
+        """
         mock_get_payload.side_effect = RuntimeError("S3 unavailable")
 
-        with pytest.raises(RuntimeError, match="S3 unavailable"):
-            process_sdk_upload(
-                content=None,
-                content_type="application/json",
-                user_id=str(uuid4()),
-                provider="apple",
-                payload_ref=_PAYLOAD_REF,
-            )
+        process_sdk_upload.push_request(retries=process_sdk_upload.max_retries)
+        try:
+            with pytest.raises(RuntimeError, match="S3 unavailable"):
+                process_sdk_upload(
+                    content=None,
+                    content_type="application/json",
+                    user_id=str(uuid4()),
+                    provider="apple",
+                    payload_ref=_PAYLOAD_REF,
+                )
+        finally:
+            process_sdk_upload.pop_request()
 
     def test_neither_content_nor_reference_is_reported(self) -> None:
         result = process_sdk_upload(

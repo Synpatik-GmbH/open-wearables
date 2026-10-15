@@ -18,6 +18,9 @@ from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 class BaseWorkoutsTemplate(ABC):
     """Base template for fetching and processing workouts."""
 
+    # Retry a 429 in _make_api_request. FORK (2.96.6.1, spec R1): Polar turns it off.
+    retry_on_rate_limit: bool = True
+
     def __init__(
         self,
         workout_repo: EventRecordRepository,
@@ -164,4 +167,5 @@ class BaseWorkoutsTemplate(ABC):
             params=params,
             headers=headers,
             json_data=json_data,
+            retry_on_rate_limit=self.retry_on_rate_limit,
         )

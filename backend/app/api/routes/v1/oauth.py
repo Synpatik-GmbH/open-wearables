@@ -128,6 +128,9 @@ def oauth_callback(
                 end_date=now.isoformat(),
                 providers=[provider_name.value],
                 is_historical=True,
+                # FORK (2.96.6.1, spec R1, AC1): the pull at connect always runs, whenever the
+                # last pull of this user ran (a member reconnecting within the pull interval).
+                ignore_pull_interval=True,
             )
 
     # If a specific redirect_uri was requested (e.g. by frontend), redirect there

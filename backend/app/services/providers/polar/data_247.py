@@ -19,6 +19,7 @@ from app.constants.series_types.polar import (
     SLEEP_INERTIA_LABELS,
 )
 from app.database import DbSession
+from app.models import DataSource, EventRecord
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType
 from app.schemas.model_crud.activities import (
@@ -51,18 +52,67 @@ from app.schemas.providers.polar.sleepwise import (
     CircadianBedtimeResultType,
     GradeType,
 )
+from app.schemas.sync_status import DataTypeFailure
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.providers.api_client import make_authenticated_request
 from app.services.providers.polar.coverage import ACTIVITY_SERIES
+from app.services.providers.polar.pull_budget import (
+    RATE_LIMITED,
+    full_due,
+    record_full_failure,
+    record_full_fetch,
+)
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.raw_payload_storage import store_raw_payload
+from app.services.sync_error_code import POLAR_SLEEP_LISTING_MALFORMED, UNKNOWN, error_code
 from app.services.timeseries_service import timeseries_service
-from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
 _T = TypeVar("_T", bound=BaseModel)
+
+# FORK (2.96.6.1, spec Q5): nothing whose date is more than this many days back is fetched.
+POLAR_WINDOW_DAYS = 90
+
+# FORK (2.96.6.1, spec causes 1-3 and 8, Andrei's ruling of 14 Oct 2026): a full fetch asks each
+# range endpoint for the whole window Polar serves it, capped at POLAR_WINDOW_DAYS, instead of
+# only what came after the connection's cursor. A night or reading that reaches Polar late, or
+# whose earlier fetch failed, is therefore asked for again while Polar still serves it. How often
+# a type is fetched in full is set by pull_budget (spec R1, see _FULL_FORM_TYPES). Unchanged rows
+# are not re-emitted (emit_only_written). Per Polar AccessLink v3:
+# - activities accept a ``from`` up to 365 days back in 28-day ranges: the 90-day cap applies;
+# - SleepWise, body and skin temperature, SpO2 and wrist ECG serve "the last 28 days" with a
+#   28-day maximum range; continuous heart rate and cardio load document no older history,
+#   so they get the same 28 days. Widening one is a change to this table only.
+# Sleep and Nightly Recharge are not here: both are listed by Polar for its last 28 days
+# (``/sleep/available``, ``/nightly-recharge``) and filtered to POLAR_WINDOW_DAYS.
+_RANGE_WINDOW_DAYS: dict[str, int] = {
+    "daily_activity": POLAR_WINDOW_DAYS,
+    "continuous_hr": 27,
+    "cardio_load": 27,
+    "alertness": 27,
+    "circadian_bedtime": 27,
+    "body_temperature": 27,
+    "sleep_skin_temperature": 27,
+    "spo2": 27,
+    "wrist_ecg": 27,
+}
+
+
+# FORK (2.96.6.1, spec R1, AC2, AC17): the data types pull_budget fetches in full at most once per
+# FULL_INTERVAL. Between full fetches a pull fetches the short form of sleep (the newest night
+# Polar lists, when it is not stored) and of daily activity (yesterday and today), and nothing
+# of the other eight. Nightly Recharge is one call for everything Polar serves, so it is fetched
+# whole on every pull (spec cause 8, AC11), as are workouts (one call, see PolarWorkouts).
+_FULL_FORM_TYPES: tuple[str, ...] = (
+    "sleep",
+    "daily_activity",
+    *(t for t in _RANGE_WINDOW_DAYS if t != "daily_activity"),
+)
+# The key a short-form fetch is reported under, so a run says which form it fetched.
+_SHORT_FORM_KEYS: dict[str, str] = {"sleep": "sleep_latest", "daily_activity": "daily_activity_recent"}
+_SHORT_ACTIVITY_DAYS = 1
 
 
 class Polar247Data(Base247DataTemplate):
@@ -95,6 +145,8 @@ class Polar247Data(Base247DataTemplate):
                 method="GET",
                 params=params,
                 headers=headers,
+                # FORK (2.96.6.1, spec R1): a 429 is not retried; the pull ends on it.
+                retry_on_rate_limit=False,
             )
             store_raw_payload(
                 source="api_response",
@@ -486,8 +538,12 @@ class Polar247Data(Base247DataTemplate):
         start_time: datetime,
         end_time: datetime,
     ) -> list[dict[str, Any]]:
+        # FORK (2.96.6.1, spec cause 8, AC11): Polar sends Nightly Recharge by pull only, and this
+        # list (Polar's last 28 days) is requested on every pull, so a date still missing it is
+        # asked for again each time. Dates older than POLAR_WINDOW_DAYS are dropped (Q5).
         response = self._make_api_request(db, user_id, "/v3/users/nightly-recharge")
-        return (response or {}).get("recharges", [])
+        oldest = (datetime.now(timezone.utc) - timedelta(days=POLAR_WINDOW_DAYS)).date().isoformat()
+        return [r for r in (response or {}).get("recharges", []) if (r.get("date") or "") >= oldest]
 
     def normalize_nightly_recharge(
         self,
@@ -888,7 +944,9 @@ class Polar247Data(Base247DataTemplate):
     def _save_timeseries(self, db: DbSession, samples: list[TimeSeriesSampleCreate]) -> int:
         counts: int = 0
         if samples:
-            counts = timeseries_service.bulk_create_samples(db, samples)
+            # FORK (2.96.6.1): every pull re-reads Polar's whole served window, so only the
+            # samples the save actually wrote go out as webhooks.
+            counts = timeseries_service.bulk_create_samples(db, samples, emit_only_written=True)
         return counts
 
     def _save_scores(self, db: DbSession, scores: list[HealthScoreCreate]) -> int:
@@ -921,17 +979,8 @@ class Polar247Data(Base247DataTemplate):
 
         match event_type:
             case PolarWebhookEventType.SLEEP:
-                count = 0
-                for record, detail, score, hr_samples in self.normalize_sleep([raw], user_id):
-                    event_record_service.create_or_merge_sleep(
-                        db, user_id, record, detail, settings.sleep_end_gap_minutes
-                    )
-                    count += 1
-                    if score:
-                        health_score_service.bulk_create(db, [score])
-                    if hr_samples:
-                        timeseries_service.bulk_create_samples(db, hr_samples)
-                return {"sleep": count}
+                # FORK (2.96.6.1): the same save as the pull, so the night is stored last.
+                return {"sleep": self._save_sleep_items(db, user_id, [raw])}
 
             case PolarWebhookEventType.ACTIVITY_SUMMARY:
                 return {"daily_activity": self._save_timeseries(db, self.normalize_daily_activity([raw], user_id))}
@@ -958,37 +1007,158 @@ class Polar247Data(Base247DataTemplate):
                 )
                 return {}
 
-    def _save_sleep(
-        self,
-        db: DbSession,
-        user_id: UUID,
-        start_time: datetime,
-        end_time: datetime,
-    ) -> int:
-        raw_items = self.get_sleep_data(db, user_id, start_time, end_time)
-        normalized = self.normalize_sleep(raw_items, user_id)
-        count = 0
-        scores: list[HealthScoreCreate] = []
-        hr_samples: list[TimeSeriesSampleCreate] = []
+    def _save_missing_sleep(
+        self, db: DbSession, user_id: UUID, now: datetime, *, latest_only: bool = False
+    ) -> int | DataTypeFailure:
+        """Fetch and store every night Polar lists that is inside the window and not yet stored.
 
-        for record, detail, score, hr in normalized:
+        FORK (2.96.6.1, spec causes 1-3, AC1-AC4). Polar lists the nights it holds for its last
+        28 days, with each night's start and end. A night counts as stored when a Polar sleep
+        record of this user overlaps that span; every other listed night whose date is at most
+        POLAR_WINDOW_DAYS back is fetched, on every pull, whatever time it is and wherever the
+        cursor stands. A night that reached Polar late, or whose fetch failed last time, is
+        therefore fetched on the next pull. Each night is fetched and saved on its own, so one
+        failing night does not discard the others; the type is then reported failed (with the
+        first failure's code) and the failed night stays missing, so it is asked for again. A 429
+        ends the loop: every later night would be refused too (spec R1).
+
+        ``latest_only`` is the short form (spec R1): only the newest night Polar lists is
+        considered, which is last night once the watch has synced.
+
+        A listed entry whose date, start or end cannot be read is skipped on its own, so it
+        cannot stop the valid nights being fetched (the newest valid one, in the short form);
+        the type is then reported failed with ``POLAR_SLEEP_LISTING_MALFORMED``, unless a night's
+        own failure gives an earlier code (a 429 above all, which ends the pull).
+        """
+        oldest = (now - timedelta(days=POLAR_WINDOW_DAYS)).date()
+        response = self._make_api_request(db, user_id, "/v3/users/sleep/available")
+        listed, malformed = self._readable_available_nights(response, user_id)
+        if latest_only and listed:
+            listed = [max(listed, key=lambda listed_night: listed_night[0])]
+        missing = [night for day, night in listed if day >= oldest and not self._polar_sleep_stored(db, user_id, night)]
+
+        saved = 0
+        first_failure: str | None = None
+        for night in missing:
             try:
-                event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
-                count += 1
-                if score:
-                    scores.append(score)
-                hr_samples.extend(hr)
+                raw = self._make_api_request(db, user_id, f"/v3/users/sleep/{night['date']}")
+                if raw:
+                    saved += self._save_sleep_items(db, user_id, [raw])
+                db.commit()
             except Exception as e:
-                log_and_capture_error(
-                    e,
+                db.rollback()
+                code = error_code(e) or UNKNOWN
+                first_failure = first_failure or code
+                log_structured(
                     self.logger,
-                    "Failed to save Polar sleep record",
-                    extra={"provider": "polar", "task": "_save_sleep", "user_id": str(user_id)},
+                    "warning",
+                    "Failed to sync a Polar night",
+                    provider="polar",
+                    task="_save_missing_sleep",
+                    user_id=str(user_id),
+                    error_code=code,
                 )
+                if code == RATE_LIMITED:
+                    # Codex 4271871222: the 429 is what the night type reports, whatever failed
+                    # before it, so the caller ends the whole pull on it (spec R1).
+                    first_failure = RATE_LIMITED
+                    break
+        if first_failure is None and malformed:
+            first_failure = POLAR_SLEEP_LISTING_MALFORMED
+        if first_failure is not None:
+            return DataTypeFailure(code=first_failure, saved=saved)
+        return saved
 
-        self._save_scores(db, scores)
-        self._save_timeseries(db, hr_samples)
+    def _readable_available_nights(self, response: Any, user_id: UUID) -> tuple[list[tuple[date, dict[str, Any]]], int]:
+        """The /sleep/available entries whose date, start and end can be read, and how many could not.
+
+        An entry with no date is left out as before (there is no night to ask for); a start or
+        end that is absent is allowed, as before. A value that is present and unreadable, or an
+        entry that is not an object, makes the entry malformed. Logged as a code with a count.
+        """
+        readable: list[tuple[date, dict[str, Any]]] = []
+        malformed = 0
+        for entry in (response or {}).get("available", []):
+            try:
+                if not entry.get("date"):
+                    continue
+                day = date.fromisoformat(entry["date"])
+                for key in ("start_time", "end_time"):
+                    if entry.get(key):
+                        datetime.fromisoformat(entry[key])
+            except (AttributeError, TypeError, ValueError):
+                malformed += 1
+                continue
+            readable.append((day, entry))
+        if malformed:
+            log_structured(
+                self.logger,
+                "warning",
+                "Skipped unreadable Polar sleep listing entries",
+                provider="polar",
+                task="_save_missing_sleep",
+                user_id=str(user_id),
+                error_code=POLAR_SLEEP_LISTING_MALFORMED,
+                count=malformed,
+            )
+        return readable, malformed
+
+    @staticmethod
+    def _polar_sleep_stored(db: DbSession, user_id: UUID, night: dict[str, Any]) -> bool:
+        """True when a Polar sleep record of this user overlaps the night Polar listed."""
+        start, end = night.get("start_time"), night.get("end_time")
+        if not start or not end:
+            return False
+        return (
+            db.query(EventRecord.id)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == ProviderName.POLAR,
+                EventRecord.category == "sleep",
+                EventRecord.start_datetime < datetime.fromisoformat(end),
+                EventRecord.end_datetime > datetime.fromisoformat(start),
+            )
+            .first()
+            is not None
+        )
+
+    def _save_sleep_items(self, db: DbSession, user_id: UUID, raw_items: list[dict[str, Any]]) -> int:
+        """Store sleep records with their scores and heart-rate samples. Raises on any failure."""
+        count = 0
+        for record, detail, score, hr in self.normalize_sleep(raw_items, user_id):
+            # The night's heart rate first, then the sleep record and its score in ONE commit:
+            # the record commits (and is announced) inside create_or_merge_sleep, and from then on
+            # the night counts as stored and is not fetched again, so anything saved after that
+            # commit and failing would be lost for good. A failure before it leaves the night
+            # missing, so the next pull asks again; the heart-rate and score writes do nothing on
+            # a row already there, so the retry is safe.
+            self._save_timeseries(db, hr)
+            event_record_service.create_or_merge_sleep(
+                db,
+                user_id,
+                record,
+                detail,
+                settings.sleep_end_gap_minutes,
+                before_commit=self._score_writer(db, score),
+            )
+            count += 1
         return count
+
+    def _score_writer(self, db: DbSession, score: HealthScoreCreate | None) -> Callable[[EventRecord], None] | None:
+        """The night's score, written in the sleep record's own transaction and pointing at it.
+
+        The score cannot be written before the record: it references the record (foreign key).
+        It points at the record the night ended up in, which after a merge is not the id
+        ``normalize_sleep`` minted.
+        """
+        if score is None:
+            return None
+
+        def write(stored: EventRecord) -> None:
+            self._save_scores(db, [score.model_copy(update={"event_record_id": stored.id})])
+
+        return write
 
     # -------------------------------------------------------------------------
     # Load and save all — entry point for sync_vendor_data task
@@ -1001,86 +1171,141 @@ class Polar247Data(Base247DataTemplate):
         start_time: datetime | str | None = None,
         end_time: datetime | str | None = None,
         is_first_sync: bool = False,
-    ) -> dict[str, int]:
-        if isinstance(start_time, str):
-            start_time = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-        if isinstance(end_time, str):
-            end_time = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
-        if not start_time:
-            start_time = datetime.now(timezone.utc) - timedelta(days=30)
-        if not end_time:
-            end_time = datetime.now(timezone.utc)
+    ) -> dict[str, int | DataTypeFailure]:
+        # FORK (2.96.6.1): the window no longer follows ``start_time`` / ``end_time`` (the
+        # connection's cursor on a live pull). A type fetched in full asks for what Polar serves
+        # it, capped at POLAR_WINDOW_DAYS (see _RANGE_WINDOW_DAYS); which types are fetched in
+        # full, and the short forms, are under _FULL_FORM_TYPES. The parameters stay for the
+        # shared provider interface.
+        now = datetime.now(timezone.utc)
 
-        tasks: dict[str, Callable[[], int]] = {
-            "sleep": lambda: self._save_sleep(db, user_id, start_time, end_time),
-            "daily_activity": lambda: self._save_timeseries(
+        def since(data_type: str) -> datetime:
+            return now - timedelta(days=_RANGE_WINDOW_DAYS[data_type])
+
+        # FORK (2.96.6.1, spec R1): which types this pull fetches in full. Without a connection
+        # (nothing to keep the state on) every type is fetched in full, as before the budget.
+        connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
+        connection_id = connection.id if connection is not None else None
+        due = (
+            full_due(db, connection_id, now, _FULL_FORM_TYPES)
+            if connection_id is not None
+            else frozenset(_FULL_FORM_TYPES)
+        )
+
+        def daily_activity(start: datetime) -> Callable[[], Any]:
+            return lambda: self._save_timeseries(
                 db,
-                self.normalize_daily_activity(
-                    self.get_daily_activity_statistics(db, user_id, start_time, end_time), user_id
-                ),
-            ),
+                self.normalize_daily_activity(self.get_daily_activity_statistics(db, user_id, start, now), user_id),
+            )
+
+        full_only: dict[str, Callable[[], Any]] = {
             "continuous_hr": lambda: self._save_timeseries(
                 db,
-                self.normalize_continuous_hr(self.get_continuous_hr_data(db, user_id, start_time, end_time), user_id),
-            ),
-            "cardio_load": lambda: self._save_scores(
-                db, self.normalize_cardio_load(self.get_cardio_load_data(db, user_id, start_time, end_time), user_id)
-            ),
-            "nightly_recharge": lambda: self._save_nightly_recharge(
-                db,
-                *self.normalize_nightly_recharge(
-                    self.get_nightly_recharge_data(db, user_id, start_time, end_time), user_id
+                self.normalize_continuous_hr(
+                    self.get_continuous_hr_data(db, user_id, since("continuous_hr"), now), user_id
                 ),
             ),
+            "cardio_load": lambda: self._save_scores(
+                db,
+                self.normalize_cardio_load(self.get_cardio_load_data(db, user_id, since("cardio_load"), now), user_id),
+            ),
             "alertness": lambda: self._save_scores(
-                db, self.normalize_alertness(self.get_alertness_data(db, user_id, start_time, end_time), user_id)
+                db, self.normalize_alertness(self.get_alertness_data(db, user_id, since("alertness"), now), user_id)
             ),
             "circadian_bedtime": lambda: self._save_scores(
                 db,
                 self.normalize_circadian_bedtime(
-                    self.get_circadian_bedtime_data(db, user_id, start_time, end_time), user_id
+                    self.get_circadian_bedtime_data(db, user_id, since("circadian_bedtime"), now), user_id
                 ),
             ),
             "body_temperature": lambda: self._save_timeseries(
                 db,
                 self.normalize_body_temperature(
-                    self.get_body_temperature_data(db, user_id, start_time, end_time), user_id
+                    self.get_body_temperature_data(db, user_id, since("body_temperature"), now), user_id
                 ),
             ),
             "sleep_skin_temperature": lambda: self._save_timeseries(
                 db,
                 self.normalize_sleep_skin_temperature(
-                    self.get_sleep_skin_temperature_data(db, user_id, start_time, end_time), user_id
+                    self.get_sleep_skin_temperature_data(db, user_id, since("sleep_skin_temperature"), now), user_id
                 ),
             ),
             "spo2": lambda: self._save_timeseries(
-                db, self.normalize_spo2(self.get_spo2_data(db, user_id, start_time, end_time), user_id)
+                db, self.normalize_spo2(self.get_spo2_data(db, user_id, since("spo2"), now), user_id)
             ),
             "wrist_ecg": lambda: self._save_timeseries(
-                db, self.normalize_wrist_ecg(self.get_wrist_ecg_data(db, user_id, start_time, end_time), user_id)
+                db, self.normalize_wrist_ecg(self.get_wrist_ecg_data(db, user_id, since("wrist_ecg"), now), user_id)
             ),
         }
 
-        results: dict[str, int] = {}
+        # Sleep first: last night is what the morning needs, and a 429 ends the pull.
+        tasks: dict[str, Callable[[], Any]] = {}
+        if "sleep" in due:
+            tasks["sleep"] = lambda: self._save_missing_sleep(db, user_id, now)
+        else:
+            tasks[_SHORT_FORM_KEYS["sleep"]] = lambda: self._save_missing_sleep(db, user_id, now, latest_only=True)
+        tasks["nightly_recharge"] = lambda: self._save_nightly_recharge(
+            db,
+            *self.normalize_nightly_recharge(self.get_nightly_recharge_data(db, user_id, now, now), user_id),
+        )
+        if "daily_activity" in due:
+            tasks["daily_activity"] = daily_activity(since("daily_activity"))
+        else:
+            tasks[_SHORT_FORM_KEYS["daily_activity"]] = daily_activity(now - timedelta(days=_SHORT_ACTIVITY_DAYS))
+        tasks.update({data_type: fn for data_type, fn in full_only.items() if data_type in due})
+
+        results: dict[str, int | DataTypeFailure] = {}
+        stopped: str | None = None
         for data_type, fn in tasks.items():
+            if stopped is not None:
+                # FORK (2.96.6.1, spec R1): Polar refused a call for its rate limit, so every later
+                # call would be refused too, and still counted. Not asked; still due next pull.
+                results[data_type] = DataTypeFailure(code=stopped)
+                continue
             try:
                 results[data_type] = fn()
                 db.commit()
             except Exception as e:
                 db.rollback()
-                results[data_type] = 0
-                log_and_capture_error(
-                    e,
+                # FORK (2.96.6.1, spec cause 3, AC5): a failed type is reported as failed, with a
+                # code, so the sync records it as FAILED and does not move the cursor past it.
+                # It used to read as 0 rows saved, i.e. "nothing new".
+                code = error_code(e) or UNKNOWN
+                results[data_type] = DataTypeFailure(code=code)
+                # A code, never the exception's text, and no traceback (spec cause 3, R-2026-10-06-b).
+                log_structured(
                     self.logger,
-                    f"Failed to sync {data_type} data",
-                    extra={
-                        "provider": "polar",
-                        "task": "load_and_save_all",
-                        "data_type": data_type,
-                        "user_id": str(user_id),
-                    },
+                    "warning",
+                    "Failed to sync a Polar data type",
+                    provider="polar",
+                    task="load_and_save_all",
+                    data_type=data_type,
+                    user_id=str(user_id),
+                    error_code=code,
                 )
+            outcome = results[data_type]
+            if isinstance(outcome, DataTypeFailure):
+                if outcome.code == RATE_LIMITED:
+                    stopped = RATE_LIMITED
+                # Spec cause 3, AC4 (v0.6): a full fetch that failed is asked for again after a
+                # growing gap, at least once every 22 hours (pull_budget.record_full_failure). A
+                # short form that failed needs nothing: the next pull asks for it again anyway,
+                # and a night that is no longer the newest is the next full fetch's.
+                if data_type in _FULL_FORM_TYPES and connection_id is not None:
+                    record_full_failure(db, connection_id, data_type, now)
+            elif data_type in _FULL_FORM_TYPES and connection_id is not None:
+                record_full_fetch(db, connection_id, data_type, now)
 
+        if stopped is not None:
+            log_structured(
+                self.logger,
+                "warning",
+                "Polar pull stopped at the rate limit",
+                provider="polar",
+                task="load_and_save_all",
+                user_id=str(user_id),
+                error_code=stopped,
+            )
         return results
 
     # -------------------------------------------------------------------------

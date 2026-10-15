@@ -14,6 +14,7 @@ from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
 from app.repositories import UserConnectionRepository
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
+from app.services.sync_error_code import error_code
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
@@ -110,6 +111,7 @@ def make_authenticated_request(
     json_data: dict[str, Any] | None = None,
     expect_json: bool = True,
     http2: bool = False,
+    retry_on_rate_limit: bool = True,
 ) -> Any:
     """Make authenticated request to provider API.
 
@@ -134,6 +136,10 @@ def make_authenticated_request(
         http2: Enable HTTP/2 for this request (default False). Requires the h2
             package (installed via httpx[http2]).  Use for providers that require
             HTTP/2, e.g. Sensor Bio.  Other providers are unaffected.
+        retry_on_rate_limit: Retry a 429 up to MAX_RETRIES times (default True). FORK
+            (2.96.6.1, spec R1): Polar passes False. Its limits are 15-minute and 24-hour
+            windows that a few seconds of backoff cannot clear, and every retry is another
+            call counted against them.
 
     Returns:
         Any: API response JSON, or dict with status_code if expect_json=False
@@ -173,7 +179,7 @@ def make_authenticated_request(
 
             # Handle 429 rate limiting with retry
             if response.status_code == 429:
-                if attempt < MAX_RETRIES:
+                if retry_on_rate_limit and attempt < MAX_RETRIES:
                     backoff_delay = RETRY_BASE_DELAY * (2**attempt)  # 1s, 2s, 4s
                     log_structured(
                         logger,
@@ -220,12 +226,14 @@ def make_authenticated_request(
 
                 if has_error or has_error_code:
                     error_msg = result.get("message") or result.get("error") or str(result)
+                    # FORK (2.96.6.1, spec cause 3, R-2026-10-06-b): the status, never the body or
+                    # a message read from it; an upstream body can carry the user's data.
                     log_structured(
                         logger,
                         "error",
                         "API returned error in body",
                         provider_name=provider_name,
-                        error_msg=error_msg,
+                        status_code=response.status_code,
                     )
                     raise HTTPException(
                         status_code=result.get("code", 400),
@@ -236,7 +244,7 @@ def make_authenticated_request(
 
         except httpx.HTTPStatusError as e:
             # Handle 429 from raise_for_status (shouldn't happen due to early check, but just in case)
-            if e.response.status_code == 429 and attempt < MAX_RETRIES:
+            if e.response.status_code == 429 and retry_on_rate_limit and attempt < MAX_RETRIES:
                 backoff_delay = RETRY_BASE_DELAY * (2**attempt)
                 log_structured(
                     logger,
@@ -250,13 +258,14 @@ def make_authenticated_request(
                 time.sleep(backoff_delay)
                 continue
 
+            # FORK (2.96.6.1, spec cause 3, R-2026-10-06-b): the status, never the response body.
             log_structured(
                 logger,
                 "error",
                 "API error",
                 provider_name=provider_name,
                 user_id=str(user_id),
-                error=e.response.text,
+                status_code=e.response.status_code,
             )
             if e.response.status_code == 401:
                 raise HTTPException(
@@ -271,13 +280,15 @@ def make_authenticated_request(
             # Re-raise HTTPExceptions as-is
             raise
         except Exception as e:
+            # FORK (2.96.6.1, spec cause 3, R-2026-10-06-b): no answer, so no status; the
+            # exception's code, never its text.
             log_structured(
                 logger,
                 "error",
                 "API request failed",
                 provider_name=provider_name,
                 user_id=str(user_id),
-                error=str(e),
+                error_code=error_code(e),
             )
             raise HTTPException(
                 status_code=500,

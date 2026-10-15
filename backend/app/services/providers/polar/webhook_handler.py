@@ -47,7 +47,7 @@ from app.schemas.enums import ProviderName
 from app.schemas.providers.polar import PolarWebhookEvent, PolarWebhookEventType
 from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
 from app.services.raw_payload_storage import store_raw_payload
-from app.utils.sentry_helpers import log_and_capture_error
+from app.services.sync_error_code import error_code
 from app.utils.structured_logging import log_structured
 
 if TYPE_CHECKING:
@@ -210,7 +210,9 @@ class PolarWebhookHandler(BaseWebhookHandler):
         path = urlparse(event.url).path
         user_id = connection.user_id
 
-        self.connection_repo.update_last_synced_at(db, connection)
+        # FORK (2.96.6.1, spec cause 3): the webhook no longer stamps last_synced_at before it
+        # fetches. It marked the connection synced whether or not the fetch then succeeded; the
+        # cursor is the pull's to move, and only after a pull in which nothing failed.
 
         log_structured(
             logger,
@@ -235,17 +237,16 @@ class PolarWebhookHandler(BaseWebhookHandler):
             saved = self.data_247.fetch_and_save_from_webhook(db, user_id, event.event, path)
             return {"status": "accepted", "user_id": str(user_id), "saved": saved}
         except Exception as exc:
-            log_and_capture_error(
-                exc,
+            # FORK (2.96.6.1, spec cause 3): a code, never the exception's text, and no traceback.
+            log_structured(
                 logger,
+                "warning",
                 "Error fetching/saving Polar webhook data",
-                extra={
-                    "provider": "polar",
-                    "trace_id": trace_id,
-                    "event": event.event,
-                    "polar_user_id": event.user_id,
-                    "path": path,
-                    "user_id": str(user_id),
-                },
+                provider="polar",
+                trace_id=trace_id,
+                event=event.event,
+                user_id=str(user_id),
+                error_code=error_code(exc),
             )
-            return {"status": "error", "error": str(exc), "user_id": str(user_id)}
+            # FORK (2.96.6.1, AC5): a code, never the exception's text.
+            return {"status": "error", "error": error_code(exc), "user_id": str(user_id)}

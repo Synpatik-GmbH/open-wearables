@@ -12,6 +12,9 @@ from .health_score import HealthScore
 from .invitation import Invitation
 from .menstrual_cycle_details import MenstrualCycleDetails
 from .personal_record import PersonalRecord
+from .polar_pull_state import PolarPullState
+from .polar_registration import PolarRegistration
+from .polar_workout_true_time import PolarWorkoutTrueTime
 from .provider_priority import ProviderPriority
 from .provider_setting import ProviderSetting
 from .refresh_token import RefreshToken
@@ -52,6 +55,9 @@ __all__ = [
     "SleepDetails",
     "WorkoutDetails",
     "PersonalRecord",
+    "PolarPullState",
+    "PolarRegistration",
+    "PolarWorkoutTrueTime",
     "DataPointSeries",
     "SeriesTypeDefinition",
     "SyncRun",

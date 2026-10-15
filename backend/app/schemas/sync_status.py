@@ -8,6 +8,7 @@ distributed to clients via Server-Sent Events (SSE).
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
@@ -75,6 +76,20 @@ class DataTypeKind(StrEnum):
     PROFILE = "profile"
     EVENT = "event"
     TASK = "task"
+
+
+@dataclass(frozen=True)
+class DataTypeFailure:
+    """FORK (2.96.6.1, spec cause 3): a provider's per-type result saying the type failed.
+
+    A provider's ``load_and_save_all`` returns this in place of a count, so the sync records
+    the data type as FAILED with ``code`` (a code from ``app.services.sync_error_code``, never
+    text) instead of SKIPPED, and does not move the connection's cursor past it. ``saved`` is
+    what the type still wrote before or around the failure (a night that did arrive is kept).
+    """
+
+    code: str
+    saved: int = 0
 
 
 class DataTypeOutcome(BaseModel):
