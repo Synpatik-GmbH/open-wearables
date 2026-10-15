@@ -1,6 +1,6 @@
 import uuid
 from logging import getLogger
-from typing import Any
+from typing import Any, NoReturn
 from uuid import UUID
 
 from celery import Task, shared_task
@@ -24,7 +24,7 @@ from app.services.sdk.import_service import (
 from app.services.sdk.import_service import (
     import_service as sdk_import_service,
 )
-from app.services.sync_error_code import SDK_IMPORT_FAILED
+from app.services.sync_error_code import SDK_IMPORT_FAILED, error_code
 from app.services.sync_status_service import (
     emit_sync_completed,
     emit_sync_failed,
@@ -76,11 +76,46 @@ def _batch_outcomes(types: list[str], workouts_saved: int, sleep_saved: int, sco
 #
 # FORK (2.96.6.1, spec 3.3, Apple Health cause 3): bound and retried. The SDK holds its 202 for
 # a batch and never re-sends it, so a batch whose import failed for a transient reason (an
-# unexpected error, a busy sleep lock) is processed again from the same content or S3 payload,
+# unexpected error, a busy sleep lock), or failed in a step before the import (the S3 load, the
+# user check, the connection setup), is processed again from the same content or S3 payload,
 # with backoff, before it is reported failed. Re-processing is safe: samples upsert, workouts
 # and sleep are keyed on their times.
 SDK_IMPORT_MAX_RETRIES = 5
 SDK_IMPORT_RETRY_BASE_SECONDS = 30
+
+
+def _retry_delay(retries: int) -> int:
+    """Seconds before the next attempt: 30, then twice as long each time."""
+    return SDK_IMPORT_RETRY_BASE_SECONDS * 2**retries
+
+
+def _retry_or_fail_before_import(
+    task: Task,
+    error: Exception,
+    user_uuid: UUID,
+    provider: str,
+    scope: SyncScope,
+    run_id: str,
+    batch_id: str,
+) -> NoReturn:
+    """FORK (2.96.6.1): retry a batch whose failure came before its import, while retries remain.
+
+    With none left, the batch is recorded as failed, with the exception's code and not its text,
+    and the exception is raised again.
+    """
+    if task.request.retries < task.max_retries:
+        raise task.retry(countdown=_retry_delay(task.request.retries))
+    emit_sync_failed(
+        user_uuid,
+        provider,
+        SyncSource.SDK,
+        scope=scope,
+        run_id=run_id,
+        error=SDK_IMPORT_FAILED,
+        message=f"{provider.capitalize()} batch failed before its import",
+        metadata={"batch_id": batch_id, "cause": error_code(error)},
+    )
+    raise error
 
 
 @shared_task(bind=True, queue="sdk_sync", ignore_result=True, max_retries=SDK_IMPORT_MAX_RETRIES)
@@ -118,37 +153,6 @@ def process_sdk_upload(
     if not batch_id:
         batch_id = str(uuid.uuid4())
 
-    # Payload was offloaded to S3, so the body never travelled through the broker. A read
-    # failure propagates: boto3 has already retried the transient cases, and CeleryIntegration
-    # reports the exception to Sentry.
-    if content is None and payload_ref:
-        try:
-            content = get_payload_from_s3(payload_ref)
-        except Exception:
-            log_structured(
-                logger,
-                "error",
-                "Failed to load SDK payload from S3",
-                provider=provider,
-                action="load_payload_ref",
-                batch_id=batch_id,
-                user_id=user_id,
-                payload_ref=payload_ref,
-            )
-            raise
-
-    if content is None:
-        log_structured(
-            logger,
-            "warning",
-            "No payload content or reference provided",
-            provider=provider,
-            action="validate_payload_present",
-            batch_id=batch_id,
-            user_id=user_id,
-        )
-        return {"status": "error", "reason": "missing_payload", "batch_id": batch_id}
-
     # A historical export spans many batches, so its run is keyed by the device's session
     # id. Without one the batch is its own run, which is why live syncs are not persisted.
     scope = SyncScope.HISTORICAL if sync_type == SyncScope.HISTORICAL and sync_session_id else SyncScope.LIVE
@@ -169,20 +173,55 @@ def process_sdk_upload(
         )
         return {"status": "error", "reason": "invalid_user_id", "batch_id": batch_id}
 
-    # Validate user exists before processing
-    with SessionLocal() as db:
-        user_repo = UserRepository(User)
-        if not user_repo.get(db, user_uuid):
+    # FORK (2.96.6.1, spec 3.3): the SDK holds its 202 for this batch and never re-sends it, so a
+    # failure in a step before the import is retried like a failed import. The S3 payload stays
+    # where it is until the batch is saved, so a retry loads it again.
+    try:
+        # Payload was offloaded to S3, so the body never travelled through the broker.
+        if content is None and payload_ref:
+            try:
+                content = get_payload_from_s3(payload_ref)
+            except Exception:
+                log_structured(
+                    logger,
+                    "error",
+                    "Failed to load SDK payload from S3",
+                    provider=provider,
+                    action="load_payload_ref",
+                    batch_id=batch_id,
+                    user_id=user_id,
+                    payload_ref=payload_ref,
+                )
+                raise
+
+        if content is None:
             log_structured(
                 logger,
                 "warning",
-                "Skipping import for non-existent user",
+                "No payload content or reference provided",
                 provider=provider,
-                action="validate_user_exists",
+                action="validate_payload_present",
                 batch_id=batch_id,
                 user_id=user_id,
             )
-            return {"status": "skipped", "reason": "user_not_found", "batch_id": batch_id}
+            return {"status": "error", "reason": "missing_payload", "batch_id": batch_id}
+
+        # Validate user exists before processing
+        with SessionLocal() as db:
+            user_repo = UserRepository(User)
+            if not user_repo.get(db, user_uuid):
+                log_structured(
+                    logger,
+                    "warning",
+                    "Skipping import for non-existent user",
+                    provider=provider,
+                    action="validate_user_exists",
+                    batch_id=batch_id,
+                    user_id=user_id,
+                )
+                return {"status": "skipped", "reason": "user_not_found", "batch_id": batch_id}
+    except Exception as e:
+        _retry_or_fail_before_import(self, e, user_uuid, provider, scope, run_id, batch_id)
 
     # Log task start
     log_structured(
@@ -208,7 +247,10 @@ def process_sdk_upload(
     with SessionLocal() as db:
         # Ensure SDK connection exists for this user (SDK-based, no OAuth tokens).
         # Goes through the service so a new/reactivated connection emits connection.created.
-        user_connection_service.ensure_sdk_connection(db, user_uuid, provider)
+        try:
+            user_connection_service.ensure_sdk_connection(db, user_uuid, provider)
+        except Exception as e:
+            _retry_or_fail_before_import(self, e, user_uuid, provider, scope, run_id, batch_id)
 
         # Select the appropriate import service based on source
         import_service = _get_import_service(provider)
@@ -276,7 +318,7 @@ def process_sdk_upload(
                 delete_payload_from_s3(payload_ref)
         else:
             if result.get("retryable") and self.request.retries < self.max_retries:
-                raise self.retry(countdown=SDK_IMPORT_RETRY_BASE_SECONDS * 2**self.request.retries)
+                raise self.retry(countdown=_retry_delay(self.request.retries))
             emit_sync_failed(
                 user_uuid,
                 provider,
