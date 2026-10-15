@@ -7,7 +7,12 @@ through ``create_or_merge_sleep`` with no callback, as they do.
 
 The ``db`` fixture runs each test inside a transaction that is rolled back, where a commit only
 releases a savepoint, so no other session could see the night either way. This test commits
-against the engine itself and reads from a second session, then deletes its user.
+against the engine itself and reads from a second session, then deletes what it committed: its
+user, and the shared ``provider_priority`` row WHOOP's save adds for ``whoop`` when there is none
+(``DataSourceRepository`` → ``ensure_provider_exists``). That row outlived the test once and made
+later tests read ``whoop`` where they expected ``garmin`` (Dragan's re-review of #40). The
+fixture now also checks that every table holds as many rows as before, so a shared row added
+here in future fails this test rather than another one.
 """
 
 from collections.abc import Iterator
@@ -16,16 +21,27 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models import DataSource, EventRecord, User
+from app.database import BaseDbModel
+from app.models import DataSource, EventRecord, ProviderPriority, User
 from app.services.providers.whoop.strategy import WhoopStrategy
+
+
+def _row_counts(session: Session) -> dict[str, int]:
+    return {
+        table.name: session.execute(select(func.count()).select_from(table)).scalar_one()
+        for table in BaseDbModel.metadata.sorted_tables
+    }
 
 
 @pytest.fixture
 def committed_user(session_factory: Any) -> Iterator[UUID]:
     user_id = uuid4()
     with session_factory() as session:
+        counts_before = _row_counts(session)
+        priorities_before = set(session.scalars(select(ProviderPriority.id)))
         session.add(User(id=user_id, created_at=datetime.now(timezone.utc), email=f"{user_id}@example.test"))
         session.commit()
     try:
@@ -33,7 +49,9 @@ def committed_user(session_factory: Any) -> Iterator[UUID]:
     finally:
         with session_factory() as session:
             session.query(User).filter(User.id == user_id).delete()
+            session.query(ProviderPriority).filter(ProviderPriority.id.not_in(priorities_before)).delete()
             session.commit()
+            assert _row_counts(session) == counts_before
 
 
 def _night() -> dict[str, Any]:
