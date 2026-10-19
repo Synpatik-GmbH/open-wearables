@@ -9,6 +9,7 @@ heavy mode then names the Python lines holding it, or names none, which points a
 """
 
 import json
+import platform
 import sys
 import threading
 import tracemalloc
@@ -23,8 +24,8 @@ from app.integrations.celery.memory_profile import MemoryProfiler, parse_malloc_
 # Allocations held across reports, so the profiler has growth to find.
 _held: list[bytes | str] = []
 
-_has_malloc_info = memory_profile.read_malloc_info() is not None
-needs_glibc = pytest.mark.skipif(not _has_malloc_info, reason="no glibc malloc_info here")
+# Decided apart from read_malloc_info, so a broken reader fails these tests rather than skipping them.
+needs_glibc = pytest.mark.skipif(platform.libc_ver()[0] != "glibc", reason="no glibc here")
 
 
 @pytest.fixture(autouse=True)
@@ -65,6 +66,16 @@ def test_malloc_info_is_read_across_every_pool() -> None:
     assert stats.free_bytes == 1048576 + 3145728  # fast + rest: freed, not returned
     assert stats.mmap_bytes == 2097152  # large blocks straight from the OS, in use
     assert stats.in_use_bytes == 10485760 - (1048576 + 3145728) + 2097152
+
+
+@needs_glibc
+def test_malloc_info_is_read_from_glibc() -> None:
+    xml = memory_profile.read_malloc_info()
+
+    assert xml is not None
+    stats = parse_malloc_info(xml)
+    assert stats.arenas >= 1
+    assert stats.heap_bytes > 0
 
 
 # ── The cheap report ──
