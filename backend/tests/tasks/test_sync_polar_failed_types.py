@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.sync_vendor_data_task import cursor_after_failed_pull, sync_vendor_data
-from app.models import PolarRegistration, SyncRun, SyncRunDataType, UserConnection
+from app.models import PolarPullState, PolarRegistration, SyncRun, SyncRunDataType, UserConnection
 from app.schemas.auth import ConnectionStatus
 from app.schemas.sync_status import SyncStatus
 from app.services.providers.polar.data_247 import Polar247Data
@@ -40,6 +40,7 @@ class TestTheSyncRun:
         *,
         workouts_answer: dict[str, Any] | None = None,
         load_and_save_all: dict[str, Any] | None = None,
+        full_retry: dict[str, Any] | None = None,
     ) -> UUID:
         user = UserFactory()
         connection = UserConnectionFactory(user=user, provider="polar", status=ConnectionStatus.ACTIVE)
@@ -50,6 +51,8 @@ class TestTheSyncRun:
                 user_connection_id=connection.id, registered=True, attempts=1, updated_at=datetime.now(timezone.utc)
             )
         )
+        if full_retry is not None:
+            db.add(PolarPullState(user_connection_id=connection.id, full_retry=full_retry))
         db.commit()
         session_local.return_value.__enter__.return_value = db
         session_local.return_value.__exit__.return_value = None
@@ -90,6 +93,26 @@ class TestTheSyncRun:
         )
         assert row.status == SyncStatus.FAILED
         assert row.error_code == "HTTPException_503"
+        assert row.error is None
+
+    def test_a_full_fetch_an_earlier_pull_never_ended_is_recorded_failed_with_its_code(
+        self, session_local: MagicMock, db: Session, polar: FakePolar, mock_celery_app: MagicMock
+    ) -> None:
+        # An earlier pull's worker was killed during the continuous HR full fetch: its entry still
+        # carries the started marker, and its gap still holds it back.
+        now = datetime.now(timezone.utc)
+        killed = {"failures": 1, "next": (now + timedelta(minutes=30)).isoformat(), "started": now.isoformat()}
+
+        self._pull(db, session_local, polar, full_retry={"continuous_hr": killed})
+
+        row = (
+            db.query(SyncRunDataType)
+            .join(SyncRun, SyncRunDataType.run_id == SyncRun.id)
+            .filter(SyncRun.provider == "polar", SyncRunDataType.data_type == "continuous_hr")
+            .one()
+        )
+        assert row.status == SyncStatus.FAILED
+        assert row.error_code == "polar_full_fetch_interrupted"
         assert row.error is None
 
     def test_a_failure_caught_by_the_outer_handlers_is_recorded_with_its_code_and_no_text(

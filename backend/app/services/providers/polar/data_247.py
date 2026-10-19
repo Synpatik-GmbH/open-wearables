@@ -60,13 +60,21 @@ from app.services.providers.polar.coverage import ACTIVITY_SERIES
 from app.services.providers.polar.pull_budget import (
     RATE_LIMITED,
     full_due,
+    interrupted_full_fetches,
+    record_full_end,
     record_full_failure,
     record_full_fetch,
+    record_full_start,
 )
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.raw_payload_storage import store_raw_payload
-from app.services.sync_error_code import POLAR_SLEEP_LISTING_MALFORMED, UNKNOWN, error_code
+from app.services.sync_error_code import (
+    POLAR_FULL_FETCH_INTERRUPTED,
+    POLAR_SLEEP_LISTING_MALFORMED,
+    UNKNOWN,
+    error_code,
+)
 from app.services.timeseries_service import timeseries_service
 from app.utils.structured_logging import log_structured
 
@@ -1284,6 +1292,24 @@ class Polar247Data(Base247DataTemplate):
         tasks.update({data_type: fn for data_type, fn in full_only.items() if data_type in due})
 
         results: dict[str, int | DataTypeFailure] = {}
+        # FORK: a full fetch an earlier pull started and never ended (record_full_start). Said once:
+        # the marker is dropped here. A type its gap still holds back reads FAILED in this run; one
+        # due again runs below and reports what that fetch does.
+        if connection_id is not None:
+            for data_type in sorted(interrupted_full_fetches(db, connection_id)):
+                log_structured(
+                    self.logger,
+                    "warning",
+                    "Polar full fetch interrupted",
+                    provider="polar",
+                    task="load_and_save_all",
+                    action=POLAR_FULL_FETCH_INTERRUPTED,
+                    data_type=data_type,
+                    user_id=str(user_id),
+                )
+                record_full_end(db, connection_id, data_type)
+                if data_type not in tasks:
+                    results[data_type] = DataTypeFailure(code=POLAR_FULL_FETCH_INTERRUPTED)
         stopped: str | None = None
         for data_type, fn in tasks.items():
             if stopped is not None:
@@ -1291,13 +1317,12 @@ class Polar247Data(Base247DataTemplate):
                 # call would be refused too, and still counted. Not asked; still due next pull.
                 results[data_type] = DataTypeFailure(code=stopped)
                 continue
-            # FORK: a full fetch counts as failed until it succeeds. A worker killed in the middle
-            # of one (prod, 16-19 Oct 2026: out of memory) runs nothing after it, so without this
-            # the fetch stayed due and every hourly pull started it again; now the retry gap holds
-            # it back. A success clears the gap (record_full_fetch).
+            # FORK: a full fetch counts as failed until it ends (record_full_start), so a worker
+            # killed in the middle of one is held back by the retry gap instead of being started
+            # again by the next hourly pull.
             attempted_in_full = data_type in _FULL_FORM_TYPES and connection_id is not None
             if attempted_in_full:
-                record_full_failure(db, connection_id, data_type, now)
+                record_full_start(db, connection_id, data_type, now)
             try:
                 results[data_type] = fn()
                 db.commit()
@@ -1327,8 +1352,10 @@ class Polar247Data(Base247DataTemplate):
                 # growing gap, at least once every 22 hours (pull_budget.record_full_failure). A
                 # short form that failed needs nothing: the next pull asks for it again anyway,
                 # and a night that is no longer the newest is the next full fetch's.
-                # A type asked for in full has its failure recorded already, before it ran.
-                if data_type in _FULL_FORM_TYPES and connection_id is not None and not attempted_in_full:
+                # A type asked for in full has its failure recorded already, when it started.
+                if attempted_in_full:
+                    record_full_end(db, connection_id, data_type)
+                elif data_type in _FULL_FORM_TYPES and connection_id is not None:
                     record_full_failure(db, connection_id, data_type, now)
             elif data_type in _FULL_FORM_TYPES and connection_id is not None:
                 record_full_fetch(db, connection_id, data_type, now)

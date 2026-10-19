@@ -10,6 +10,7 @@ Polar is faked at ``_make_api_request``; storage is real.
 """
 
 import gc
+import json
 from collections.abc import Iterator
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -17,10 +18,12 @@ from unittest.mock import patch
 from uuid import UUID
 
 import pytest
+from freezegun import freeze_time
 from sqlalchemy.orm import Session
 
 from app.models import DataPointSeries, DataSource, PolarPullState
 from app.schemas.model_crud.activities import TimeSeriesSampleCreate
+from app.schemas.sync_status import DataTypeFailure
 from app.services.providers.polar import data_247 as data_247_module
 from app.services.providers.polar.data_247 import Polar247Data
 from app.services.providers.polar.pull_budget import RETRY_FIRST_GAP, full_due
@@ -36,7 +39,8 @@ WRIST_ECG = "/v3/users/wrist-ecg"
 ACTIVITIES = "/v3/users/activities"
 
 BATCH = 500
-DAYS = 10
+# Polar serves 28 days of continuous heart rate and body temperature.
+DAYS = 28
 PER_DAY = 400
 
 
@@ -187,7 +191,7 @@ class TestAFullFetchHoldsOneBatch:
             result = data_247.load_and_save_all(db, user_id)
 
         assert result[data_type] == DAYS * PER_DAY
-        # The whole window is DAYS * PER_DAY = 4000 samples. One batch, plus the day that filled it.
+        # The whole window is DAYS * PER_DAY = 11,200 samples. One batch, plus the day that filled it.
         assert live_at_save
         assert max(live_at_save) <= BATCH + PER_DAY
 
@@ -200,7 +204,7 @@ class TestAFullFetchHoldsOneBatch:
         with patch.object(Polar247Data, "_save_missing_sleep", return_value=0):
             result = data_247.load_and_save_all(db, user_id)
 
-        # continuous_hr + body_temperature, 4000 each, and 90 days of three activity series.
+        # continuous_hr + body_temperature, 11,200 each, and 90 days of three activity series.
         activity = result["daily_activity"]
         assert activity == 91 * 3
         assert _stored(db, user_id) == 2 * DAYS * PER_DAY + activity
@@ -330,3 +334,85 @@ class TestAKilledFullFetch:
         db.refresh(state)
         assert "continuous_hr" not in (state.full_retry or {})
         assert "continuous_hr" in state.full_fetched_at
+
+
+INTERRUPTED = "polar_full_fetch_interrupted"
+
+
+def _killed(*args: Any, **kwargs: Any) -> Any:
+    raise Killed
+
+
+def _interrupted_lines(capsys: pytest.CaptureFixture[str]) -> list[dict[str, Any]]:
+    lines = []
+    for line in capsys.readouterr().out.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and entry.get("action") == INTERRUPTED:
+            lines.append(entry)
+    return lines
+
+
+def _kill_a_pull(db: Session, data_247: Polar247Data, user_id: UUID, entry: str) -> None:
+    with patch.object(Polar247Data, entry, side_effect=_killed), pytest.raises(Killed):
+        data_247.load_and_save_all(db, user_id)
+    db.rollback()
+
+
+class TestAnInterruptedFullFetch:
+    """The pull after a killed full fetch says so: the type reads FAILED with a code, once, and
+    a log line names it. A fetch that failed and was caught is not an interruption."""
+
+    @pytest.mark.parametrize(("data_type", "entry"), FULL_FETCH_ENTRY.items())
+    def test_the_next_pull_reports_it_failed_once(
+        self,
+        db: Session,
+        data_247: Polar247Data,
+        polar: DensePolar,
+        capsys: pytest.CaptureFixture[str],
+        data_type: str,
+        entry: str,
+    ) -> None:
+        user_id = _polar_user(db)
+        _kill_a_pull(db, data_247, user_id, entry)
+        capsys.readouterr()
+
+        result = data_247.load_and_save_all(db, user_id)
+
+        outcome = result[data_type]
+        assert isinstance(outcome, DataTypeFailure)
+        assert outcome.code == INTERRUPTED
+        assert [line["data_type"] for line in _interrupted_lines(capsys)] == [data_type]
+
+        again = data_247.load_and_save_all(db, user_id)
+
+        assert not isinstance(again.get(data_type), DataTypeFailure)
+        assert _interrupted_lines(capsys) == []
+
+    def test_a_failure_that_was_caught_is_not_an_interruption(
+        self, db: Session, data_247: Polar247Data, polar: DensePolar, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        polar.failing_endpoints.add(CONTINUOUS_HR)
+        user_id = _polar_user(db)
+        data_247.load_and_save_all(db, user_id)
+        capsys.readouterr()
+
+        result = data_247.load_and_save_all(db, user_id)
+
+        assert "continuous_hr" not in result
+        assert _interrupted_lines(capsys) == []
+
+    def test_once_its_gap_has_passed_it_runs_and_reports_its_own_outcome(
+        self, db: Session, data_247: Polar247Data, polar: DensePolar, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        user_id = _polar_user(db)
+        _kill_a_pull(db, data_247, user_id, "get_continuous_hr_data")
+        capsys.readouterr()
+
+        with freeze_time(datetime.now(timezone.utc) + RETRY_FIRST_GAP + timedelta(minutes=2)):
+            result = data_247.load_and_save_all(db, user_id)
+
+        assert result["continuous_hr"] == DAYS * PER_DAY
+        assert [line["data_type"] for line in _interrupted_lines(capsys)] == ["continuous_hr"]
