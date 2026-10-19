@@ -98,11 +98,13 @@ _XML = b"<malloc/>"
 class _FakeLibc:
     """Like glibc's memstream: the buffer and its size reach the caller only when fclose flushes them.
 
-    malloc_info returns the given status, or raises when ``raises`` is set.
+    malloc_info returns the given status, or raises when ``raises`` is set; open_memstream returns
+    ``stream``, which is null when it cannot allocate.
     """
 
-    def __init__(self, status: int, raises: bool = False) -> None:
+    def __init__(self, status: int, raises: bool = False, stream: int = _STREAM) -> None:
         self.order: list[str] = []
+        self._stream = stream
         self.buffer_address: int | None = None
         self._out: tuple[ctypes.c_char_p, ctypes.c_size_t] | None = None
         refused = ctypes.ArgumentError("malloc_info refused its arguments") if raises else None
@@ -112,7 +114,7 @@ class _FakeLibc:
     def open_memstream(self, buffer_ref: object, size_ref: object) -> int:
         self.order.append("open_memstream")
         self._out = (buffer_ref._obj, size_ref._obj)  # ty: ignore[unresolved-attribute] - behind byref()
-        return _STREAM
+        return self._stream
 
     def fclose(self, stream: int) -> int:
         self.order.append("fclose")
@@ -150,6 +152,47 @@ def test_malloc_info_raising_still_releases_its_stream_and_buffer() -> None:
     _assert_released(libc)
 
 
+def test_a_stream_that_cannot_open_reads_nothing_and_releases_nothing() -> None:
+    libc = _FakeLibc(0, stream=0)
+
+    assert memory_profile.read_malloc_info(libc) is None
+    assert libc.order == ["open_memstream"]  # no malloc_info on a null FILE *, nothing to close or free
+
+
+class _LibcWithoutMallocInfo:
+    """A C library without glibc's malloc_info, as on musl."""
+
+    def open_memstream(self, *args: object) -> int:
+        raise AssertionError("a C library without malloc_info is never asked for a stream")
+
+
+def _no_c_library(name: str | None) -> object:
+    raise OSError(f"{name}: cannot open shared object file")
+
+
+@pytest.mark.parametrize(
+    "load_c_library",
+    [lambda name: _LibcWithoutMallocInfo(), _no_c_library],
+    ids=["no_malloc_info", "no_c_library"],
+)
+def test_without_glibc_the_allocator_figures_are_null(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], load_c_library: object
+) -> None:
+    # The real lookup and reader, on a C library that is not glibc: null fields, not a raise per report.
+    monkeypatch.setattr(ctypes, "CDLL", load_c_library)
+    memory_profile._glibc.cache_clear()
+    try:
+        assert memory_profile.read_malloc_info() is None
+        MemoryProfiler().task_finished(every=1)
+    finally:
+        memory_profile._glibc.cache_clear()
+
+    (report,) = _reports(capsys)
+    assert [report[key] for key in ("malloc_arenas", "malloc_heap_mib", "malloc_in_use_mib", "malloc_free_mib")] == [
+        None
+    ] * 4
+
+
 @needs_glibc
 def test_the_c_library_is_looked_up_once(monkeypatch: pytest.MonkeyPatch) -> None:
     # find_library runs ldconfig in a subprocess; once per process, not once per report.
@@ -169,13 +212,24 @@ def test_the_c_library_is_looked_up_once(monkeypatch: pytest.MonkeyPatch) -> Non
 # ── The cheap report ──
 
 
-def test_it_logs_nothing_when_off(capsys: pytest.CaptureFixture[str]) -> None:
+def _record_sampling(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replaces every memory read with a spy; the returned list names each one that ran."""
+    sampled: list[str] = []
+    monkeypatch.setattr(memory_profile, "read_malloc_info", lambda: sampled.append("read_malloc_info"))
+    monkeypatch.setattr(memory_profile, "_rss_bytes", lambda: sampled.append("_rss_bytes"))
+    monkeypatch.setattr(MemoryProfiler, "_report", lambda self, pid: sampled.append("_report") or {})
+    return sampled
+
+
+def test_it_logs_nothing_when_off(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    sampled = _record_sampling(monkeypatch)
     profiler = MemoryProfiler()
 
     for _ in range(50):
         profiler.task_finished(every=0)
 
     assert capsys.readouterr().out == ""  # nothing at all, not only no report
+    assert sampled == []  # and no memory read: off costs a comparison per task
 
 
 def test_it_logs_once_every_n_finished_tasks(capsys: pytest.CaptureFixture[str]) -> None:
@@ -225,18 +279,20 @@ def test_a_cheap_report_maps_each_figure_to_its_field(
     assert report["malloc_in_use_mib"] == 8.0  # 10 - 4 + 2 (mmap)
 
 
-def test_without_glibc_the_allocator_figures_are_null(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("status_text", [None, "VmPeak:\t 999999 kB\n"], ids=["no_proc", "no_vmrss_line"])
+def test_without_a_resident_size_the_rss_figure_is_null(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str], status_text: str | None
 ) -> None:
-    monkeypatch.setattr(memory_profile, "read_malloc_info", lambda: None)
-    profiler = MemoryProfiler()
+    status = tmp_path / "status"
+    if status_text is not None:
+        status.write_text(status_text)
+    read_rss = memory_profile._rss_bytes
+    monkeypatch.setattr(memory_profile, "_rss_bytes", lambda: read_rss(str(status)))
 
-    profiler.task_finished(every=1)
+    MemoryProfiler().task_finished(every=1)
 
     (report,) = _reports(capsys)
-    assert [report[key] for key in ("malloc_arenas", "malloc_heap_mib", "malloc_in_use_mib", "malloc_free_mib")] == [
-        None
-    ] * 4
+    assert report["rss_mib"] is None  # null, not a false zero
 
 
 @needs_glibc
@@ -314,12 +370,13 @@ def test_every_finished_task_reaches_the_worker_profiler(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(core, "_memory_profiler", MemoryProfiler())
-    monkeypatch.setattr(settings, "celery_memory_profile_every", 2)
+    monkeypatch.setattr(settings, "celery_memory_profile_every", 5)
 
-    for _ in range(4):
+    for _ in range(10):
         signals.task_postrun.send(sender=None)
 
-    assert [report["tasks"] for report in _reports(capsys)] == [2, 4]
+    # The configured cadence, as set: any other would report at other counts.
+    assert [report["tasks"] for report in _reports(capsys)] == [5, 10]
 
 
 def test_the_worker_profiler_is_silent_while_the_setting_is_off(
@@ -327,8 +384,10 @@ def test_the_worker_profiler_is_silent_while_the_setting_is_off(
 ) -> None:
     monkeypatch.setattr(core, "_memory_profiler", MemoryProfiler())
     monkeypatch.setattr(settings, "celery_memory_profile_every", 0)
+    sampled = _record_sampling(monkeypatch)
 
     for _ in range(4):
         signals.task_postrun.send(sender=None)
 
     assert capsys.readouterr().out == ""
+    assert sampled == []
