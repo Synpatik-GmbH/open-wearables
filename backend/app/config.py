@@ -135,9 +135,12 @@ class Settings(BaseSettings):
     workout_zone_target_completeness: float = 0.95  # emit once the trace is this complete
     workout_zone_hard_cap_seconds: int = 5  # emit whatever we have past this elapsed
 
-    # FORK diagnostic: every Celery worker process logs a memory report per this many finished
-    # tasks (app/integrations/celery/memory_profile.py). 0 = off; tracemalloc slows allocation.
+    # FORK diagnostic (app/integrations/celery/memory_profile.py): every Celery worker process logs a
+    # cheap memory report per this many finished tasks. 0 = off.
     celery_memory_profile_every: int = 0
+    # FORK diagnostic, heavy: > 0 also traces allocations with this many frames and adds the sites
+    # that grew to each report. Seconds of stall per report on a large process; dev, briefly. 0 = off.
+    celery_memory_profile_trace_frames: int = 0
 
     # Default 24/7 data granularity (raw | hourly | daily) for providers that support it,
     # used when a provider has no explicit ProviderSetting.data_granularity.
