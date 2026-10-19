@@ -42,6 +42,7 @@ else
     trap 'echo "$name term" >> "$FAKE_LOG"; exit 143' TERM
 fi
 echo "$name start" >> "$FAKE_LOG"
+echo "$name argv $*" >> "$FAKE_LOG"
 echo "$name pid $$" >> "$FAKE_LOG"
 case "$mode" in
     exit:*)
@@ -56,6 +57,12 @@ case "$mode" in
         echo "$name exit" >> "$FAKE_LOG"; exit "${mode#exit:}" ;;
     *) for _ in $(seq 1200); do command -p sleep 0.05; done ;;
 esac
+"""
+
+# The script's grace timer runs `sleep`; this one records the duration it was asked for, then sleeps.
+_RECORDING_SLEEP = """#!/bin/bash
+echo "timer sleep $*" >> "$FAKE_LOG"
+exec "$(command -pv sleep)" "$@"
 """
 
 
@@ -103,11 +110,10 @@ def _start(
     fake_uv = bin_dir / "uv"
     fake_uv.write_text(_FAKE_UV)
     fake_uv.chmod(0o755)
-    if broken_sleep:
-        # The script's own `sleep` fails; the fakes call the real one through `command -p`.
-        failing = bin_dir / "sleep"
-        failing.write_text("#!/bin/bash\nexit 1\n")
-        failing.chmod(0o755)
+    # The script's own `sleep` is recorded, or fails; the fakes call the real one via `command -p`.
+    timer = bin_dir / "sleep"
+    timer.write_text("#!/bin/bash\nexit 1\n" if broken_sleep else _RECORDING_SLEEP)
+    timer.chmod(0o755)
     log = tmp_path / "workers.log"
     log.touch()
     env = {
@@ -143,6 +149,20 @@ def _pid_of(log: Path, name: str) -> int:
                 return int(line.split()[2])
         time.sleep(0.05)
     raise AssertionError(f"{name} never logged its pid")
+
+
+def _argv(log: Path, name: str) -> list[str]:
+    _wait_for(log, f"{name} start")
+    (line,) = [line for line in log.read_text().splitlines() if line.startswith(f"{name} argv ")]
+    return line.split()[2:]
+
+
+def _option(argv: list[str], option: str) -> str:
+    return argv[argv.index(option) + 1]
+
+
+def _timer_durations(log: Path) -> list[str]:
+    return [line.split()[2] for line in log.read_text().splitlines() if line.startswith("timer sleep ")]
 
 
 def _stop(proc: subprocess.Popen[bytes]) -> None:
@@ -188,23 +208,30 @@ def test_the_container_stops_even_when_a_worker_exits_cleanly(tmp_path: Path) ->
 def test_a_survivor_that_ignores_term_is_killed_after_the_grace(tmp_path: Path, dies: str, survives: str) -> None:
     # Celery's TERM waits for running tasks, and an xml_sync task has no time limit.
     modes = {dies: "exit:3", survives: "ignore-term"}
+    started = time.monotonic()
     proc, log = _start(tmp_path, io=modes["io"], cpu=modes["cpu"], grace="1")
     survivor = _pid_of(log, survives)
 
     assert _exit_status(proc, timeout=5) != 0
     _wait_for(log, f"{survives} term")
     assert not _alive(survivor)
+    # The survivor got the whole configured grace before the kill.
+    assert _timer_durations(log) == ["1"]
+    assert time.monotonic() - started >= 1
 
 
 def test_sigterm_is_bounded_by_the_grace_too(tmp_path: Path) -> None:
     proc, log = _start(tmp_path, io="ignore-term", cpu="ignore-term", grace="1")
     io, cpu = _pid_of(log, "io"), _pid_of(log, "cpu")
 
+    signalled = time.monotonic()
     proc.send_signal(signal.SIGTERM)
 
     assert _exit_status(proc, timeout=5) == 143
     assert not _alive(io)
     assert not _alive(cpu)
+    assert _timer_durations(log) == ["1"]
+    assert time.monotonic() - signalled >= 1
 
 
 @pytest.mark.parametrize("grace", ["abc", "-5", "1.5", "30s"])
@@ -214,9 +241,11 @@ def test_a_grace_that_is_not_whole_seconds_falls_back_to_the_default(tmp_path: P
     survivor = _pid_of(log, "cpu")
     try:
         _wait_for(log, "cpu term")
-        time.sleep(2)
+        _wait_for(log, "timer sleep 30")  # the default, not the value given
+        time.sleep(1)
         assert proc.poll() is None  # not killed at once: the default grace runs
         assert _alive(survivor)
+        assert _timer_durations(log) == ["30"]
         stderr = (tmp_path / "stderr.log").read_text()
         assert f"WORKER_STOP_GRACE_SECONDS='{grace}' is not a whole number of seconds; using 30" in stderr
     finally:
@@ -239,9 +268,11 @@ def test_a_worker_gets_the_default_grace_before_it_is_killed(tmp_path: Path) -> 
     survivor = _pid_of(log, "cpu")
     try:
         _wait_for(log, "cpu term")
-        time.sleep(2)
+        _wait_for(log, "timer sleep 30")
+        time.sleep(1)
         assert proc.poll() is None
         assert _alive(survivor)
+        assert _timer_durations(log) == ["30"]
     finally:
         # End the grace the way a worker finishing its task would, so the script and its timer
         # exit normally; a TERM here would start a second 30-second grace.
@@ -276,4 +307,22 @@ def test_a_dedicated_worker_runs_only_its_own_queues(tmp_path: Path) -> None:
     proc, log = _start(tmp_path, io="exit:0", cpu="run", queues="webhook_sync")
 
     assert _exit_status(proc) == 0
-    assert [line for line in log.read_text().splitlines() if " pid " not in line] == ["io start", "io exit"]
+    events = [line for line in log.read_text().splitlines() if line.split()[1] in ("start", "exit")]
+    assert events == ["io start", "io exit"]
+    argv = _argv(log, "io")
+    assert _option(argv, "-Q") == "webhook_sync"
+    assert "--pool=threads" in argv
+
+
+def test_each_worker_consumes_its_own_queues(tmp_path: Path) -> None:
+    proc, log = _start(tmp_path, io="run", cpu="run")
+    try:
+        io, cpu = _argv(log, "io"), _argv(log, "cpu")
+    finally:
+        _stop(proc)
+
+    assert _option(io, "-Q") == "default,sdk_sync,garmin_sync,webhook_sync"
+    assert "--pool=threads" in io
+    assert _option(cpu, "-Q") == "xml_sync"
+    assert "--pool=prefork" in cpu
+    assert "--concurrency=2" in cpu
