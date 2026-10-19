@@ -85,61 +85,63 @@ def test_malloc_info_is_read_from_glibc() -> None:
 
 
 class _FakeFunction:
-    def __init__(self, result: int | None) -> None:
+    def __init__(
+        self, result: int | None, calls_log: list[str], name: str, raises: Exception | None = None
+    ) -> None:
         self.result = result
-        self.calls = 0
+        self.calls_log = calls_log
+        self.name = name
+        self.raises = raises
 
     def __call__(self, *args: object) -> int | None:
-        self.calls += 1
         self.args = args
+        self.calls_log.append(self.name)
+        if self.raises is not None:
+            raise self.raises
         return self.result
 
 
 _STREAM = 0x5EED
-
-
-class _FakeOpenMemstream(_FakeFunction):
-    """Like open_memstream: hands the caller a buffer through its ``char **`` and returns a stream."""
-
-    def __init__(self) -> None:
-        super().__init__(_STREAM)
-        self.buffer_address: int | None = None
-
-    def __call__(self, *args: object) -> int | None:
-        buffer, size = args[0]._obj, args[1]._obj  # ty: ignore[unresolved-attribute] - behind byref()
-        buffer.value = _XML
-        size.value = len(_XML)
-        self.buffer_address = ctypes.cast(buffer, ctypes.c_void_p).value
-        return super().__call__(*args)
-
-
 _XML = b"<malloc/>"
 
 
 class _FakeLibc:
-    """open_memstream succeeds; malloc_info returns the given status."""
+    """Like glibc's memstream: the buffer and its size reach the caller only when fclose flushes them.
 
-    def __init__(self, status: int) -> None:
-        self.open_memstream = _FakeOpenMemstream()
-        self.malloc_info = _FakeFunction(status)
-        self.fclose = _FakeFunction(0)
-        self.free = _FakeFunction(None)
+    malloc_info returns the given status, or raises when ``raises`` is set.
+    """
+
+    def __init__(self, status: int, raises: bool = False) -> None:
+        self.order: list[str] = []
+        self.buffer_address: int | None = None
+        self._out: tuple[ctypes.c_char_p, ctypes.c_size_t] | None = None
+        refused = ctypes.ArgumentError("malloc_info refused its arguments") if raises else None
+        self.malloc_info = _FakeFunction(status, self.order, "malloc_info", raises=refused)
+        self.free = _FakeFunction(None, self.order, "free")
+
+    def open_memstream(self, buffer_ref: object, size_ref: object) -> int:
+        self.order.append("open_memstream")
+        self._out = (buffer_ref._obj, size_ref._obj)  # ty: ignore[unresolved-attribute] - behind byref()
+        return _STREAM
+
+    def fclose(self, stream: int) -> int:
+        self.order.append("fclose")
+        assert stream == _STREAM
+        assert self._out is not None
+        buffer, size = self._out
+        buffer.value = _XML  # published on close, as glibc does
+        size.value = len(_XML)
+        self.buffer_address = ctypes.cast(buffer, ctypes.c_void_p).value
+        return 0
 
 
-class _RaisingFunction(_FakeFunction):
-    def __call__(self, *args: object) -> int | None:
-        super().__call__(*args)
-        raise ctypes.ArgumentError("malloc_info refused its arguments")
-
-
-def test_malloc_info_raising_still_releases_its_stream_and_buffer() -> None:
-    libc = _FakeLibc(0)
-    libc.malloc_info = _RaisingFunction(None)
-
-    with pytest.raises(ctypes.ArgumentError):
-        memory_profile.read_malloc_info(libc)
-    assert libc.fclose.calls == 1
-    assert libc.free.calls == 1
+def _assert_released(libc: _FakeLibc) -> None:
+    # fclose before free: free before the flush would release the initial null and leak the buffer.
+    assert libc.order == ["open_memstream", "malloc_info", "fclose", "free"]
+    (freed,) = libc.free.args
+    assert isinstance(freed, ctypes.c_void_p)
+    assert freed.value is not None
+    assert freed.value == libc.buffer_address  # the buffer, not the stream
 
 
 @pytest.mark.parametrize(("status", "expected"), [(0, _XML.decode()), (1, None)])
@@ -147,12 +149,15 @@ def test_malloc_info_releases_its_stream_and_buffer_either_way(status: int, expe
     libc = _FakeLibc(status)
 
     assert memory_profile.read_malloc_info(libc) == expected
-    assert libc.fclose.calls == 1
-    assert libc.fclose.args == (_STREAM,)
-    assert libc.free.calls == 1  # no leak per failed report
-    (freed,) = libc.free.args
-    assert isinstance(freed, ctypes.c_void_p)
-    assert freed.value == libc.open_memstream.buffer_address  # the buffer, not the stream
+    _assert_released(libc)
+
+
+def test_malloc_info_raising_still_releases_its_stream_and_buffer() -> None:
+    libc = _FakeLibc(0, raises=True)
+
+    with pytest.raises(ctypes.ArgumentError):
+        memory_profile.read_malloc_info(libc)
+    _assert_released(libc)
 
 
 @needs_glibc
@@ -179,6 +184,7 @@ def test_it_logs_nothing_when_off(capsys: pytest.CaptureFixture[str]) -> None:
 
     for _ in range(50):
         profiler.task_finished(every=0)
+        profiler.task_finished(every=0, trace_frames=4)  # the heavy setting alone does not turn it on
 
     assert capsys.readouterr().out == ""  # nothing at all, not only no report
     assert not tracemalloc.is_tracing()
@@ -499,3 +505,4 @@ def test_the_worker_profiler_is_silent_while_the_setting_is_off(
         signals.task_postrun.send(sender=None)
 
     assert capsys.readouterr().out == ""
+    assert not tracemalloc.is_tracing()  # an otherwise disabled worker pays nothing for the trace setting
