@@ -32,17 +32,28 @@ _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "start" / "worker.sh
 
 _FAKE_UV = """#!/bin/bash
 name=cpu
-case "$*" in *"-n io@"*) name=io ;; esac
+peer=io
+case "$*" in *"-n io@"*) name=io peer=cpu ;; esac
 if [ "$name" = io ]; then mode="$FAKE_IO"; else mode="$FAKE_CPU"; fi
-echo "$name start" >> "$FAKE_LOG"
-echo "$name pid $$" >> "$FAKE_LOG"
+# The trap goes in before anything is logged: a logged pid means TERM is handled.
 if [ "$mode" = ignore-term ]; then
     trap 'echo "$name term" >> "$FAKE_LOG"' TERM
 else
     trap 'echo "$name term" >> "$FAKE_LOG"; exit 143' TERM
 fi
+echo "$name start" >> "$FAKE_LOG"
+echo "$name pid $$" >> "$FAKE_LOG"
 case "$mode" in
-    exit:*) echo "$name exit" >> "$FAKE_LOG"; exit "${mode#exit:}" ;;
+    exit:*)
+        # Exit only once the peer is up, so every test sees both workers start (a dedicated
+        # worker has no peer).
+        if [ -z "${CELERY_QUEUES:-}" ]; then
+            for _ in $(seq 100); do
+                grep -q "^$peer pid " "$FAKE_LOG" && break
+                command -p sleep 0.05
+            done
+        fi
+        echo "$name exit" >> "$FAKE_LOG"; exit "${mode#exit:}" ;;
     *) for _ in $(seq 1200); do command -p sleep 0.05; done ;;
 esac
 """
