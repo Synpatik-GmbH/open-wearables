@@ -367,18 +367,36 @@ def test_it_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     assert Settings().celery_memory_profile_every == 0
 
 
-@pytest.mark.parametrize(("every", "expected"), [(3, [3, 6, 9]), (5, [5, 10])])
 def test_every_finished_task_reaches_the_worker_profiler(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], every: int, expected: list[int]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(core, "_memory_profiler", MemoryProfiler())
-    monkeypatch.setattr(settings, "celery_memory_profile_every", every)
+    monkeypatch.setattr(settings, "celery_memory_profile_every", 3)
 
     for _ in range(10):
         signals.task_postrun.send(sender=None)
 
-    # The configured cadence, as set: a constant in its place matches at most one case.
-    assert [report["tasks"] for report in _reports(capsys)] == expected
+    assert [report["tasks"] for report in _reports(capsys)] == [3, 6, 9]
+
+
+class _CadenceSpy:
+    def __init__(self) -> None:
+        self.every: list[int] = []
+
+    def task_finished(self, every: int) -> None:
+        self.every.append(every)
+
+
+@pytest.mark.parametrize("every", [3, 50, 7919])
+def test_the_configured_cadence_reaches_the_profiler_unchanged(monkeypatch: pytest.MonkeyPatch, every: int) -> None:
+    # Small, production-sized and large: a constant, a cap or a floor in its place fails one of them.
+    spy = _CadenceSpy()
+    monkeypatch.setattr(core, "_memory_profiler", spy)
+    monkeypatch.setattr(settings, "celery_memory_profile_every", every)
+
+    signals.task_postrun.send(sender=None)
+
+    assert spy.every == [every]
 
 
 def test_the_worker_profiler_is_silent_while_the_setting_is_off(
