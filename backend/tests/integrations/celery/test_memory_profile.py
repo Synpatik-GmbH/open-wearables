@@ -233,13 +233,17 @@ def test_it_logs_nothing_when_off(monkeypatch: pytest.MonkeyPatch, capsys: pytes
     assert sampled == []  # and no memory read: off costs a comparison per task
 
 
-def test_it_logs_once_every_n_finished_tasks(capsys: pytest.CaptureFixture[str]) -> None:
+@pytest.mark.parametrize(("every", "finished", "expected"), [(3, 7, [3, 6]), (50, 120, [50, 100])])
+def test_it_logs_once_every_n_finished_tasks(
+    capsys: pytest.CaptureFixture[str], every: int, finished: int, expected: list[int]
+) -> None:
+    # 50 is the production setting: a cadence capped below it reports more often and fails here.
     profiler = MemoryProfiler()
 
-    for _ in range(7):
-        profiler.task_finished(every=3)
+    for _ in range(finished):
+        profiler.task_finished(every=every)
 
-    assert [report["tasks"] for report in _reports(capsys)] == [3, 6]
+    assert [report["tasks"] for report in _reports(capsys)] == expected
 
 
 @needs_glibc
