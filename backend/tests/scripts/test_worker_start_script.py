@@ -43,7 +43,7 @@ else
 fi
 case "$mode" in
     exit:*) echo "$name exit" >> "$FAKE_LOG"; exit "${mode#exit:}" ;;
-    *) for _ in $(seq 1200); do sleep 0.05; done ;;
+    *) for _ in $(seq 1200); do command -p sleep 0.05; done ;;
 esac
 """
 
@@ -79,13 +79,24 @@ def _kill_leftover_fakes(tmp_path: Path) -> Iterator[None]:
 
 
 def _start(
-    tmp_path: Path, *, io: str, cpu: str, queues: str | None = None, grace: str | None = "1"
+    tmp_path: Path,
+    *,
+    io: str,
+    cpu: str,
+    queues: str | None = None,
+    grace: str | None = "1",
+    broken_sleep: bool = False,
 ) -> tuple[subprocess.Popen[bytes], Path]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     fake_uv = bin_dir / "uv"
     fake_uv.write_text(_FAKE_UV)
     fake_uv.chmod(0o755)
+    if broken_sleep:
+        # The script's own `sleep` fails; the fakes call the real one through `command -p`.
+        failing = bin_dir / "sleep"
+        failing.write_text("#!/bin/bash\nexit 1\n")
+        failing.chmod(0o755)
     log = tmp_path / "workers.log"
     log.touch()
     env = {
@@ -98,7 +109,8 @@ def _start(
         env["CELERY_QUEUES"] = queues
     if grace is not None:
         env["WORKER_STOP_GRACE_SECONDS"] = grace
-    proc = subprocess.Popen(["/bin/bash", str(_SCRIPT)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with (tmp_path / "stderr.log").open("wb") as stderr:
+        proc = subprocess.Popen(["/bin/bash", str(_SCRIPT)], env=env, stdout=subprocess.DEVNULL, stderr=stderr)
     return proc, log
 
 
@@ -182,6 +194,32 @@ def test_sigterm_is_bounded_by_the_grace_too(tmp_path: Path) -> None:
     assert _exit_status(proc, timeout=5) == 143
     assert not _alive(io)
     assert not _alive(cpu)
+
+
+@pytest.mark.parametrize("grace", ["abc", "-5", "1.5", "30s"])
+def test_a_grace_that_is_not_whole_seconds_falls_back_to_the_default(tmp_path: Path, grace: str) -> None:
+    # `sleep` would reject these, and a failed sleep must not cancel the kill.
+    proc, log = _start(tmp_path, io="exit:3", cpu="ignore-term", grace=grace)
+    survivor = _pid_of(log, "cpu")
+    try:
+        _wait_for(log, "cpu term")
+        time.sleep(2)
+        assert proc.poll() is None  # not killed at once: the default grace runs
+        assert _alive(survivor)
+        stderr = (tmp_path / "stderr.log").read_text()
+        assert f"WORKER_STOP_GRACE_SECONDS='{grace}' is not a whole number of seconds; using 30" in stderr
+    finally:
+        os.kill(survivor, signal.SIGKILL)
+        _exit_status(proc)
+
+
+def test_a_grace_timer_that_cannot_sleep_kills_at_once(tmp_path: Path) -> None:
+    # Fail toward stopping: a broken timer must not leave the survivor waited on for ever.
+    proc, log = _start(tmp_path, io="exit:3", cpu="ignore-term", grace="30", broken_sleep=True)
+    survivor = _pid_of(log, "cpu")
+
+    assert _exit_status(proc, timeout=5) != 0
+    assert not _alive(survivor)
 
 
 def test_a_worker_gets_the_default_grace_before_it_is_killed(tmp_path: Path) -> None:

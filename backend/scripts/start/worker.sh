@@ -16,14 +16,23 @@ fi
 #
 # Stopping is bounded: TERM is Celery's warm shutdown, which waits for running tasks (an
 # xml_sync task has no time limit), so a worker still running WORKER_STOP_GRACE_SECONDS
-# after TERM is killed.
+# after TERM is killed. The grace is whole seconds; anything else falls back to 30, because a
+# value `sleep` rejects would otherwise cancel the kill.
+stop_grace="${WORKER_STOP_GRACE_SECONDS:-30}"
+case "$stop_grace" in
+    *[!0-9]*)
+        echo "WORKER_STOP_GRACE_SECONDS='${stop_grace}' is not a whole number of seconds; using 30" >&2
+        stop_grace=30
+        ;;
+esac
 stop_workers() {
     kill -TERM "$IO_PID" "$CPU_PID" 2>/dev/null || true
     (
         trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM
-        sleep "${WORKER_STOP_GRACE_SECONDS:-30}" &
+        sleep "$stop_grace" &
         sleeper=$!
-        wait "$sleeper"
+        # A failed sleep still kills: fail toward stopping, never toward waiting for ever.
+        wait "$sleeper" || true
         kill -KILL "$IO_PID" "$CPU_PID" 2>/dev/null || true
     ) &
     local timer=$!
