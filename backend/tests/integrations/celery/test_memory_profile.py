@@ -8,6 +8,7 @@ grows). The
 heavy mode then names the Python lines holding it, or names none, which points at a C library.
 """
 
+import ctypes
 import json
 import platform
 import sys
@@ -87,14 +88,32 @@ class _FakeFunction:
 
     def __call__(self, *args: object) -> int | None:
         self.calls += 1
+        self.args = args
         return self.result
+
+
+_STREAM = 0x5EED
+
+
+class _FakeOpenMemstream(_FakeFunction):
+    """Like open_memstream: hands the caller a buffer through its ``char **`` and returns a stream."""
+
+    def __init__(self) -> None:
+        super().__init__(_STREAM)
+        self.buffer_address: int | None = None
+
+    def __call__(self, *args: object) -> int | None:
+        buffer = args[0]._obj  # ty: ignore[unresolved-attribute] - the c_char_p behind byref()
+        buffer.value = b"<malloc/>"
+        self.buffer_address = ctypes.cast(buffer, ctypes.c_void_p).value
+        return super().__call__(*args)
 
 
 class _FailingLibc:
     """open_memstream succeeds, malloc_info fails."""
 
     def __init__(self) -> None:
-        self.open_memstream = _FakeFunction(1)
+        self.open_memstream = _FakeOpenMemstream()
         self.malloc_info = _FakeFunction(1)
         self.fclose = _FakeFunction(0)
         self.free = _FakeFunction(None)
@@ -104,7 +123,12 @@ def test_a_failing_malloc_info_still_releases_its_stream_and_buffer() -> None:
     libc = _FailingLibc()
 
     assert memory_profile.read_malloc_info(libc) is None
-    assert (libc.fclose.calls, libc.free.calls) == (1, 1)  # no leak per failed report
+    assert libc.fclose.calls == 1
+    assert libc.fclose.args == (_STREAM,)
+    assert libc.free.calls == 1  # no leak per failed report
+    (freed,) = libc.free.args
+    assert isinstance(freed, ctypes.c_void_p)
+    assert freed.value == libc.open_memstream.buffer_address  # the buffer, not the stream
 
 
 # ── The cheap report ──
@@ -116,7 +140,7 @@ def test_it_logs_nothing_when_off(capsys: pytest.CaptureFixture[str]) -> None:
     for _ in range(50):
         profiler.task_finished(every=0)
 
-    assert _reports(capsys) == []
+    assert capsys.readouterr().out == ""  # nothing at all, not only no report
     assert not tracemalloc.is_tracing()
 
 
@@ -431,4 +455,4 @@ def test_the_worker_profiler_is_silent_while_the_setting_is_off(
     for _ in range(4):
         signals.task_postrun.send(sender=None)
 
-    assert _reports(capsys) == []
+    assert capsys.readouterr().out == ""
