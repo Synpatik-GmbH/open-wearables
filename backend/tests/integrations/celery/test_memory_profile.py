@@ -17,8 +17,10 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from celery import signals
 
-from app.integrations.celery import memory_profile
+from app.config import Settings, settings
+from app.integrations.celery import core, memory_profile
 from app.integrations.celery.memory_profile import MemoryProfiler, parse_malloc_info
 
 # Allocations held across reports, so the profiler has growth to find.
@@ -373,35 +375,26 @@ def test_the_heavy_mode_does_not_report_its_own_bookkeeping(capsys: pytest.Captu
 
 
 def test_the_settings_are_read_from_their_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.config import Settings
-
     monkeypatch.setenv("CELERY_MEMORY_PROFILE_EVERY", "50")
     monkeypatch.setenv("CELERY_MEMORY_PROFILE_TRACE_FRAMES", "10")
 
-    settings = Settings()
-    assert settings.celery_memory_profile_every == 50
-    assert settings.celery_memory_profile_trace_frames == 10
+    fresh = Settings()
+    assert fresh.celery_memory_profile_every == 50
+    assert fresh.celery_memory_profile_trace_frames == 10
 
 
 def test_both_are_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    from app.config import Settings
-
     monkeypatch.delenv("CELERY_MEMORY_PROFILE_EVERY", raising=False)
     monkeypatch.delenv("CELERY_MEMORY_PROFILE_TRACE_FRAMES", raising=False)
 
-    settings = Settings()
-    assert settings.celery_memory_profile_every == 0
-    assert settings.celery_memory_profile_trace_frames == 0
+    fresh = Settings()
+    assert fresh.celery_memory_profile_every == 0
+    assert fresh.celery_memory_profile_trace_frames == 0
 
 
 def test_every_finished_task_reaches_the_worker_profiler(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from celery import signals
-
-    from app.config import settings
-    from app.integrations.celery import core
-
     monkeypatch.setattr(core, "_memory_profiler", MemoryProfiler())
     monkeypatch.setattr(settings, "celery_memory_profile_every", 2)
     monkeypatch.setattr(settings, "celery_memory_profile_trace_frames", 0)
@@ -417,11 +410,6 @@ def test_every_finished_task_reaches_the_worker_profiler(
 def test_the_trace_setting_reaches_the_worker_profiler(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from celery import signals
-
-    from app.config import settings
-    from app.integrations.celery import core
-
     monkeypatch.setattr(core, "_memory_profiler", MemoryProfiler())
     monkeypatch.setattr(settings, "celery_memory_profile_every", 1)
     monkeypatch.setattr(settings, "celery_memory_profile_trace_frames", 4)
@@ -436,11 +424,6 @@ def test_the_trace_setting_reaches_the_worker_profiler(
 def test_the_worker_profiler_is_silent_while_the_setting_is_off(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from celery import signals
-
-    from app.config import settings
-    from app.integrations.celery import core
-
     monkeypatch.setattr(core, "_memory_profiler", MemoryProfiler())
     monkeypatch.setattr(settings, "celery_memory_profile_every", 0)
     monkeypatch.setattr(settings, "celery_memory_profile_trace_frames", 4)
