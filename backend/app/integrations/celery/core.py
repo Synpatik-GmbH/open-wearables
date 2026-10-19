@@ -84,10 +84,7 @@ _memory_profiler = MemoryProfiler()
 @signals.task_postrun.connect
 def profile_worker_memory(**kwargs) -> None:
     """FORK diagnostic: report this process's memory every N finished tasks (off unless set)."""
-    _memory_profiler.task_finished(
-        every=settings.celery_memory_profile_every,
-        trace_frames=settings.celery_memory_profile_trace_frames,
-    )
+    _memory_profiler.task_finished(every=settings.celery_memory_profile_every)
 
 
 def create_celery() -> Celery:

@@ -4,19 +4,14 @@ Prod's I/O worker grew from ~650 to ~880 MiB between 2026-09-26 and 2026-10-16 a
 grew from ~535 to ~800 MiB after the 0.9.0 move on 2026-10-05 (Azure Monitor ``WorkingSetBytes``,
 read 2026-10-19). The cheap report says which cause it is: the allocator keeping freed memory
 (``malloc_free_mib`` grows), or something holding memory (``malloc_in_use_mib`` or ``python_blocks``
-grows). The heavy mode then names the Python lines holding it, or names none, which points at a C
-library.
+grows).
 """
 
 import ctypes
 import ctypes.util
-import fnmatch
 import json
 import platform
-import re
-import sys
 import threading
-import tracemalloc
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -35,12 +30,9 @@ needs_glibc = pytest.mark.skipif(platform.libc_ver()[0] != "glibc", reason="no g
 
 
 @pytest.fixture(autouse=True)
-def _isolate() -> Iterator[None]:
-    was_tracing = tracemalloc.is_tracing()
+def _release_held() -> Iterator[None]:
     yield
     _held.clear()
-    if not was_tracing:
-        tracemalloc.stop()
 
 
 def _reports(capsys: pytest.CaptureFixture[str]) -> list[dict]:
@@ -182,10 +174,8 @@ def test_it_logs_nothing_when_off(capsys: pytest.CaptureFixture[str]) -> None:
 
     for _ in range(50):
         profiler.task_finished(every=0)
-        profiler.task_finished(every=0, trace_frames=4)  # the heavy setting alone does not turn it on
 
     assert capsys.readouterr().out == ""  # nothing at all, not only no report
-    assert not tracemalloc.is_tracing()
 
 
 def test_it_logs_once_every_n_finished_tasks(capsys: pytest.CaptureFixture[str]) -> None:
@@ -210,8 +200,6 @@ def test_a_cheap_report_carries_process_and_allocator_memory(capsys: pytest.Capt
     assert report["malloc_heap_mib"] > 0
     assert report["malloc_in_use_mib"] > 0
     assert report["malloc_free_mib"] >= 0
-    assert "top" not in report
-    assert not tracemalloc.is_tracing()  # the cheap report never turns tracing on
 
 
 def test_a_cheap_report_maps_each_figure_to_its_field(
@@ -307,160 +295,19 @@ def test_a_forked_child_starts_its_own_count(
     assert [(report["pid"], report["tasks"]) for report in _reports(capsys)] == [(-1, 2)]
 
 
-def test_a_forked_child_takes_its_own_baseline(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # A child comparing against the parent's snapshot would report the parent's later memory as growth.
-    profiler = MemoryProfiler()
-    profiler.task_finished(every=1, trace_frames=2)  # the parent's baseline
-    _held.extend(bytes(1024) for _ in range(4096))  # ~4 MiB more, before the fork
-    capsys.readouterr()
-
-    monkeypatch.setattr(memory_profile.os, "getpid", lambda: -1)
-    profiler.task_finished(every=1, trace_frames=2)  # the child's first report: its own baseline
-
-    (report,) = _reports(capsys)
-    assert [site for site in report["top"] if site["growth_kib"] >= 1024] == []
-
-
-# ── The heavy mode: tracemalloc, on only when asked ──
-
-
-def test_the_heavy_mode_names_where_memory_grew(capsys: pytest.CaptureFixture[str]) -> None:
-    profiler = MemoryProfiler(top=5)
-    profiler.task_finished(every=1, trace_frames=5)  # the baseline
-    capsys.readouterr()
-
-    line = sys._getframe().f_lineno + 1
-    _held.extend(bytes(1024) for _ in range(4096))  # ~4 MiB, held
-    profiler.task_finished(every=1, trace_frames=5)
-
-    (report,) = _reports(capsys)
-    assert len(report["top"]) == 5
-    grown = report["top"][0]  # the largest growth is listed first
-    assert grown["frames"][0] == f"{__file__}:{line}"  # innermost frame: the allocating line
-    assert grown["growth_kib"] >= 4096
-    assert grown["size_kib"] >= grown["growth_kib"]
-    assert grown["size_kib"] < 8192  # KiB, not bytes
-    assert grown["count"] >= 4096
-
-
-def test_the_heavy_mode_lists_growth_not_memory_released_since(capsys: pytest.CaptureFixture[str]) -> None:
-    tracemalloc.start(5)  # as on a worker already tracing: what is alive now is in the baseline
-    released = [bytes(1024) for _ in range(20_480)]  # ~20 MiB
-    profiler = MemoryProfiler(top=1)
-    profiler.task_finished(every=1, trace_frames=5)
-    capsys.readouterr()
-
-    released.clear()  # a large release, which compare_to would rank first
-    _held.extend(bytes(1024) for _ in range(1024))  # a small leak, ~1 MiB
-    profiler.task_finished(every=1, trace_frames=5)
-
-    (report,) = _reports(capsys)
-    (grown,) = report["top"]
-    assert grown["growth_kib"] >= 1024
-
-
-def test_the_heavy_mode_keeps_the_frames_it_was_asked_for(capsys: pytest.CaptureFixture[str]) -> None:
-    profiler = MemoryProfiler(top=1)
-    profiler.task_finished(every=1, trace_frames=3)
-    capsys.readouterr()
-
-    def inner() -> None:
-        _held.extend(bytes(1024) for _ in range(4096))
-
-    def outer() -> None:
-        inner()
-
-    outer()
-    profiler.task_finished(every=1, trace_frames=3)
-
-    (report,) = _reports(capsys)
-    frames = report["top"][0]["frames"]
-    assert len(frames) == 3  # the caller chain, not only the line that allocated
-    assert sum("test_memory_profile.py" in frame for frame in frames) >= 2
-
-
-def test_the_heavy_mode_separates_size_growth_and_count(capsys: pytest.CaptureFixture[str]) -> None:
-    # One site that already held memory at the baseline and then grew: size and growth differ.
-    tracemalloc.start(5)
-
-    def grow(kib: int) -> None:
-        _held.extend(bytes(4096) for _ in range(kib // 4))  # 4 KiB blocks: count is not size in KiB
-
-    profiler = MemoryProfiler(top=1)
-    for kib in (2048, 4096):  # the first report is the baseline, holding 2 MiB from this site
-        capsys.readouterr()
-        grow(kib)  # one call site, so one traceback
-        profiler.task_finished(every=1, trace_frames=5)
-
-    (report,) = _reports(capsys)
-    (site,) = report["top"]
-    assert 4096 <= site["growth_kib"] < 5000  # what was added since the baseline
-    assert site["size_kib"] >= site["growth_kib"] + 1900  # all it holds now, the baseline's 2 MiB too
-    assert 1500 <= site["count"] < 1700  # every block it holds (512 + 1024), not only the new ones
-
-
-def test_the_heavy_mode_restarts_tracing_at_the_depth_asked_for(capsys: pytest.CaptureFixture[str]) -> None:
-    # Tracing already on at another depth (PYTHONTRACEMALLOC=1, say) is restarted, not reused.
-    tracemalloc.start(1)
-    profiler = MemoryProfiler(top=1)
-    profiler.task_finished(every=1, trace_frames=3)
-    capsys.readouterr()
-
-    def inner() -> None:
-        _held.extend(bytes(1024) for _ in range(4096))
-
-    inner()
-    profiler.task_finished(every=1, trace_frames=3)
-
-    (report,) = _reports(capsys)
-    assert len(report["top"][0]["frames"]) == 3
-
-
-def test_the_heavy_mode_works_at_a_depth_of_one(capsys: pytest.CaptureFixture[str]) -> None:
-    profiler = MemoryProfiler(top=1)
-    profiler.task_finished(every=1, trace_frames=1)
-
-    (report,) = _reports(capsys)
-    assert "top" in report
-    assert tracemalloc.get_traceback_limit() == 1
-
-
-def test_the_heavy_mode_does_not_report_its_own_bookkeeping(capsys: pytest.CaptureFixture[str]) -> None:
-    # Cold caches, as in a fresh worker: otherwise earlier tests have already compiled the patterns.
-    re.purge()
-    vars(fnmatch)["_compile_pattern"].cache_clear()  # fnmatch's private lru_cache of patterns
-    profiler = MemoryProfiler(top=50)
-    profiler.task_finished(every=1, trace_frames=5)
-    capsys.readouterr()
-
-    profiler.task_finished(every=1, trace_frames=5)  # nothing allocated in between
-
-    (report,) = _reports(capsys)
-    own = ("memory_profile.py", "tracemalloc.py", "fnmatch.py", "_compiler.py", "_parser.py")
-    assert [stat for stat in report["top"] if any(name in stat["frames"][0] for name in own)] == []
-
-
 # ── Wiring: the worker's own profiler, fed by Celery's task_postrun signal ──
 
 
-def test_the_settings_are_read_from_their_env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_setting_is_read_from_its_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CELERY_MEMORY_PROFILE_EVERY", "50")
-    monkeypatch.setenv("CELERY_MEMORY_PROFILE_TRACE_FRAMES", "10")
 
-    fresh = Settings()
-    assert fresh.celery_memory_profile_every == 50
-    assert fresh.celery_memory_profile_trace_frames == 10
+    assert Settings().celery_memory_profile_every == 50
 
 
-def test_both_are_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_it_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CELERY_MEMORY_PROFILE_EVERY", raising=False)
-    monkeypatch.delenv("CELERY_MEMORY_PROFILE_TRACE_FRAMES", raising=False)
 
-    fresh = Settings()
-    assert fresh.celery_memory_profile_every == 0
-    assert fresh.celery_memory_profile_trace_frames == 0
+    assert Settings().celery_memory_profile_every == 0
 
 
 def test_every_finished_task_reaches_the_worker_profiler(
@@ -468,28 +315,11 @@ def test_every_finished_task_reaches_the_worker_profiler(
 ) -> None:
     monkeypatch.setattr(core, "_memory_profiler", MemoryProfiler())
     monkeypatch.setattr(settings, "celery_memory_profile_every", 2)
-    monkeypatch.setattr(settings, "celery_memory_profile_trace_frames", 0)
 
     for _ in range(4):
         signals.task_postrun.send(sender=None)
 
-    reports = _reports(capsys)
-    assert [report["tasks"] for report in reports] == [2, 4]
-    assert all("top" not in report for report in reports)
-
-
-def test_the_trace_setting_reaches_the_worker_profiler(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    monkeypatch.setattr(core, "_memory_profiler", MemoryProfiler())
-    monkeypatch.setattr(settings, "celery_memory_profile_every", 1)
-    monkeypatch.setattr(settings, "celery_memory_profile_trace_frames", 4)
-
-    signals.task_postrun.send(sender=None)
-
-    (report,) = _reports(capsys)
-    assert "top" in report
-    assert tracemalloc.get_traceback_limit() == 4
+    assert [report["tasks"] for report in _reports(capsys)] == [2, 4]
 
 
 def test_the_worker_profiler_is_silent_while_the_setting_is_off(
@@ -497,10 +327,8 @@ def test_the_worker_profiler_is_silent_while_the_setting_is_off(
 ) -> None:
     monkeypatch.setattr(core, "_memory_profiler", MemoryProfiler())
     monkeypatch.setattr(settings, "celery_memory_profile_every", 0)
-    monkeypatch.setattr(settings, "celery_memory_profile_trace_frames", 4)
 
     for _ in range(4):
         signals.task_postrun.send(sender=None)
 
     assert capsys.readouterr().out == ""
-    assert not tracemalloc.is_tracing()  # an otherwise disabled worker pays nothing for the trace setting

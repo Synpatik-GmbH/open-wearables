@@ -2,7 +2,7 @@
 
 With ``CELERY_MEMORY_PROFILE_EVERY=N`` (N > 0) every worker process logs one
 ``worker_memory_profile`` line per N finished tasks. The line is cheap (no tracing, well under a
-millisecond) and says which of three causes is growing a worker's memory:
+millisecond) and says which cause is growing a worker's memory:
 
 - ``malloc_free_mib`` grows: glibc keeps freed memory in its pools rather than returning it, the
   per-thread pools of ``--pool=threads`` in particular. ``MALLOC_ARENA_MAX`` is the fix.
@@ -15,14 +15,7 @@ millisecond) and says which of three causes is growing a worker's memory:
 Read trends, not single lines. A report is taken as a task finishes, so it includes that task's
 arguments and result, and in the threads pool every task still running: one line can spike for
 reasons that are gone a moment later. A leak raises the floor, so compare per-process minimums over
-an hour or more.
-
-To find what holds it, ``CELERY_MEMORY_PROFILE_TRACE_FRAMES=K`` (K > 0) also starts ``tracemalloc``
-with K frames per allocation, and each line then carries ``top``: the allocation sites whose memory
-grew most since the process's first report, innermost frame first. Memory that grows with no Python
-site among them is held by a C library. This mode is heavy: every report holds the GIL for seconds
-on a large process, and the snapshots cost memory in proportion to live allocations, so run it
-briefly, on dev. See FORK-DELTA.md.
+an hour or more. See FORK-DELTA.md.
 """
 
 import ctypes
@@ -31,7 +24,6 @@ import functools
 import os
 import sys
 import threading
-import tracemalloc
 import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass
 from logging import getLogger
@@ -42,15 +34,6 @@ from app.utils.structured_logging import log_structured
 logger = getLogger(__name__)
 
 _MIB = 1024 * 1024
-
-# The heavy mode's own bookkeeping, kept out of the growth it reports. Filtering compiles its patterns
-# through fnmatch and re, whose caches settle only after a few uses, so their allocations go too.
-_IGNORED_FRAMES = (
-    tracemalloc.Filter(False, tracemalloc.__file__),
-    tracemalloc.Filter(False, __file__),
-    tracemalloc.Filter(False, "*/fnmatch.py"),
-    tracemalloc.Filter(False, "*/re/*"),
-)
 
 
 @dataclass(frozen=True)
@@ -134,14 +117,12 @@ def _mib(value: int | None) -> float | None:
 class MemoryProfiler:
     """Counts finished tasks in this process and logs a memory report every ``every`` of them."""
 
-    def __init__(self, top: int = 15) -> None:
-        self._top = top
+    def __init__(self) -> None:
         self._lock = threading.Lock()
         self._pid: int | None = None
         self._count = 0
-        self._baseline: tracemalloc.Snapshot | None = None
 
-    def task_finished(self, every: int, trace_frames: int = 0) -> None:
+    def task_finished(self, every: int) -> None:
         if every <= 0:
             return
         with self._lock:
@@ -150,16 +131,13 @@ class MemoryProfiler:
                 # First task in this process, or a prefork child that inherited the parent's state.
                 self._pid = pid
                 self._count = 0
-                self._baseline = None
             self._count += 1
             if self._count % every:
                 return
-            report = self._cheap_report(pid)
-            if trace_frames > 0:
-                report["top"] = self._growth(trace_frames)
+            report = self._report(pid)
         log_structured(logger, "info", "Worker memory profile", action="worker_memory_profile", **report)
 
-    def _cheap_report(self, pid: int) -> dict[str, Any]:
+    def _report(self, pid: int) -> dict[str, Any]:
         xml = read_malloc_info()
         malloc = parse_malloc_info(xml) if xml is not None else None
         return {
@@ -172,24 +150,3 @@ class MemoryProfiler:
             "malloc_in_use_mib": _mib(malloc.in_use_bytes) if malloc else None,
             "malloc_free_mib": _mib(malloc.free_bytes) if malloc else None,
         }
-
-    def _growth(self, frames: int) -> list[dict[str, Any]]:
-        if not tracemalloc.is_tracing() or tracemalloc.get_traceback_limit() != frames:
-            tracemalloc.stop()
-            tracemalloc.start(frames)
-            self._baseline = None
-        if self._baseline is None:
-            self._baseline = tracemalloc.take_snapshot().filter_traces(_IGNORED_FRAMES)
-        snapshot = tracemalloc.take_snapshot().filter_traces(_IGNORED_FRAMES)
-        # compare_to ranks by the size of the change either way; memory released since the baseline
-        # must not crowd out the growth being looked for.
-        grown = [stat for stat in snapshot.compare_to(self._baseline, "traceback") if stat.size_diff > 0]
-        return [
-            {
-                "frames": [f"{frame.filename}:{frame.lineno}" for frame in reversed(stat.traceback)],
-                "size_kib": round(stat.size / 1024),
-                "growth_kib": round(stat.size_diff / 1024),
-                "count": stat.count,
-            }
-            for stat in grown[: self._top]
-        ]
