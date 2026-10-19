@@ -217,6 +217,7 @@ def _record_sampling(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     sampled: list[str] = []
     monkeypatch.setattr(memory_profile, "read_malloc_info", lambda: sampled.append("read_malloc_info"))
     monkeypatch.setattr(memory_profile, "_rss_bytes", lambda: sampled.append("_rss_bytes"))
+    monkeypatch.setattr(memory_profile.sys, "getallocatedblocks", lambda: sampled.append("getallocatedblocks") or 0)
     monkeypatch.setattr(MemoryProfiler, "_report", lambda self, pid: sampled.append("_report") or {})
     return sampled
 
@@ -366,17 +367,18 @@ def test_it_is_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     assert Settings().celery_memory_profile_every == 0
 
 
+@pytest.mark.parametrize(("every", "expected"), [(3, [3, 6, 9]), (5, [5, 10])])
 def test_every_finished_task_reaches_the_worker_profiler(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], every: int, expected: list[int]
 ) -> None:
     monkeypatch.setattr(core, "_memory_profiler", MemoryProfiler())
-    monkeypatch.setattr(settings, "celery_memory_profile_every", 5)
+    monkeypatch.setattr(settings, "celery_memory_profile_every", every)
 
     for _ in range(10):
         signals.task_postrun.send(sender=None)
 
-    # The configured cadence, as set: any other would report at other counts.
-    assert [report["tasks"] for report in _reports(capsys)] == [5, 10]
+    # The configured cadence, as set: a constant in its place matches at most one case.
+    assert [report["tasks"] for report in _reports(capsys)] == expected
 
 
 def test_the_worker_profiler_is_silent_while_the_setting_is_off(
