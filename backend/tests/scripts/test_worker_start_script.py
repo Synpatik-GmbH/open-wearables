@@ -194,6 +194,8 @@ def test_the_container_stops_when_either_worker_exits(tmp_path: Path, dies: str,
     assert status != 0
     # The survivor is stopped rather than orphaned, so a warm shutdown gets the chance to run.
     _wait_for(log, f"{survives} term")
+    # The log names the dead worker's own status, the first clue in an outage.
+    assert "A Celery worker exited (status 3)" in (tmp_path / "stderr.log").read_text()
 
 
 def test_the_container_stops_even_when_a_worker_exits_cleanly(tmp_path: Path) -> None:
@@ -202,6 +204,7 @@ def test_the_container_stops_even_when_a_worker_exits_cleanly(tmp_path: Path) ->
     survivor = _pid_of(log, "cpu")
 
     assert _exit_status(proc) != 0
+    assert "A Celery worker exited (status 0)" in (tmp_path / "stderr.log").read_text()
     _wait_for(log, "cpu term")  # stopped like any other survivor, not orphaned
     assert not _alive(survivor)
 
@@ -307,16 +310,18 @@ def test_the_container_keeps_running_while_both_workers_run(tmp_path: Path) -> N
         _stop(proc)
 
 
-def test_sigterm_reaches_both_workers(tmp_path: Path) -> None:
+@pytest.mark.parametrize("stop", [signal.SIGTERM, signal.SIGINT])
+def test_a_stop_signal_reaches_both_workers(tmp_path: Path, stop: signal.Signals) -> None:
     proc, log = _start(tmp_path, io="run", cpu="run")
-    _wait_for(log, "io start")
-    _wait_for(log, "cpu start")
+    io, cpu = _pid_of(log, "io"), _pid_of(log, "cpu")
 
-    proc.send_signal(signal.SIGTERM)
-    _exit_status(proc)
+    proc.send_signal(stop)
 
+    assert _exit_status(proc) == 143
     _wait_for(log, "io term")
     _wait_for(log, "cpu term")
+    assert not _alive(io)
+    assert not _alive(cpu)
 
 
 def test_a_dedicated_worker_runs_only_its_own_queues(tmp_path: Path) -> None:
