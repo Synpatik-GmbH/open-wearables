@@ -2,8 +2,9 @@
 
 Prod's I/O worker grew from ~650 to ~880 MiB between 2026-09-26 and 2026-10-16 and then died; dev's
 grew from ~535 to ~800 MiB after the 0.9.0 move on 2026-10-05 (Azure Monitor ``WorkingSetBytes``,
-read 2026-10-19). The cheap report says which of three causes it is: the allocator keeping freed
-memory (``malloc_free_mib`` grows), or something holding memory (``malloc_in_use_mib`` grows). The
+read 2026-10-19). The cheap report says which cause it is: the allocator keeping freed memory
+(``malloc_free_mib`` grows), or something holding memory (``malloc_in_use_mib`` or ``python_blocks``
+grows). The
 heavy mode then names the Python lines holding it, or names none, which points at a C library.
 """
 
@@ -99,7 +100,6 @@ def test_a_cheap_report_carries_process_and_allocator_memory(capsys: pytest.Capt
     assert report["malloc_heap_mib"] > 0
     assert report["malloc_in_use_mib"] > 0
     assert report["malloc_free_mib"] >= 0
-    assert report["rss_outside_malloc_mib"] > 0
     assert "top" not in report
     assert not tracemalloc.is_tracing()  # the cheap report never turns tracing on
 
@@ -114,12 +114,9 @@ def test_memory_held_shows_as_in_use(capsys: pytest.CaptureFixture[str]) -> None
 
     before, after = _reports(capsys)
     assert after["malloc_in_use_mib"] - before["malloc_in_use_mib"] >= 35
-    # Memory glibc accounts for is not counted again as memory outside it.
-    assert after["rss_outside_malloc_mib"] - before["rss_outside_malloc_mib"] < 10
 
 
-@needs_glibc
-def test_small_python_objects_show_outside_malloc(capsys: pytest.CaptureFixture[str]) -> None:
+def test_small_python_objects_show_as_python_blocks(capsys: pytest.CaptureFixture[str]) -> None:
     # Python keeps small objects in its own pools, mapped from the OS: malloc_info never sees them.
     profiler = MemoryProfiler()
     profiler.task_finished(every=1)
@@ -128,7 +125,6 @@ def test_small_python_objects_show_outside_malloc(capsys: pytest.CaptureFixture[
     profiler.task_finished(every=1)
 
     before, after = _reports(capsys)
-    assert after["rss_outside_malloc_mib"] - before["rss_outside_malloc_mib"] >= 30
     assert after["python_blocks"] - before["python_blocks"] >= 900_000
 
 
@@ -180,6 +176,22 @@ def test_the_heavy_mode_names_where_memory_grew(capsys: pytest.CaptureFixture[st
     grown = report["top"][0]  # the largest growth is listed first
     assert grown["growth_kib"] >= 4096
     assert any("test_memory_profile.py" in frame for frame in grown["frames"])
+
+
+def test_the_heavy_mode_lists_growth_not_memory_released_since(capsys: pytest.CaptureFixture[str]) -> None:
+    tracemalloc.start(5)  # as on a worker already tracing: what is alive now is in the baseline
+    released = [bytes(1024) for _ in range(20_480)]  # ~20 MiB
+    profiler = MemoryProfiler(top=1)
+    profiler.task_finished(every=1, trace_frames=5)
+    capsys.readouterr()
+
+    released.clear()  # a large release, which compare_to would rank first
+    _held.extend(bytes(1024) for _ in range(1024))  # a small leak, ~1 MiB
+    profiler.task_finished(every=1, trace_frames=5)
+
+    (report,) = _reports(capsys)
+    (grown,) = report["top"]
+    assert grown["growth_kib"] >= 1024
 
 
 def test_the_heavy_mode_keeps_the_frames_it_was_asked_for(capsys: pytest.CaptureFixture[str]) -> None:

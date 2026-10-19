@@ -8,9 +8,8 @@ millisecond) and says which of three causes is growing a worker's memory:
   per-thread pools of ``--pool=threads`` in particular. ``MALLOC_ARENA_MAX`` is the fix.
 - ``malloc_in_use_mib`` grows: something holds memory taken through glibc: large Python objects,
   or a C library (database driver, TLS, XML).
-- ``rss_outside_malloc_mib`` grows: memory glibc does not see grows, mostly Python's own pools for
-  small objects. ``python_blocks`` growing with it points at Python objects; it counts blocks, not
-  bytes, so a few large objects barely move it.
+- ``python_blocks`` grows: small Python objects are held. Python keeps them in its own pools, which
+  glibc does not see; the count stands in for their size, as each is at most 512 bytes.
 
 To find what holds it, ``CELERY_MEMORY_PROFILE_TRACE_FRAMES=K`` (K > 0) also starts ``tracemalloc``
 with K frames per allocation, and each line then carries ``top``: the allocation sites whose memory
@@ -54,7 +53,7 @@ class MallocStats:
     """glibc's totals over every pool (arena), from ``malloc_info``."""
 
     arenas: int
-    heap_bytes: int  # the pools' current size
+    heap_bytes: int  # the pools' current size: address space, not only resident pages
     free_bytes: int  # freed chunks the pools keep (fast + rest)
     mmap_bytes: int  # large blocks taken straight from the OS; in use until freed
 
@@ -156,13 +155,10 @@ class MemoryProfiler:
     def _cheap_report(self, pid: int) -> dict[str, Any]:
         xml = read_malloc_info()
         malloc = parse_malloc_info(xml) if xml is not None else None
-        rss = _rss_bytes()
-        outside = rss - malloc.heap_bytes - malloc.mmap_bytes if rss is not None and malloc else None
         return {
             "pid": pid,
             "tasks": self._count,
-            "rss_mib": _mib(rss),
-            "rss_outside_malloc_mib": _mib(outside),
+            "rss_mib": _mib(_rss_bytes()),
             "python_blocks": sys.getallocatedblocks(),
             "malloc_arenas": malloc.arenas if malloc else None,
             "malloc_heap_mib": _mib(malloc.heap_bytes) if malloc else None,
@@ -179,6 +175,9 @@ class MemoryProfiler:
         if self._baseline is None:
             self._baseline = tracemalloc.take_snapshot().filter_traces(_IGNORED_FRAMES)
         snapshot = tracemalloc.take_snapshot().filter_traces(_IGNORED_FRAMES)
+        # compare_to ranks by the size of the change either way; memory released since the baseline
+        # must not crowd out the growth being looked for.
+        grown = [stat for stat in snapshot.compare_to(self._baseline, "traceback") if stat.size_diff > 0]
         return [
             {
                 "frames": [f"{frame.filename}:{frame.lineno}" for frame in reversed(stat.traceback)],
@@ -186,5 +185,5 @@ class MemoryProfiler:
                 "growth_kib": round(stat.size_diff / 1024),
                 "count": stat.count,
             }
-            for stat in snapshot.compare_to(self._baseline, "traceback")[: self._top]
+            for stat in grown[: self._top]
         ]
