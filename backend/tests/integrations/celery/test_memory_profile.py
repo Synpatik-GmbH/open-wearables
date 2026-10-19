@@ -78,6 +78,33 @@ def test_malloc_info_is_read_from_glibc() -> None:
     assert stats.heap_bytes > 0
 
 
+class _FakeFunction:
+    def __init__(self, result: int | None) -> None:
+        self.result = result
+        self.calls = 0
+
+    def __call__(self, *args: object) -> int | None:
+        self.calls += 1
+        return self.result
+
+
+class _FailingLibc:
+    """open_memstream succeeds, malloc_info fails."""
+
+    def __init__(self) -> None:
+        self.open_memstream = _FakeFunction(1)
+        self.malloc_info = _FakeFunction(1)
+        self.fclose = _FakeFunction(0)
+        self.free = _FakeFunction(None)
+
+
+def test_a_failing_malloc_info_still_releases_its_stream_and_buffer() -> None:
+    libc = _FailingLibc()
+
+    assert memory_profile.read_malloc_info(libc) is None
+    assert (libc.fclose.calls, libc.free.calls) == (1, 1)  # no leak per failed report
+
+
 # ── The cheap report ──
 
 
@@ -208,6 +235,22 @@ def test_a_forked_child_starts_its_own_count(
 
     # Counting on from the parent's one task would report at 2 and again at 4.
     assert [(report["pid"], report["tasks"]) for report in _reports(capsys)] == [(-1, 2)]
+
+
+def test_a_forked_child_takes_its_own_baseline(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A child comparing against the parent's snapshot would report the parent's later memory as growth.
+    profiler = MemoryProfiler()
+    profiler.task_finished(every=1, trace_frames=2)  # the parent's baseline
+    _held.extend(bytes(1024) for _ in range(4096))  # ~4 MiB more, before the fork
+    capsys.readouterr()
+
+    monkeypatch.setattr(memory_profile.os, "getpid", lambda: -1)
+    profiler.task_finished(every=1, trace_frames=2)  # the child's first report: its own baseline
+
+    (report,) = _reports(capsys)
+    assert [site for site in report["top"] if site["growth_kib"] >= 1024] == []
 
 
 # ── The heavy mode: tracemalloc, on only when asked ──

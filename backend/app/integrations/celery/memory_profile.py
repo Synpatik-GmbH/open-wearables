@@ -41,10 +41,13 @@ logger = getLogger(__name__)
 
 _MIB = 1024 * 1024
 
-# The heavy mode's own bookkeeping, kept out of the growth it reports.
+# The heavy mode's own bookkeeping, kept out of the growth it reports. Filtering compiles its patterns
+# through fnmatch and re, whose caches settle only after a few uses, so their allocations go too.
 _IGNORED_FRAMES = (
     tracemalloc.Filter(False, tracemalloc.__file__),
     tracemalloc.Filter(False, __file__),
+    tracemalloc.Filter(False, "*/fnmatch.py"),
+    tracemalloc.Filter(False, "*/re/*"),
 )
 
 
@@ -74,31 +77,30 @@ def parse_malloc_info(xml: str) -> MallocStats:
     )
 
 
-def read_malloc_info() -> str | None:
+def read_malloc_info(libc: Any = None) -> str | None:
     """glibc's ``malloc_info`` XML for this process, or None where there is no glibc."""
-    try:
-        libc = ctypes.CDLL(ctypes.util.find_library("c"))
-        malloc_info = libc.malloc_info
-        open_memstream = libc.open_memstream
-    except (OSError, AttributeError, TypeError):
-        return None
-    open_memstream.restype = ctypes.c_void_p
-    open_memstream.argtypes = [ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_size_t)]
-    malloc_info.argtypes = [ctypes.c_int, ctypes.c_void_p]
+    if libc is None:
+        try:
+            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            libc.malloc_info, libc.open_memstream  # noqa: B018 - absent outside glibc
+        except (OSError, AttributeError, TypeError):
+            return None
+    libc.open_memstream.restype = ctypes.c_void_p
+    libc.open_memstream.argtypes = [ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_size_t)]
+    libc.malloc_info.argtypes = [ctypes.c_int, ctypes.c_void_p]
     libc.fclose.argtypes = [ctypes.c_void_p]
     libc.free.argtypes = [ctypes.c_void_p]
     buffer = ctypes.c_char_p()
     size = ctypes.c_size_t()
-    stream = open_memstream(ctypes.byref(buffer), ctypes.byref(size))
+    stream = libc.open_memstream(ctypes.byref(buffer), ctypes.byref(size))
     if not stream:
         return None
     try:
-        if malloc_info(0, stream) != 0:
-            return None
+        status = libc.malloc_info(0, stream)
     finally:
-        libc.fclose(stream)
+        libc.fclose(stream)  # flushes into buffer, which is ours to free whatever malloc_info did
     try:
-        return ctypes.string_at(buffer, size.value).decode()
+        return ctypes.string_at(buffer, size.value).decode() if status == 0 else None
     finally:
         libc.free(ctypes.cast(buffer, ctypes.c_void_p))
 
