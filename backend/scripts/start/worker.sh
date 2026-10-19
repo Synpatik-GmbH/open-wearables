@@ -13,9 +13,23 @@ fi
 # Upstream ran the CPU worker in the foreground, which kept the container alive after the
 # I/O worker died: on 2026-10-16 nothing consumed sdk_sync or default for 2.7 days. Both
 # now run in the background; SIGTERM is passed on to both. See FORK-DELTA.md.
+#
+# Stopping is bounded: TERM is Celery's warm shutdown, which waits for running tasks (an
+# xml_sync task has no time limit), so a worker still running WORKER_STOP_GRACE_SECONDS
+# after TERM is killed.
 stop_workers() {
     kill -TERM "$IO_PID" "$CPU_PID" 2>/dev/null || true
-    wait || true
+    (
+        trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM
+        sleep "${WORKER_STOP_GRACE_SECONDS:-30}" &
+        sleeper=$!
+        wait "$sleeper"
+        kill -KILL "$IO_PID" "$CPU_PID" 2>/dev/null || true
+    ) &
+    local timer=$!
+    wait "$IO_PID" "$CPU_PID" 2>/dev/null || true
+    kill -TERM "$timer" 2>/dev/null || true
+    wait "$timer" 2>/dev/null || true
 }
 trap 'stop_workers; exit 143' TERM INT
 
