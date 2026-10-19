@@ -8,8 +8,9 @@ millisecond) and says which of three causes is growing a worker's memory:
   per-thread pools of ``--pool=threads`` in particular. ``MALLOC_ARENA_MAX`` is the fix.
 - ``malloc_in_use_mib`` grows: something holds memory taken through glibc: large Python objects,
   or a C library (database driver, TLS, XML).
-- ``python_blocks`` grows: small Python objects are held. Python keeps them in its own pools, which
-  glibc does not see; the count stands in for their size, as each is at most 512 bytes.
+- ``python_blocks`` grows: Python allocations are held. It counts allocations of every size, not
+  bytes; the small ones live in Python's own pools, which glibc does not see, so for them it is the
+  only figure that moves.
 
 Read trends, not single lines. A report is taken as a task finishes, so it includes that task's
 arguments and result, and in the threads pool every task still running: one line can spike for
@@ -18,10 +19,10 @@ an hour or more.
 
 To find what holds it, ``CELERY_MEMORY_PROFILE_TRACE_FRAMES=K`` (K > 0) also starts ``tracemalloc``
 with K frames per allocation, and each line then carries ``top``: the allocation sites whose memory
-grew most since the process's first report, innermost frame first. Memory that grows with no Python site
-among them is held by a C library. This mode is heavy: every report holds the GIL for seconds on a large process and
-the snapshots cost memory in proportion to live allocations, so run it briefly, on dev. See
-FORK-DELTA.md.
+grew most since the process's first report, innermost frame first. Memory that grows with no Python
+site among them is held by a C library. This mode is heavy: every report holds the GIL for seconds
+on a large process, and the snapshots cost memory in proportion to live allocations, so run it
+briefly, on dev. See FORK-DELTA.md.
 """
 
 import ctypes
@@ -105,10 +106,10 @@ def read_malloc_info(libc: Any = None) -> str | None:
     if not stream:
         return None
     try:
-        status = libc.malloc_info(0, stream)
-    finally:
-        libc.fclose(stream)  # flushes into buffer, which is ours to free whatever malloc_info did
-    try:
+        try:
+            status = libc.malloc_info(0, stream)
+        finally:
+            libc.fclose(stream)  # flushes into buffer, which is ours to free whatever malloc_info did
         return ctypes.string_at(buffer, size.value).decode() if status == 0 else None
     finally:
         libc.free(ctypes.cast(buffer, ctypes.c_void_p))

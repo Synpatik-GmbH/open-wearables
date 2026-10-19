@@ -4,8 +4,8 @@ Prod's I/O worker grew from ~650 to ~880 MiB between 2026-09-26 and 2026-10-16 a
 grew from ~535 to ~800 MiB after the 0.9.0 move on 2026-10-05 (Azure Monitor ``WorkingSetBytes``,
 read 2026-10-19). The cheap report says which cause it is: the allocator keeping freed memory
 (``malloc_free_mib`` grows), or something holding memory (``malloc_in_use_mib`` or ``python_blocks``
-grows). The
-heavy mode then names the Python lines holding it, or names none, which points at a C library.
+grows). The heavy mode then names the Python lines holding it, or names none, which points at a C
+library.
 """
 
 import ctypes
@@ -124,6 +124,22 @@ class _FakeLibc:
         self.malloc_info = _FakeFunction(status)
         self.fclose = _FakeFunction(0)
         self.free = _FakeFunction(None)
+
+
+class _RaisingFunction(_FakeFunction):
+    def __call__(self, *args: object) -> int | None:
+        super().__call__(*args)
+        raise ctypes.ArgumentError("malloc_info refused its arguments")
+
+
+def test_malloc_info_raising_still_releases_its_stream_and_buffer() -> None:
+    libc = _FakeLibc(0)
+    libc.malloc_info = _RaisingFunction(None)
+
+    with pytest.raises(ctypes.ArgumentError):
+        memory_profile.read_malloc_info(libc)
+    assert libc.fclose.calls == 1
+    assert libc.free.calls == 1
 
 
 @pytest.mark.parametrize(("status", "expected"), [(0, _XML.decode()), (1, None)])
