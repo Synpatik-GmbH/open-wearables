@@ -41,15 +41,10 @@ logger = getLogger(__name__)
 
 _MIB = 1024 * 1024
 
-# The heavy mode's own bookkeeping (snapshot filtering compiles fnmatch and regex patterns), kept
-# out of the growth it reports.
+# The heavy mode's own bookkeeping, kept out of the growth it reports.
 _IGNORED_FRAMES = (
     tracemalloc.Filter(False, tracemalloc.__file__),
     tracemalloc.Filter(False, __file__),
-    tracemalloc.Filter(False, "*/fnmatch.py"),
-    tracemalloc.Filter(False, "*/re/*"),
-    tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
-    tracemalloc.Filter(False, "<frozen importlib._bootstrap_external>"),
 )
 
 
@@ -108,10 +103,10 @@ def read_malloc_info() -> str | None:
         libc.free(ctypes.cast(buffer, ctypes.c_void_p))
 
 
-def _rss_bytes() -> int | None:
+def _rss_bytes(status_path: str = "/proc/self/status") -> int | None:
     """Resident set size from /proc (Linux), or None where there is no /proc."""
     try:
-        with open("/proc/self/status") as status:
+        with open(status_path) as status:
             for line in status:
                 if line.startswith("VmRSS:"):
                     return int(line.split()[1]) * 1024
@@ -133,7 +128,6 @@ class MemoryProfiler:
         self._pid: int | None = None
         self._count = 0
         self._baseline: tracemalloc.Snapshot | None = None
-        self._tracing = False
 
     def task_finished(self, every: int, trace_frames: int = 0) -> None:
         if every <= 0:
@@ -151,10 +145,6 @@ class MemoryProfiler:
             report = self._cheap_report(pid)
             if trace_frames > 0:
                 report["top"] = self._growth(trace_frames)
-            elif self._tracing:
-                tracemalloc.stop()
-                self._tracing = False
-                self._baseline = None
         log_structured(logger, "info", "Worker memory profile", action="worker_memory_profile", **report)
 
     def _cheap_report(self, pid: int) -> dict[str, Any]:
@@ -175,7 +165,6 @@ class MemoryProfiler:
         if not tracemalloc.is_tracing() or tracemalloc.get_traceback_limit() != frames:
             tracemalloc.stop()
             tracemalloc.start(frames)
-            self._tracing = True
             self._baseline = None
         if self._baseline is None:
             self._baseline = tracemalloc.take_snapshot().filter_traces(_IGNORED_FRAMES)

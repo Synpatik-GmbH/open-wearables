@@ -9,9 +9,11 @@ heavy mode then names the Python lines holding it, or names none, which points a
 """
 
 import json
+import sys
 import threading
 import tracemalloc
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -104,6 +106,43 @@ def test_a_cheap_report_carries_process_and_allocator_memory(capsys: pytest.Capt
     assert not tracemalloc.is_tracing()  # the cheap report never turns tracing on
 
 
+def test_a_cheap_report_maps_each_figure_to_its_field(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Exact values from a known malloc_info and /proc status: a swapped or mis-scaled field fails.
+    status = tmp_path / "status"
+    status.write_text("VmPeak:\t 999999 kB\nVmHWM:\t 888888 kB\nVmRSS:\t 263168 kB\n")
+    monkeypatch.setattr(memory_profile, "read_malloc_info", lambda: _MALLOC_INFO)
+    read_rss = memory_profile._rss_bytes
+    monkeypatch.setattr(memory_profile, "_rss_bytes", lambda: read_rss(str(status)))
+    profiler = MemoryProfiler()
+
+    profiler.task_finished(every=1)
+
+    (report,) = _reports(capsys)
+    assert report["message"] == "Worker memory profile"
+    assert report["level"] == "info"
+    assert report["rss_mib"] == 257.0  # VmRSS, kB -> MiB
+    assert report["malloc_arenas"] == 2
+    assert report["malloc_heap_mib"] == 10.0
+    assert report["malloc_free_mib"] == 4.0
+    assert report["malloc_in_use_mib"] == 8.0  # 10 - 4 + 2 (mmap)
+
+
+def test_without_glibc_the_allocator_figures_are_null(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(memory_profile, "read_malloc_info", lambda: None)
+    profiler = MemoryProfiler()
+
+    profiler.task_finished(every=1)
+
+    (report,) = _reports(capsys)
+    assert [report[key] for key in ("malloc_arenas", "malloc_heap_mib", "malloc_in_use_mib", "malloc_free_mib")] == [
+        None
+    ] * 4
+
+
 @needs_glibc
 def test_memory_held_shows_as_in_use(capsys: pytest.CaptureFixture[str]) -> None:
     profiler = MemoryProfiler()
@@ -168,14 +207,18 @@ def test_the_heavy_mode_names_where_memory_grew(capsys: pytest.CaptureFixture[st
     profiler.task_finished(every=1, trace_frames=5)  # the baseline
     capsys.readouterr()
 
+    line = sys._getframe().f_lineno + 1
     _held.extend(bytes(1024) for _ in range(4096))  # ~4 MiB, held
     profiler.task_finished(every=1, trace_frames=5)
 
     (report,) = _reports(capsys)
     assert len(report["top"]) == 5
     grown = report["top"][0]  # the largest growth is listed first
+    assert grown["frames"][0] == f"{__file__}:{line}"  # innermost frame: the allocating line
     assert grown["growth_kib"] >= 4096
-    assert any("test_memory_profile.py" in frame for frame in grown["frames"])
+    assert grown["size_kib"] >= grown["growth_kib"]
+    assert grown["size_kib"] < 8192  # KiB, not bytes
+    assert grown["count"] >= 4096
 
 
 def test_the_heavy_mode_lists_growth_not_memory_released_since(capsys: pytest.CaptureFixture[str]) -> None:
@@ -212,6 +255,32 @@ def test_the_heavy_mode_keeps_the_frames_it_was_asked_for(capsys: pytest.Capture
     frames = report["top"][0]["frames"]
     assert len(frames) == 3  # the caller chain, not only the line that allocated
     assert sum("test_memory_profile.py" in frame for frame in frames) >= 2
+
+
+def test_the_heavy_mode_restarts_tracing_at_the_depth_asked_for(capsys: pytest.CaptureFixture[str]) -> None:
+    # Tracing already on at another depth (PYTHONTRACEMALLOC=1, say) is restarted, not reused.
+    tracemalloc.start(1)
+    profiler = MemoryProfiler(top=1)
+    profiler.task_finished(every=1, trace_frames=3)
+    capsys.readouterr()
+
+    def inner() -> None:
+        _held.extend(bytes(1024) for _ in range(4096))
+
+    inner()
+    profiler.task_finished(every=1, trace_frames=3)
+
+    (report,) = _reports(capsys)
+    assert len(report["top"][0]["frames"]) == 3
+
+
+def test_the_heavy_mode_works_at_a_depth_of_one(capsys: pytest.CaptureFixture[str]) -> None:
+    profiler = MemoryProfiler(top=1)
+    profiler.task_finished(every=1, trace_frames=1)
+
+    (report,) = _reports(capsys)
+    assert "top" in report
+    assert tracemalloc.get_traceback_limit() == 1
 
 
 def test_the_heavy_mode_does_not_report_its_own_bookkeeping(capsys: pytest.CaptureFixture[str]) -> None:
