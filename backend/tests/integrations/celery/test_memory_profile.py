@@ -111,7 +111,7 @@ def test_a_cheap_report_maps_each_figure_to_its_field(
 ) -> None:
     # Exact values from a known malloc_info and /proc status: a swapped or mis-scaled field fails.
     status = tmp_path / "status"
-    status.write_text("VmPeak:\t 999999 kB\nVmHWM:\t 888888 kB\nVmRSS:\t 263168 kB\n")
+    status.write_text("VmPeak:\t 999999 kB\nVmHWM:\t 888888 kB\nVmRSS:\t 263270 kB\n")
     monkeypatch.setattr(memory_profile, "read_malloc_info", lambda: _MALLOC_INFO)
     read_rss = memory_profile._rss_bytes
     monkeypatch.setattr(memory_profile, "_rss_bytes", lambda: read_rss(str(status)))
@@ -122,7 +122,7 @@ def test_a_cheap_report_maps_each_figure_to_its_field(
     (report,) = _reports(capsys)
     assert report["message"] == "Worker memory profile"
     assert report["level"] == "info"
-    assert report["rss_mib"] == 257.0  # VmRSS, kB -> MiB
+    assert report["rss_mib"] == 257.1  # VmRSS, kB -> MiB, one decimal
     assert report["malloc_arenas"] == 2
     assert report["malloc_heap_mib"] == 10.0
     assert report["malloc_free_mib"] == 4.0
@@ -255,6 +255,26 @@ def test_the_heavy_mode_keeps_the_frames_it_was_asked_for(capsys: pytest.Capture
     frames = report["top"][0]["frames"]
     assert len(frames) == 3  # the caller chain, not only the line that allocated
     assert sum("test_memory_profile.py" in frame for frame in frames) >= 2
+
+
+def test_the_heavy_mode_separates_size_growth_and_count(capsys: pytest.CaptureFixture[str]) -> None:
+    # One site that already held memory at the baseline and then grew: size and growth differ.
+    tracemalloc.start(5)
+
+    def grow(kib: int) -> None:
+        _held.extend(bytes(1024) for _ in range(kib))
+
+    profiler = MemoryProfiler(top=1)
+    for kib in (2048, 4096):  # the first report is the baseline, holding 2 MiB from this site
+        capsys.readouterr()
+        grow(kib)  # one call site, so one traceback
+        profiler.task_finished(every=1, trace_frames=5)
+
+    (report,) = _reports(capsys)
+    (site,) = report["top"]
+    assert 4096 <= site["growth_kib"] < 5000  # what was added since the baseline
+    assert site["size_kib"] >= site["growth_kib"] + 1900  # all it holds now, the baseline's 2 MiB too
+    assert site["count"] >= 6000  # every block it holds, not only the new ones
 
 
 def test_the_heavy_mode_restarts_tracing_at_the_depth_asked_for(capsys: pytest.CaptureFixture[str]) -> None:
