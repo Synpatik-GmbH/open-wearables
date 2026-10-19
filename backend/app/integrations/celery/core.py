@@ -9,6 +9,7 @@ from celery import current_app as current_celery_app
 from celery.schedules import crontab
 
 from app.config import settings
+from app.integrations.celery.memory_profile import MemoryProfiler
 from app.services import raw_payload_storage
 
 _WEBHOOK_TASK = "emit_webhook_event_task.emit_webhook_event"
@@ -75,6 +76,15 @@ def init_raw_payload_storage(**kwargs) -> None:
         fit_files_enabled=settings.store_fit_files,
         transport_enabled=settings.sdk_payload_s3_offload,
     )
+
+
+_memory_profiler = MemoryProfiler()
+
+
+@signals.task_postrun.connect
+def profile_worker_memory(**kwargs) -> None:
+    """FORK diagnostic: report this process's memory every N finished tasks (off unless set)."""
+    _memory_profiler.task_finished(every=settings.celery_memory_profile_every)
 
 
 def create_celery() -> Celery:
