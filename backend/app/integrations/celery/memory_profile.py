@@ -37,8 +37,8 @@ logger = getLogger(__name__)
 
 _MIB = 1024 * 1024
 
-# The heavy mode's own bookkeeping (snapshot filtering compiles fnmatch patterns), kept out of the
-# growth it reports.
+# The heavy mode's own bookkeeping (snapshot filtering compiles fnmatch and regex patterns), kept
+# out of the growth it reports.
 _IGNORED_FRAMES = (
     tracemalloc.Filter(False, tracemalloc.__file__),
     tracemalloc.Filter(False, __file__),
@@ -177,8 +177,6 @@ class MemoryProfiler:
             self._tracing = True
             self._baseline = None
         if self._baseline is None:
-            # Filter once before the baseline, so the patterns it compiles are not growth.
-            tracemalloc.take_snapshot().filter_traces(_IGNORED_FRAMES)
             self._baseline = tracemalloc.take_snapshot().filter_traces(_IGNORED_FRAMES)
         snapshot = tracemalloc.take_snapshot().filter_traces(_IGNORED_FRAMES)
         return [

@@ -114,6 +114,8 @@ def test_memory_held_shows_as_in_use(capsys: pytest.CaptureFixture[str]) -> None
 
     before, after = _reports(capsys)
     assert after["malloc_in_use_mib"] - before["malloc_in_use_mib"] >= 35
+    # Memory glibc accounts for is not counted again as memory outside it.
+    assert after["rss_outside_malloc_mib"] - before["rss_outside_malloc_mib"] < 10
 
 
 @needs_glibc
