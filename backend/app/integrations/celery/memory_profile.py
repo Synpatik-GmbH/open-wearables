@@ -11,6 +11,11 @@ millisecond) and says which of three causes is growing a worker's memory:
 - ``python_blocks`` grows: small Python objects are held. Python keeps them in its own pools, which
   glibc does not see; the count stands in for their size, as each is at most 512 bytes.
 
+Read trends, not single lines. A report is taken as a task finishes, so it includes that task's
+arguments and result, and in the threads pool every task still running: one line can spike for
+reasons that are gone a moment later. A leak raises the floor, so compare per-process minimums over
+an hour or more.
+
 To find what holds it, ``CELERY_MEMORY_PROFILE_TRACE_FRAMES=K`` (K > 0) also starts ``tracemalloc``
 with K frames per allocation, and each line then carries ``top``: the allocation sites whose memory
 grew most since the process's first report, innermost frame first. Memory that grows with no Python site
