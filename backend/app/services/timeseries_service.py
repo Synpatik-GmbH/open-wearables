@@ -143,13 +143,20 @@ class TimeSeriesService(
         else:
             samples_copy = list(samples)
 
+        # FORK: SQLAlchemy keeps a ``once`` listener attached to the session after it fires, so
+        # its closure lives as long as the session. The batch sits in a box the listener empties,
+        # or a pull that saves many batches in one session would hold every one until it ends.
+        pending = [samples_copy]
+        del samples_copy
+
         @sa_event.listens_for(db_session, "after_commit", once=True)
         def _start_webhook_thread(session: DbSession) -> None:  # noqa: ARG001
+            batch = pending.pop()
             if not svix_service.is_enabled():
                 return
             threading.Thread(
                 target=self._emit_timeseries_webhooks,
-                args=(samples_copy,),
+                args=(batch,),
                 daemon=True,
             ).start()
 

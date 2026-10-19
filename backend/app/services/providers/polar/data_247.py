@@ -114,6 +114,12 @@ _FULL_FORM_TYPES: tuple[str, ...] = (
 _SHORT_FORM_KEYS: dict[str, str] = {"sleep": "sleep_latest", "daily_activity": "daily_activity_recent"}
 _SHORT_ACTIVITY_DAYS = 1
 
+# FORK: a full fetch saves and commits its samples in batches of about this many, so a type's
+# whole window is never held as sample objects at once. One full fetch is up to ~147k samples
+# for a member (prod, 15 Oct 2026); built whole, every Polar member pulled together exceeded the
+# worker's 1 GiB. A record whose samples alone exceed it (a day of heart rate) is one batch.
+_SAVE_BATCH = 5000
+
 
 class Polar247Data(Base247DataTemplate):
     def __init__(
@@ -949,6 +955,30 @@ class Polar247Data(Base247DataTemplate):
             counts = timeseries_service.bulk_create_samples(db, samples, emit_only_written=True)
         return counts
 
+    def _save_timeseries_in_batches(
+        self,
+        db: DbSession,
+        raw_items: list[dict[str, Any]],
+        normalize: Callable[[list[dict[str, Any]], UUID], list[TimeSeriesSampleCreate]],
+        user_id: UUID,
+    ) -> int:
+        """Normalize ``raw_items`` one record at a time and save and commit every ``_SAVE_BATCH``
+        samples. Consumes ``raw_items``, so a record already saved is released too. A batch that
+        fails leaves the batches before it stored: the type is reported failed and fetched again."""
+        counts: int = 0
+        pending: list[TimeSeriesSampleCreate] = []
+        raw_items.reverse()
+        while raw_items:
+            pending.extend(normalize([raw_items.pop()], user_id))
+            if len(pending) >= _SAVE_BATCH:
+                counts += self._save_timeseries(db, pending)
+                db.commit()
+                pending = []
+        if pending:
+            counts += self._save_timeseries(db, pending)
+            db.commit()
+        return counts
+
     def _save_scores(self, db: DbSession, scores: list[HealthScoreCreate]) -> int:
         if scores:
             health_score_service.bulk_create(db, scores)
@@ -1193,17 +1223,16 @@ class Polar247Data(Base247DataTemplate):
         )
 
         def daily_activity(start: datetime) -> Callable[[], Any]:
-            return lambda: self._save_timeseries(
-                db,
-                self.normalize_daily_activity(self.get_daily_activity_statistics(db, user_id, start, now), user_id),
+            return lambda: self._save_timeseries_in_batches(
+                db, self.get_daily_activity_statistics(db, user_id, start, now), self.normalize_daily_activity, user_id
             )
 
         full_only: dict[str, Callable[[], Any]] = {
-            "continuous_hr": lambda: self._save_timeseries(
+            "continuous_hr": lambda: self._save_timeseries_in_batches(
                 db,
-                self.normalize_continuous_hr(
-                    self.get_continuous_hr_data(db, user_id, since("continuous_hr"), now), user_id
-                ),
+                self.get_continuous_hr_data(db, user_id, since("continuous_hr"), now),
+                self.normalize_continuous_hr,
+                user_id,
             ),
             "cardio_load": lambda: self._save_scores(
                 db,
@@ -1218,23 +1247,23 @@ class Polar247Data(Base247DataTemplate):
                     self.get_circadian_bedtime_data(db, user_id, since("circadian_bedtime"), now), user_id
                 ),
             ),
-            "body_temperature": lambda: self._save_timeseries(
+            "body_temperature": lambda: self._save_timeseries_in_batches(
                 db,
-                self.normalize_body_temperature(
-                    self.get_body_temperature_data(db, user_id, since("body_temperature"), now), user_id
-                ),
+                self.get_body_temperature_data(db, user_id, since("body_temperature"), now),
+                self.normalize_body_temperature,
+                user_id,
             ),
-            "sleep_skin_temperature": lambda: self._save_timeseries(
+            "sleep_skin_temperature": lambda: self._save_timeseries_in_batches(
                 db,
-                self.normalize_sleep_skin_temperature(
-                    self.get_sleep_skin_temperature_data(db, user_id, since("sleep_skin_temperature"), now), user_id
-                ),
+                self.get_sleep_skin_temperature_data(db, user_id, since("sleep_skin_temperature"), now),
+                self.normalize_sleep_skin_temperature,
+                user_id,
             ),
-            "spo2": lambda: self._save_timeseries(
-                db, self.normalize_spo2(self.get_spo2_data(db, user_id, since("spo2"), now), user_id)
+            "spo2": lambda: self._save_timeseries_in_batches(
+                db, self.get_spo2_data(db, user_id, since("spo2"), now), self.normalize_spo2, user_id
             ),
-            "wrist_ecg": lambda: self._save_timeseries(
-                db, self.normalize_wrist_ecg(self.get_wrist_ecg_data(db, user_id, since("wrist_ecg"), now), user_id)
+            "wrist_ecg": lambda: self._save_timeseries_in_batches(
+                db, self.get_wrist_ecg_data(db, user_id, since("wrist_ecg"), now), self.normalize_wrist_ecg, user_id
             ),
         }
 
@@ -1262,6 +1291,13 @@ class Polar247Data(Base247DataTemplate):
                 # call would be refused too, and still counted. Not asked; still due next pull.
                 results[data_type] = DataTypeFailure(code=stopped)
                 continue
+            # FORK: a full fetch counts as failed until it succeeds. A worker killed in the middle
+            # of one (prod, 16-19 Oct 2026: out of memory) runs nothing after it, so without this
+            # the fetch stayed due and every hourly pull started it again; now the retry gap holds
+            # it back. A success clears the gap (record_full_fetch).
+            attempted_in_full = data_type in _FULL_FORM_TYPES and connection_id is not None
+            if attempted_in_full:
+                record_full_failure(db, connection_id, data_type, now)
             try:
                 results[data_type] = fn()
                 db.commit()
@@ -1291,7 +1327,8 @@ class Polar247Data(Base247DataTemplate):
                 # growing gap, at least once every 22 hours (pull_budget.record_full_failure). A
                 # short form that failed needs nothing: the next pull asks for it again anyway,
                 # and a night that is no longer the newest is the next full fetch's.
-                if data_type in _FULL_FORM_TYPES and connection_id is not None:
+                # A type asked for in full has its failure recorded already, before it ran.
+                if data_type in _FULL_FORM_TYPES and connection_id is not None and not attempted_in_full:
                     record_full_failure(db, connection_id, data_type, now)
             elif data_type in _FULL_FORM_TYPES and connection_id is not None:
                 record_full_fetch(db, connection_id, data_type, now)
