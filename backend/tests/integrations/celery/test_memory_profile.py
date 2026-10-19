@@ -85,9 +85,7 @@ def test_malloc_info_is_read_from_glibc() -> None:
 
 
 class _FakeFunction:
-    def __init__(
-        self, result: int | None, calls_log: list[str], name: str, raises: Exception | None = None
-    ) -> None:
+    def __init__(self, result: int | None, calls_log: list[str], name: str, raises: Exception | None = None) -> None:
         self.result = result
         self.calls_log = calls_log
         self.name = name
