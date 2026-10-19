@@ -26,6 +26,7 @@ FORK-DELTA.md.
 
 import ctypes
 import ctypes.util
+import functools
 import os
 import sys
 import threading
@@ -77,19 +78,27 @@ def parse_malloc_info(xml: str) -> MallocStats:
     )
 
 
-def read_malloc_info(libc: Any = None) -> str | None:
-    """glibc's ``malloc_info`` XML for this process, or None where there is no glibc."""
-    if libc is None:
-        try:
-            libc = ctypes.CDLL(ctypes.util.find_library("c"))
-            libc.malloc_info, libc.open_memstream  # noqa: B018 - absent outside glibc
-        except (OSError, AttributeError, TypeError):
-            return None
+@functools.cache
+def _glibc() -> Any:
+    """This process's C library, loaded once (find_library runs ldconfig), or None without glibc."""
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"))
+        libc.malloc_info, libc.open_memstream  # noqa: B018 - absent outside glibc
+    except (OSError, AttributeError, TypeError):
+        return None
     libc.open_memstream.restype = ctypes.c_void_p
     libc.open_memstream.argtypes = [ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_size_t)]
     libc.malloc_info.argtypes = [ctypes.c_int, ctypes.c_void_p]
     libc.fclose.argtypes = [ctypes.c_void_p]
     libc.free.argtypes = [ctypes.c_void_p]
+    return libc
+
+
+def read_malloc_info(libc: Any = None) -> str | None:
+    """glibc's ``malloc_info`` XML for this process, or None where there is no glibc."""
+    libc = libc if libc is not None else _glibc()
+    if libc is None:
+        return None
     buffer = ctypes.c_char_p()
     size = ctypes.c_size_t()
     stream = libc.open_memstream(ctypes.byref(buffer), ctypes.byref(size))

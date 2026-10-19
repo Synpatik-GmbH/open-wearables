@@ -9,8 +9,11 @@ heavy mode then names the Python lines holding it, or names none, which points a
 """
 
 import ctypes
+import ctypes.util
+import fnmatch
 import json
 import platform
+import re
 import sys
 import threading
 import tracemalloc
@@ -103,32 +106,53 @@ class _FakeOpenMemstream(_FakeFunction):
         self.buffer_address: int | None = None
 
     def __call__(self, *args: object) -> int | None:
-        buffer = args[0]._obj  # ty: ignore[unresolved-attribute] - the c_char_p behind byref()
-        buffer.value = b"<malloc/>"
+        buffer, size = args[0]._obj, args[1]._obj  # ty: ignore[unresolved-attribute] - behind byref()
+        buffer.value = _XML
+        size.value = len(_XML)
         self.buffer_address = ctypes.cast(buffer, ctypes.c_void_p).value
         return super().__call__(*args)
 
 
-class _FailingLibc:
-    """open_memstream succeeds, malloc_info fails."""
+_XML = b"<malloc/>"
 
-    def __init__(self) -> None:
+
+class _FakeLibc:
+    """open_memstream succeeds; malloc_info returns the given status."""
+
+    def __init__(self, status: int) -> None:
         self.open_memstream = _FakeOpenMemstream()
-        self.malloc_info = _FakeFunction(1)
+        self.malloc_info = _FakeFunction(status)
         self.fclose = _FakeFunction(0)
         self.free = _FakeFunction(None)
 
 
-def test_a_failing_malloc_info_still_releases_its_stream_and_buffer() -> None:
-    libc = _FailingLibc()
+@pytest.mark.parametrize(("status", "expected"), [(0, _XML.decode()), (1, None)])
+def test_malloc_info_releases_its_stream_and_buffer_either_way(status: int, expected: str | None) -> None:
+    libc = _FakeLibc(status)
 
-    assert memory_profile.read_malloc_info(libc) is None
+    assert memory_profile.read_malloc_info(libc) == expected
     assert libc.fclose.calls == 1
     assert libc.fclose.args == (_STREAM,)
     assert libc.free.calls == 1  # no leak per failed report
     (freed,) = libc.free.args
     assert isinstance(freed, ctypes.c_void_p)
     assert freed.value == libc.open_memstream.buffer_address  # the buffer, not the stream
+
+
+@needs_glibc
+def test_the_c_library_is_looked_up_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    # find_library runs ldconfig in a subprocess; once per process, not once per report.
+    lookups: list[str] = []
+    find_library = ctypes.util.find_library
+    monkeypatch.setattr(ctypes.util, "find_library", lambda name: lookups.append(name) or find_library(name))
+    memory_profile._glibc.cache_clear()
+    try:
+        for _ in range(5):
+            assert memory_profile.read_malloc_info() is not None
+    finally:
+        memory_profile._glibc.cache_clear()
+
+    assert lookups == ["c"]
 
 
 # ── The cheap report ──
@@ -342,7 +366,7 @@ def test_the_heavy_mode_separates_size_growth_and_count(capsys: pytest.CaptureFi
     tracemalloc.start(5)
 
     def grow(kib: int) -> None:
-        _held.extend(bytes(1024) for _ in range(kib))
+        _held.extend(bytes(4096) for _ in range(kib // 4))  # 4 KiB blocks: count is not size in KiB
 
     profiler = MemoryProfiler(top=1)
     for kib in (2048, 4096):  # the first report is the baseline, holding 2 MiB from this site
@@ -354,7 +378,7 @@ def test_the_heavy_mode_separates_size_growth_and_count(capsys: pytest.CaptureFi
     (site,) = report["top"]
     assert 4096 <= site["growth_kib"] < 5000  # what was added since the baseline
     assert site["size_kib"] >= site["growth_kib"] + 1900  # all it holds now, the baseline's 2 MiB too
-    assert site["count"] >= 6000  # every block it holds, not only the new ones
+    assert 1500 <= site["count"] < 1700  # every block it holds (512 + 1024), not only the new ones
 
 
 def test_the_heavy_mode_restarts_tracing_at_the_depth_asked_for(capsys: pytest.CaptureFixture[str]) -> None:
@@ -384,6 +408,9 @@ def test_the_heavy_mode_works_at_a_depth_of_one(capsys: pytest.CaptureFixture[st
 
 
 def test_the_heavy_mode_does_not_report_its_own_bookkeeping(capsys: pytest.CaptureFixture[str]) -> None:
+    # Cold caches, as in a fresh worker: otherwise earlier tests have already compiled the patterns.
+    re.purge()
+    vars(fnmatch)["_compile_pattern"].cache_clear()  # fnmatch's private lru_cache of patterns
     profiler = MemoryProfiler(top=50)
     profiler.task_finished(every=1, trace_frames=5)
     capsys.readouterr()
