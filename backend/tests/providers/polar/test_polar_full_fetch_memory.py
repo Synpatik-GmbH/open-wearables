@@ -255,6 +255,55 @@ def test_the_tables_name_every_full_form_type() -> None:
     assert set(FULL_FETCH_ENTRY) == set(data_247_module._FULL_FORM_TYPES)
 
 
+class TestASlowWebhookSend:
+    """Codex on #43 (P1): with webhooks on, each commit handed its batch to a webhook thread and the
+    loop built the next batch at once. A send that is slow (Redis degraded) kept every batch alive
+    in its thread. The batched save sends each batch's webhooks before it builds the next."""
+
+    def test_does_not_hold_the_saved_batches(
+        self, db: Session, data_247: Polar247Data, polar: DensePolar, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        polar.serve = {CONTINUOUS_HR}
+        # 28 days of 400 at 1000 a batch: nine batches of three days, then the last day alone.
+        monkeypatch.setattr(data_247_module, "_SAVE_BATCH", 1000, raising=False)
+        stuck: list[tuple] = []
+        sent: list[int] = []
+        seen: list[int] = []
+        real = timeseries_service.bulk_create_samples
+
+        class StuckThread:
+            """A webhook thread that never gets to run: it holds its batch, as a blocked send would."""
+
+            def __init__(self, target: Any, args: tuple, daemon: bool) -> None:  # noqa: ARG002
+                stuck.append(args)
+
+            def start(self) -> None:
+                pass
+
+        def emit(**kw: Any) -> None:
+            sent.append(kw["sample_count"])
+
+        def spy(db: Session, samples: Any, **kwargs: Any) -> Any:
+            gc.collect()
+            seen.append(sum(1 for o in gc.get_objects() if type(o) is TimeSeriesSampleCreate))
+            return real(db, samples, **kwargs)
+
+        user_id = _polar_user(db)
+        with (
+            patch("app.services.timeseries_service.svix_service.is_enabled", return_value=True),
+            patch("app.services.timeseries_service.threading.Thread", StuckThread),
+            patch("app.services.timeseries_service.on_timeseries_batch_saved", new=emit),
+            patch.object(timeseries_service, "bulk_create_samples", new=spy),
+            patch.object(Polar247Data, "_save_missing_sleep", return_value=0),
+        ):
+            result = data_247.load_and_save_all(db, user_id)
+
+        assert result["continuous_hr"] == DAYS * PER_DAY
+        assert stuck == []
+        assert sum(sent) == DAYS * PER_DAY
+        assert max(seen) <= 1000 + PER_DAY
+
+
 class TestEverySeriesTypeIsSavedRecordByRecord:
     @pytest.mark.parametrize(("data_type", "served"), BATCHED.items())
     def test_a_batch_of_one_saves_each_record_on_its_own(

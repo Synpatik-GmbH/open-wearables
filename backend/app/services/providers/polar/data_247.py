@@ -955,12 +955,16 @@ class Polar247Data(Base247DataTemplate):
     # Persistence helpers
     # -------------------------------------------------------------------------
 
-    def _save_timeseries(self, db: DbSession, samples: list[TimeSeriesSampleCreate]) -> int:
+    def _save_timeseries(
+        self, db: DbSession, samples: list[TimeSeriesSampleCreate], *, emit_inline: bool = False
+    ) -> int:
         counts: int = 0
         if samples:
             # FORK (2.96.6.1): every pull re-reads Polar's whole served window, so only the
             # samples the save actually wrote go out as webhooks.
-            counts = timeseries_service.bulk_create_samples(db, samples, emit_only_written=True)
+            counts = timeseries_service.bulk_create_samples(
+                db, samples, emit_only_written=True, emit_inline=emit_inline
+            )
         return counts
 
     def _save_timeseries_in_batches(
@@ -979,11 +983,12 @@ class Polar247Data(Base247DataTemplate):
         while raw_items:
             pending.extend(normalize([raw_items.pop()], user_id))
             if len(pending) >= _SAVE_BATCH:
-                counts += self._save_timeseries(db, pending)
+                # emit_inline: the batch's webhooks are queued before the next batch is built.
+                counts += self._save_timeseries(db, pending, emit_inline=True)
                 db.commit()
                 pending = []
         if pending:
-            counts += self._save_timeseries(db, pending)
+            counts += self._save_timeseries(db, pending, emit_inline=True)
             db.commit()
         return counts
 

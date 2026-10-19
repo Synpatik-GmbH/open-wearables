@@ -129,12 +129,18 @@ class TimeSeriesService(
         samples: (list[TimeSeriesSampleCreate] | list[HeartRateSampleCreate] | list[StepSampleCreate]),
         *,
         emit_only_written: bool = False,
+        emit_inline: bool = False,
     ) -> WriteCounts:
         """Upsert the samples and, after commit, emit their webhooks.
 
         FORK (2.96.6.1): with ``emit_only_written`` the webhooks carry only the samples the
         merge actually inserted or changed, so re-reading an already-stored window sends
         nothing for it. Opt-in per call: every other caller still emits every sample it hands in.
+
+        FORK: with ``emit_inline`` the webhooks are handed off inside the commit instead of on a
+        thread, so the commit returns only once they are queued. A caller that saves batch after
+        batch then holds one batch at a time however slow the send is (Codex on #43); every other
+        caller keeps the thread.
         """
         counts = self.crud.bulk_create(db_session, samples)  # ty:ignore[invalid-argument-type]
         written = getattr(counts, "written_ids", None)
@@ -153,6 +159,9 @@ class TimeSeriesService(
         def _start_webhook_thread(session: DbSession) -> None:  # noqa: ARG001
             batch = pending.pop()
             if not svix_service.is_enabled():
+                return
+            if emit_inline:
+                self._emit_timeseries_webhooks(batch)
                 return
             threading.Thread(
                 target=self._emit_timeseries_webhooks,
