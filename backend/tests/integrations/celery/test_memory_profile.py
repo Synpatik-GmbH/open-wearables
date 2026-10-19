@@ -71,6 +71,7 @@ def test_the_top_lines_name_where_memory_grew(capsys: pytest.CaptureFixture[str]
     (grown,) = [line for line in report["top"] if "test_memory_profile.py" in line["where"]]
     assert grown["growth_kib"] >= 4096
     assert report["top"][0] == grown  # the largest growth is listed first
+    assert len(report["top"]) == 5
 
 
 def test_concurrent_tasks_are_each_counted_once(capsys: pytest.CaptureFixture[str]) -> None:
@@ -90,15 +91,18 @@ def test_concurrent_tasks_are_each_counted_once(capsys: pytest.CaptureFixture[st
     assert sorted(report["tasks"] for report in _reports(capsys)) == list(range(10, 201, 10))
 
 
-def test_a_forked_child_starts_its_own_count(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_a_forked_child_starts_its_own_count(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     # The CPU worker's prefork children inherit the parent's state; each counts on its own.
     profiler = MemoryProfiler()
     profiler.task_finished(every=2)
 
     monkeypatch.setattr(memory_profile.os, "getpid", lambda: -1)
-    profiler.task_finished(every=2)
-    profiler.task_finished(every=2)
+    for _ in range(3):
+        profiler.task_finished(every=2)
 
+    # Counting on from the parent's one task would report at 2 and again at 4.
     assert [(report["pid"], report["tasks"]) for report in _reports(capsys)] == [(-1, 2)]
 
 
