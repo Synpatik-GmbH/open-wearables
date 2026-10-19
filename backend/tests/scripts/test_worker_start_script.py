@@ -157,8 +157,7 @@ def _argv(log: Path, name: str) -> list[str]:
     return line.split()[2:]
 
 
-def _option(argv: list[str], option: str) -> str:
-    return argv[argv.index(option) + 1]
+_CELERY = ["run", "celery", "-A", "app.main:celery_app", "worker", "--loglevel=info"]
 
 
 def _timer_durations(log: Path) -> list[str]:
@@ -199,9 +198,12 @@ def test_the_container_stops_when_either_worker_exits(tmp_path: Path, dies: str,
 
 def test_the_container_stops_even_when_a_worker_exits_cleanly(tmp_path: Path) -> None:
     # A worker that exits 0 is still gone; the container must not keep running half-staffed.
-    proc, _ = _start(tmp_path, io="exit:0", cpu="run")
+    proc, log = _start(tmp_path, io="exit:0", cpu="run")
+    survivor = _pid_of(log, "cpu")
 
     assert _exit_status(proc) != 0
+    _wait_for(log, "cpu term")  # stopped like any other survivor, not orphaned
+    assert not _alive(survivor)
 
 
 @pytest.mark.parametrize(("dies", "survives"), [("io", "cpu"), ("cpu", "io")])
@@ -218,6 +220,20 @@ def test_a_survivor_that_ignores_term_is_killed_after_the_grace(tmp_path: Path, 
     # The survivor got the whole configured grace before the kill.
     assert _timer_durations(log) == ["1"]
     assert time.monotonic() - started >= 1
+
+
+@pytest.mark.parametrize("grace", ["0", "2", "10"])
+def test_the_grace_is_the_configured_whole_seconds(tmp_path: Path, grace: str) -> None:
+    proc, log = _start(tmp_path, io="exit:3", cpu="ignore-term", grace=grace)
+    survivor = _pid_of(log, "cpu")
+    try:
+        _wait_for(log, f"timer sleep {grace}")
+        assert _timer_durations(log) == [grace]
+        assert "is not a whole number of seconds" not in (tmp_path / "stderr.log").read_text()
+    finally:
+        if _alive(survivor):
+            os.kill(survivor, signal.SIGKILL)
+        _exit_status(proc, timeout=15)
 
 
 def test_sigterm_is_bounded_by_the_grace_too(tmp_path: Path) -> None:
@@ -309,9 +325,7 @@ def test_a_dedicated_worker_runs_only_its_own_queues(tmp_path: Path) -> None:
     assert _exit_status(proc) == 0
     events = [line for line in log.read_text().splitlines() if line.split()[1] in ("start", "exit")]
     assert events == ["io start", "io exit"]
-    argv = _argv(log, "io")
-    assert _option(argv, "-Q") == "webhook_sync"
-    assert "--pool=threads" in argv
+    assert _argv(log, "io") == [*_CELERY, "--pool=threads", "-Q", "webhook_sync", "-n", "io@%h"]
 
 
 def test_each_worker_consumes_its_own_queues(tmp_path: Path) -> None:
@@ -321,8 +335,6 @@ def test_each_worker_consumes_its_own_queues(tmp_path: Path) -> None:
     finally:
         _stop(proc)
 
-    assert _option(io, "-Q") == "default,sdk_sync,garmin_sync,webhook_sync"
-    assert "--pool=threads" in io
-    assert _option(cpu, "-Q") == "xml_sync"
-    assert "--pool=prefork" in cpu
-    assert "--concurrency=2" in cpu
+    # The whole command: a second -Q, or any other change, would change what the worker consumes.
+    assert io == [*_CELERY, "--pool=threads", "-Q", "default,sdk_sync,garmin_sync,webhook_sync", "-n", "io@%h"]
+    assert cpu == [*_CELERY, "--pool=prefork", "--concurrency=2", "-Q", "xml_sync", "-n", "cpu@%h"]
