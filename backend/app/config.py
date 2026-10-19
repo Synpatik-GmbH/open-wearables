@@ -135,6 +135,10 @@ class Settings(BaseSettings):
     workout_zone_target_completeness: float = 0.95  # emit once the trace is this complete
     workout_zone_hard_cap_seconds: int = 5  # emit whatever we have past this elapsed
 
+    # FORK diagnostic: every Celery worker process logs a memory report per this many finished
+    # tasks (app/integrations/celery/memory_profile.py). 0 = off; tracemalloc slows allocation.
+    celery_memory_profile_every: int = 0
+
     # Default 24/7 data granularity (raw | hourly | daily) for providers that support it,
     # used when a provider has no explicit ProviderSetting.data_granularity.
     # DANGER: anything but raw halts Google Health 24/7 ingestion. Its rollUp operation is
