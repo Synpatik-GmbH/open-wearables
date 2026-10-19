@@ -47,6 +47,7 @@ from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEve
 from app.services.sdk.import_service import import_service
 from app.services.sync_error_code import (
     ALL_SUBTASKS_FAILED,
+    POLAR_FULL_FETCH_INTERRUPTED,
     POLAR_SLEEP_LISTING_MALFORMED,
     POLAR_USER_ID_MISSING,
     PULL_CLAIM_FAILED,
@@ -86,6 +87,7 @@ class TestErrorCode:
             # words stayed green while the outcome it names became "unclassified".
             POLAR_USER_ID_MISSING,
             PULL_CLAIM_FAILED,
+            POLAR_FULL_FETCH_INTERRUPTED,
             UNKNOWN,
             UNCLASSIFIED,
         ],

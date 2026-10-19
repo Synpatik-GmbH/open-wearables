@@ -37,7 +37,7 @@ from datetime import datetime, timedelta
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import case, literal, type_coerce
+from sqlalchemy import case, literal, select, type_coerce, update
 from sqlalchemy.dialects.postgresql import JSONB, insert
 
 from app.database import DbSession
@@ -132,12 +132,15 @@ def record_full_fetch(db: DbSession, connection_id: UUID, data_type: str, now: d
     db.commit()
 
 
-def record_full_failure(db: DbSession, connection_id: UUID, data_type: str, now: datetime) -> None:
+def record_full_failure(
+    db: DbSession, connection_id: UUID, data_type: str, now: datetime, *, started: bool = False
+) -> None:
     """``data_type`` failed in full at ``now``: it is not asked for again until its gap has passed.
 
     The gap is ``RETRY_FIRST_GAP`` after the first failure in a row and doubles with each one
     after, up to ``RETRY_MAX_GAP``. A connection's pulls are one at a time (``claim_pull``), so
-    reading the count and writing the next one is not raced.
+    reading the count and writing the next one is not raced. ``started`` is
+    ``record_full_start``'s.
     """
     state = db.get(PolarPullState, connection_id)
     previous = ((state.full_retry if state is not None else None) or {}).get(data_type)
@@ -145,7 +148,10 @@ def record_full_failure(db: DbSession, connection_id: UUID, data_type: str, now:
     if not isinstance(failures, int) or failures < 0:
         failures = 0
     gap = min(RETRY_FIRST_GAP * (2 ** min(failures, 16)), RETRY_MAX_GAP)
-    entry = type_coerce({data_type: {"failures": failures + 1, "next": (now + gap).isoformat()}}, JSONB)
+    value: dict[str, object] = {"failures": failures + 1, "next": (now + gap).isoformat()}
+    if started:
+        value["started"] = now.isoformat()
+    entry = type_coerce({data_type: value}, JSONB)
     stmt = insert(PolarPullState).values(user_connection_id=connection_id, full_retry=entry)
     stmt = stmt.on_conflict_do_update(
         index_elements=[PolarPullState.user_connection_id],
@@ -153,6 +159,42 @@ def record_full_failure(db: DbSession, connection_id: UUID, data_type: str, now:
     )
     db.execute(stmt)
     db.commit()
+
+
+def record_full_start(db: DbSession, connection_id: UUID, data_type: str, now: datetime) -> None:
+    """A full fetch of ``data_type`` starts at ``now``. It counts as failed until it ends: the
+    failure and its gap are recorded now, with a ``started`` marker. A success clears the entry
+    (``record_full_fetch``); a failure the pull caught keeps the gap and drops the marker
+    (``record_full_end``). A marker still there on a later pull is a fetch that never ended: its
+    worker was killed (prod, 16-19 Oct 2026, out of memory), and without the gap recorded up front
+    every hourly pull started it again."""
+    record_full_failure(db, connection_id, data_type, now, started=True)
+
+
+def record_full_end(db: DbSession, connection_id: UUID, data_type: str) -> None:
+    """The full fetch of ``data_type`` ended, its failure already recorded: drop its ``started``
+    marker, keeping the gap."""
+    state = db.execute(
+        select(PolarPullState.full_retry).where(PolarPullState.user_connection_id == connection_id)
+    ).scalar_one_or_none()
+    entry = (state or {}).get(data_type)
+    if not isinstance(entry, dict) or "started" not in entry:
+        return
+    kept = type_coerce({data_type: {k: v for k, v in entry.items() if k != "started"}}, JSONB)
+    db.execute(
+        update(PolarPullState)
+        .where(PolarPullState.user_connection_id == connection_id)
+        .values(full_retry=PolarPullState.full_retry.op("||")(kept))
+    )
+    db.commit()
+
+
+def interrupted_full_fetches(db: DbSession, connection_id: UUID) -> frozenset[str]:
+    """The data types whose last full fetch started and never ended (see ``record_full_start``)."""
+    state = db.execute(
+        select(PolarPullState.full_retry).where(PolarPullState.user_connection_id == connection_id)
+    ).scalar_one_or_none()
+    return frozenset(t for t, e in (state or {}).items() if isinstance(e, dict) and "started" in e)
 
 
 def claim_on_open(db: DbSession, connection_id: UUID, now: datetime) -> str | None:
@@ -209,6 +251,9 @@ __all__ = [
     "claim_on_open",
     "claim_pull",
     "full_due",
+    "interrupted_full_fetches",
+    "record_full_end",
     "record_full_failure",
     "record_full_fetch",
+    "record_full_start",
 ]

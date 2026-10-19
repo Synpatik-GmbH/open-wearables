@@ -40,6 +40,9 @@ POLAR_SLEEP_LISTING_MALFORMED = "polar_sleep_listing_malformed"
 # FORK (2.96.6.1): a provider's call budget could not be recorded, so its pull was skipped.
 PULL_CLAIM_FAILED = "pull_claim_failed"
 
+# FORK: a Polar full fetch started on an earlier pull and never ended; its worker was killed.
+POLAR_FULL_FETCH_INTERRUPTED = "polar_full_fetch_interrupted"
+
 _FIXED_WORDS = frozenset(
     {
         UNCLASSIFIED,
@@ -49,6 +52,7 @@ _FIXED_WORDS = frozenset(
         POLAR_USER_ID_MISSING,
         POLAR_SLEEP_LISTING_MALFORMED,
         PULL_CLAIM_FAILED,
+        POLAR_FULL_FETCH_INTERRUPTED,
     }
 )
 
