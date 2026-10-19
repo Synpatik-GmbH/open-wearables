@@ -18,7 +18,7 @@ from app.integrations.celery import memory_profile
 from app.integrations.celery.memory_profile import MemoryProfiler, parse_malloc_info
 
 # Allocations held across reports, so the profiler has growth to find.
-_held: list[bytes] = []
+_held: list[bytes | str] = []
 
 _has_malloc_info = memory_profile.read_malloc_info() is not None
 needs_glibc = pytest.mark.skipif(not _has_malloc_info, reason="no glibc malloc_info here")
