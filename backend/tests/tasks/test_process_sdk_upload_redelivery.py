@@ -40,8 +40,16 @@ class _WorkerKilled(BaseException):
     """Stands in for the kernel's SIGKILL: nothing after it in the task runs."""
 
 
-def _key(batch_id: str) -> str:
-    return f"sdk_upload:deliveries:{batch_id}"
+def _key(batch_id: str, attempt: int = 0) -> str:
+    return f"sdk_upload:deliveries:{batch_id}:{attempt}"
+
+
+def _three_kills_then_deliver(task_env: dict[str, MagicMock], user_id: Any, batch_id: str, **batch: Any) -> dict:
+    task_env["importer"].import_data_from_request.side_effect = _WorkerKilled()
+    for _ in range(SDK_UPLOAD_MAX_DELIVERIES):
+        with pytest.raises(_WorkerKilled):
+            _run(user_id, batch_id, **batch)
+    return _run(user_id, batch_id, **batch)
 
 
 def _run(user_id: Any, batch_id: str, content: str = '{"data":{"sleep":[]}}', **batch: Any) -> dict:
@@ -110,8 +118,47 @@ class TestDeliveryCap:
         assert recorded["error"] == SDK_IMPORT_FAILED
         assert recorded["metadata"] == {"batch_id": batch_id, "cause": SDK_UPLOAD_DELIVERY_CAP}
         task_env["retry"].assert_not_called()
-        # Refused and acknowledged, so the count goes with it.
-        assert get_redis_client().exists(_key(batch_id)) == 0
+        # Codex P1, PR #44: kept until it expires, because the refusal is acknowledged only when the
+        # task returns; a worker killed before that hands the message back as a first delivery.
+        assert get_redis_client().get(_key(batch_id)) == str(SDK_UPLOAD_MAX_DELIVERIES + 1)
+        assert get_redis_client().ttl(_key(batch_id)) > 0
+
+    def test_a_refused_batch_delivered_again_is_refused_again(self, task_env: dict[str, MagicMock]) -> None:
+        """A kill between the refusal and its acknowledgement brings the message back."""
+        user = UserFactory()
+        batch_id = str(uuid4())
+        assert _three_kills_then_deliver(task_env, user.id, batch_id)["reason"] == SDK_UPLOAD_DELIVERY_CAP
+
+        again = _run(user.id, batch_id)
+
+        assert again["reason"] == SDK_UPLOAD_DELIVERY_CAP
+        assert task_env["importer"].import_data_from_request.call_count == SDK_UPLOAD_MAX_DELIVERIES
+
+    def test_the_refusal_is_logged_under_a_fixed_message(self, task_env: dict[str, MagicMock]) -> None:
+        """Codex P1, PR #44 (backend/AGENTS.md): one queryable event, its variables as attributes."""
+        user = UserFactory()
+        with patch(f"{_MODULE}.log_structured") as logged:
+            _three_kills_then_deliver(task_env, user.id, str(uuid4()))
+
+        refusals = [c for c in logged.call_args_list if c.kwargs.get("action") == SDK_UPLOAD_DELIVERY_CAP]
+        assert len(refusals) == 1
+        assert refusals[0].args[2] == "SDK batch refused after its killed deliveries"
+        assert refusals[0].kwargs["provider"] == "apple"
+        assert refusals[0].kwargs["deliveries"] == SDK_UPLOAD_MAX_DELIVERIES + 1
+        assert refusals[0].kwargs["max_deliveries"] == SDK_UPLOAD_MAX_DELIVERIES
+
+    def test_redeliveries_of_one_attempt_share_its_count(self, task_env: dict[str, MagicMock]) -> None:
+        """A message delivered again carries the same retries number, so its kills add up."""
+        user = UserFactory()
+        batch_id = str(uuid4())
+        process_sdk_upload.push_request(retries=2)
+        try:
+            result = _three_kills_then_deliver(task_env, user.id, batch_id)
+        finally:
+            process_sdk_upload.pop_request()
+
+        assert result["reason"] == SDK_UPLOAD_DELIVERY_CAP
+        assert get_redis_client().keys("sdk_upload:*") == [_key(batch_id, 2)]
 
     def test_the_count_holds_a_number_and_expires_within_a_day(self, task_env: dict[str, MagicMock]) -> None:
         """Data-protection condition: identifiers and a number only, and it expires."""
@@ -232,6 +279,38 @@ class TestEveryOtherExitResetsTheCount:
 
         assert importer.call_count == 4
         assert result["status_code"] == 200
+        task_env["failed"].assert_not_called()
+
+    def test_a_retry_is_processed_even_when_the_reset_before_it_failed(self, task_env: dict[str, MagicMock]) -> None:
+        """Codex P2, PR #44: two kills, then a retryable failure whose reset Redis refuses. The
+        retry is another attempt with its own count, so the stale count cannot refuse it."""
+        user = UserFactory()
+        batch_id = str(uuid4())
+        importer = task_env["importer"].import_data_from_request
+        importer.side_effect = [
+            _WorkerKilled(),
+            _WorkerKilled(),
+            UploadDataResponse(status_code=400, response="Import failed: OperationalError", retryable=True),
+            _OK,
+        ]
+        for _ in range(2):
+            with pytest.raises(_WorkerKilled):
+                _run(user.id, batch_id)
+        with (
+            patch.object(get_redis_client(), "delete", side_effect=ConnectionError("redis blip")),
+            pytest.raises(Retry),
+        ):
+            _run(user.id, batch_id)
+        assert get_redis_client().get(_key(batch_id, 0)) == "3"
+
+        process_sdk_upload.push_request(retries=1)
+        try:
+            result = _run(user.id, batch_id)
+        finally:
+            process_sdk_upload.pop_request()
+
+        assert result["status_code"] == 200
+        assert importer.call_count == 4
         task_env["failed"].assert_not_called()
 
 

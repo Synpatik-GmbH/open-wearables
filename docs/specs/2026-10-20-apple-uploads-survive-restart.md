@@ -59,7 +59,8 @@ Source: read-only check relayed 20 Oct 2026 (OW at `5965a10f`, tag 0.9.0-syn.8):
 
 ## 9. Build decisions (Andrei, 20 Oct 2026)
 
-- C1 counts **consecutive killed deliveries**. The count is reset on every exit that is not a kill: success, recorded failure, scheduled retry, early return, raised exception. A count of every start would collide with the five in-task retries of 2.96.6.1.
-- The count lives in Redis under `sdk_upload:deliveries:<batch_id>`, an integer only, with a 24-hour expiry refreshed on every delivery.
-- A refused delivery is recorded with error `sdk_import_failed` and cause `sdk_upload_delivery_cap`.
+- C1 counts **consecutive killed deliveries of one attempt**. The count is reset on every exit that is not a kill: success, recorded failure, scheduled retry, early return, raised exception. A count of every start would collide with the five in-task retries of 2.96.6.1.
+- The count lives in Redis under `sdk_upload:deliveries:<batch_id>:<retries>`, an integer only, with a 24-hour expiry refreshed on every delivery. A scheduled retry is a new attempt and starts a fresh count; a redelivered message keeps its retries number (Codex P2 on PR #44, decided 20 Oct 2026).
+- A refused delivery is recorded with error `sdk_import_failed` and cause `sdk_upload_delivery_cap`. Its count is kept until it expires, so a kill before the refusal is acknowledged cannot reset the cap (Codex P1 on PR #44, decided 20 Oct 2026).
+- Known limit, accepted (Codex P1 on PR #44, decided 20 Oct 2026): with `SDK_PAYLOAD_S3_OFFLOAD=true` and `RAW_PAYLOAD_STORAGE=disabled`, a kill between the transport payload's delete and the acknowledgement brings the batch back without its payload, and it is recorded failed although its data is stored. Offload defaults to off and nothing in calibra-ow-deploy turns it on; revisit before it is turned on.
 - Worst case: an upload that itself kills the worker kills it three times (deliveries 1 to 3); delivery 4 is refused and recorded failed. Before this change it killed it once and was lost.

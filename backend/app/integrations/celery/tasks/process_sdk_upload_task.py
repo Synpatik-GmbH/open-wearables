@@ -90,27 +90,30 @@ SDK_IMPORT_RETRY_BASE_SECONDS = 30
 # timeout has passed: an hour by default). A batch that itself kills the worker would then kill it
 # on every delivery. So each delivery counts itself in Redis before doing anything, every exit that
 # is not a kill resets the count, and a delivery that finds the three before it all killed is
-# recorded failed instead of processed. In-task retries are not deliveries the worker died in: a
-# scheduled retry resets the count like any other exit, so the 2.96.6.1 retries keep their five.
+# recorded failed instead of processed. In-task retries are not deliveries the worker died in: each
+# attempt (Celery's retries number, the same on every redelivery of one message) has its own count,
+# so a scheduled retry starts at zero and the 2.96.6.1 retries keep their five, even when the reset
+# of the attempt before could not be written.
 SDK_UPLOAD_MAX_DELIVERIES = 3
 # Refreshed on every delivery, so the count outlives the wait for the next one. Twenty-four hours
-# is the parent spec's bound for late data (2.96.6 AC2). The count is deleted when the batch ends,
-# so the expiry only clears a count whose batch was lost from the broker.
+# is the parent spec's bound for late data (2.96.6 AC2). The count is deleted when the attempt ends
+# below the cap; a refused attempt keeps it, so the expiry clears that one and any count whose
+# batch was lost from the broker.
 SDK_UPLOAD_DELIVERY_TTL_SECONDS = 24 * 3600
 
 
-def _delivery_key(batch_id: str) -> str:
-    # The batch id and, as the value, a number: nothing else (spec section 8).
-    return f"sdk_upload:deliveries:{batch_id}"
+def _delivery_key(batch_id: str, attempt: int) -> str:
+    # The batch id, the attempt number and, as the value, a number: nothing else (spec section 8).
+    return f"sdk_upload:deliveries:{batch_id}:{attempt}"
 
 
-def _count_delivery(batch_id: str) -> int | None:
+def _count_delivery(batch_id: str, attempt: int) -> int | None:
     """Count this delivery of the batch. None when the count cannot be kept.
 
     A batch whose count cannot be kept is processed, not refused: the cap protects the worker, and
     losing the batch is the failure this task exists to prevent.
     """
-    key = _delivery_key(batch_id)
+    key = _delivery_key(batch_id, attempt)
     try:
         pipe = get_redis_client().pipeline()
         pipe.incr(key)
@@ -129,10 +132,16 @@ def _count_delivery(batch_id: str) -> int | None:
         return None
 
 
-def _end_deliveries(batch_id: str) -> None:
-    """The batch's delivery ended without a kill, so the count of killed deliveries starts again."""
+def _end_deliveries(batch_id: str, attempt: int, deliveries: int | None) -> None:
+    """The attempt's delivery ended without a kill, so its count of killed deliveries starts again.
+
+    Not after a refusal: the refusal is acknowledged only once the task returns, and a worker killed
+    before that would hand the message back with no count, as a first delivery. The expiry clears it.
+    """
+    if deliveries is not None and deliveries > SDK_UPLOAD_MAX_DELIVERIES:
+        return
     try:
-        get_redis_client().delete(_delivery_key(batch_id))
+        get_redis_client().delete(_delivery_key(batch_id, attempt))
     except Exception as e:
         log_structured(
             logger,
@@ -229,7 +238,8 @@ def process_sdk_upload(
 
     # FORK (2.96.6.3, spec C1): counted before anything else, so a delivery that dies at any point
     # is counted. A kill ends the thread without running the lines below; every other exit does.
-    deliveries = _count_delivery(batch_id)
+    attempt = self.request.retries
+    deliveries = _count_delivery(batch_id, attempt)
     try:
         result = _process_sdk_upload(
             self,
@@ -245,9 +255,9 @@ def process_sdk_upload(
         )
     except Exception:
         # A scheduled retry (celery's Retry is an Exception) or an error: not a kill.
-        _end_deliveries(batch_id)
+        _end_deliveries(batch_id, attempt, deliveries)
         raise
-    _end_deliveries(batch_id)
+    _end_deliveries(batch_id, attempt, deliveries)
     return result
 
 
@@ -292,12 +302,13 @@ def _process_sdk_upload(
         log_structured(
             logger,
             "warning",
-            f"{provider.capitalize()} batch refused after {SDK_UPLOAD_MAX_DELIVERIES} killed deliveries",
+            "SDK batch refused after its killed deliveries",
             provider=provider,
             action=SDK_UPLOAD_DELIVERY_CAP,
             batch_id=batch_id,
             user_id=user_id,
             deliveries=deliveries,
+            max_deliveries=SDK_UPLOAD_MAX_DELIVERIES,
         )
         emit_sync_failed(
             user_uuid,
