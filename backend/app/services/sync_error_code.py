@@ -43,6 +43,10 @@ PULL_CLAIM_FAILED = "pull_claim_failed"
 # FORK: a Polar full fetch started on an earlier pull and never ended; its worker was killed.
 POLAR_FULL_FETCH_INTERRUPTED = "polar_full_fetch_interrupted"
 
+# FORK (2.96.6.3, spec C1): an SDK batch whose three deliveries before were each killed before
+# they ended is refused, not processed again.
+SDK_UPLOAD_DELIVERY_CAP = "sdk_upload_delivery_cap"
+
 _FIXED_WORDS = frozenset(
     {
         UNCLASSIFIED,
@@ -53,6 +57,7 @@ _FIXED_WORDS = frozenset(
         POLAR_SLEEP_LISTING_MALFORMED,
         PULL_CLAIM_FAILED,
         POLAR_FULL_FETCH_INTERRUPTED,
+        SDK_UPLOAD_DELIVERY_CAP,
     }
 )
 

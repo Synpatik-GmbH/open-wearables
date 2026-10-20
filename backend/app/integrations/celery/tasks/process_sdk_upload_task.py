@@ -8,6 +8,7 @@ from celery import Task, shared_task
 from app.config import settings
 from app.constants.sdk_providers import sdk_providers
 from app.database import SessionLocal
+from app.integrations.redis_client import get_redis_client
 from app.models import User
 from app.repositories.user_repository import UserRepository
 from app.schemas.sync_status import (
@@ -24,7 +25,7 @@ from app.services.sdk.import_service import (
 from app.services.sdk.import_service import (
     import_service as sdk_import_service,
 )
-from app.services.sync_error_code import SDK_IMPORT_FAILED, error_code
+from app.services.sync_error_code import SDK_IMPORT_FAILED, SDK_UPLOAD_DELIVERY_CAP, error_code
 from app.services.sync_status_service import (
     emit_sync_completed,
     emit_sync_failed,
@@ -84,6 +85,74 @@ SDK_IMPORT_MAX_RETRIES = 5
 SDK_IMPORT_RETRY_BASE_SECONDS = 30
 
 
+# FORK (2.96.6.3, spec C1): the delivery cap. The task is acknowledged only when it ends, so a
+# batch whose worker is killed in the middle is delivered again (by Kombu, once the visibility
+# timeout has passed: an hour by default). A batch that itself kills the worker would then kill it
+# on every delivery. So each delivery counts itself in Redis before doing anything, every exit that
+# is not a kill resets the count, and a delivery that finds the three before it all killed is
+# recorded failed instead of processed. In-task retries are not deliveries the worker died in: each
+# attempt (Celery's retries number, the same on every redelivery of one message) has its own count,
+# so a scheduled retry starts at zero and the 2.96.6.1 retries keep their five, even when the reset
+# of the attempt before could not be written.
+SDK_UPLOAD_MAX_DELIVERIES = 3
+# Refreshed on every delivery, so the count outlives the wait for the next one. Twenty-four hours
+# is the parent spec's bound for late data (2.96.6 AC2). The count is deleted when the attempt ends
+# below the cap; a refused attempt keeps it, so the expiry clears that one and any count whose
+# batch was lost from the broker.
+SDK_UPLOAD_DELIVERY_TTL_SECONDS = 24 * 3600
+
+
+def _delivery_key(batch_id: str, attempt: int) -> str:
+    # The batch id, the attempt number and, as the value, a number: nothing else (spec section 8).
+    return f"sdk_upload:deliveries:{batch_id}:{attempt}"
+
+
+def _count_delivery(batch_id: str, attempt: int) -> int | None:
+    """Count this delivery of the batch. None when the count cannot be kept.
+
+    A batch whose count cannot be kept is processed, not refused: the cap protects the worker, and
+    losing the batch is the failure this task exists to prevent.
+    """
+    key = _delivery_key(batch_id, attempt)
+    try:
+        pipe = get_redis_client().pipeline()
+        pipe.incr(key)
+        pipe.expire(key, SDK_UPLOAD_DELIVERY_TTL_SECONDS)
+        count, _ = pipe.execute()
+        return int(count)
+    except Exception as e:
+        log_structured(
+            logger,
+            "warning",
+            "SDK batch delivery count unavailable; processing without the cap",
+            action="sdk_upload_delivery_count",
+            batch_id=batch_id,
+            error=error_code(e),
+        )
+        return None
+
+
+def _end_deliveries(batch_id: str, attempt: int, deliveries: int | None) -> None:
+    """The attempt's delivery ended without a kill, so its count of killed deliveries starts again.
+
+    Not after a refusal: the refusal is acknowledged only once the task returns, and a worker killed
+    before that would hand the message back with no count, as a first delivery. The expiry clears it.
+    """
+    if deliveries is not None and deliveries > SDK_UPLOAD_MAX_DELIVERIES:
+        return
+    try:
+        get_redis_client().delete(_delivery_key(batch_id, attempt))
+    except Exception as e:
+        log_structured(
+            logger,
+            "warning",
+            "SDK batch delivery count not cleared",
+            action="sdk_upload_delivery_count",
+            batch_id=batch_id,
+            error=error_code(e),
+        )
+
+
 def _retry_delay(retries: int) -> int:
     """Seconds before the next attempt: 30, then twice as long each time."""
     return SDK_IMPORT_RETRY_BASE_SECONDS * 2**retries
@@ -118,7 +187,19 @@ def _retry_or_fail_before_import(
     raise error
 
 
-@shared_task(bind=True, queue="sdk_sync", ignore_result=True, max_retries=SDK_IMPORT_MAX_RETRIES)
+# FORK (2.96.6.3, spec AC1): acks_late, so a batch is acknowledged when it ends rather than when
+# a thread starts it, and a worker killed in the middle leaves it to be delivered again. On this
+# task's worker (--pool=threads) reject_on_worker_lost has no effect: it acts when a prefork child
+# dies. It is set so the task keeps the redelivery if it ever runs on a prefork worker. A batch that
+# raises is still acknowledged (Celery's default), so only a kill brings a batch back.
+@shared_task(
+    bind=True,
+    queue="sdk_sync",
+    ignore_result=True,
+    max_retries=SDK_IMPORT_MAX_RETRIES,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
 def process_sdk_upload(
     self: Task,
     content: str | None,
@@ -149,10 +230,50 @@ def process_sdk_upload(
     Returns:
         Dictionary with status_code and response message
     """
-    # Generate batch_id if not provided (backwards compatibility)
+    # Generate batch_id if not provided (backwards compatibility). FORK (2.96.6.3): the task id
+    # first, because it is the same on every delivery of the message, so the cap still counts a
+    # batch queued without one.
     if not batch_id:
-        batch_id = str(uuid.uuid4())
+        batch_id = self.request.id or str(uuid.uuid4())
 
+    # FORK (2.96.6.3, spec C1): counted before anything else, so a delivery that dies at any point
+    # is counted. A kill ends the thread without running the lines below; every other exit does.
+    attempt = self.request.retries
+    deliveries = _count_delivery(batch_id, attempt)
+    try:
+        result = _process_sdk_upload(
+            self,
+            content,
+            content_type,
+            user_id,
+            provider,
+            batch_id,
+            payload_ref,
+            sync_session_id,
+            sync_type,
+            deliveries,
+        )
+    except Exception:
+        # A scheduled retry (celery's Retry is an Exception) or an error: not a kill.
+        _end_deliveries(batch_id, attempt, deliveries)
+        raise
+    _end_deliveries(batch_id, attempt, deliveries)
+    return result
+
+
+def _process_sdk_upload(
+    task: Task,
+    content: str | None,
+    content_type: str,
+    user_id: str,
+    provider: str,
+    batch_id: str,
+    payload_ref: str | None,
+    sync_session_id: str | None,
+    sync_type: str | None,
+    deliveries: int | None,
+) -> dict[str, Any]:
+    """One delivery of ``process_sdk_upload``, whose arguments it takes, plus this delivery's count."""
     # A historical export spans many batches, so its run is keyed by the device's session
     # id. Without one the batch is its own run, which is why live syncs are not persisted.
     scope = SyncScope.HISTORICAL if sync_type == SyncScope.HISTORICAL and sync_session_id else SyncScope.LIVE
@@ -172,6 +293,34 @@ def process_sdk_upload(
             user_id=user_id,
         )
         return {"status": "error", "reason": "invalid_user_id", "batch_id": batch_id}
+
+    # FORK (2.96.6.3, spec C1, AC3): the three deliveries before this one were each killed before
+    # they ended, so this batch is what kills the worker. Recorded failed, with codes only, and
+    # acknowledged without loading or importing anything. The S3 payload is kept, as for any
+    # failed batch.
+    if deliveries is not None and deliveries > SDK_UPLOAD_MAX_DELIVERIES:
+        log_structured(
+            logger,
+            "warning",
+            "SDK batch refused after its killed deliveries",
+            provider=provider,
+            action=SDK_UPLOAD_DELIVERY_CAP,
+            batch_id=batch_id,
+            user_id=user_id,
+            deliveries=deliveries,
+            max_deliveries=SDK_UPLOAD_MAX_DELIVERIES,
+        )
+        emit_sync_failed(
+            user_uuid,
+            provider,
+            SyncSource.SDK,
+            scope=scope,
+            run_id=run_id,
+            error=SDK_IMPORT_FAILED,
+            message=f"{provider.capitalize()} batch refused after {SDK_UPLOAD_MAX_DELIVERIES} killed deliveries",
+            metadata={"batch_id": batch_id, "cause": SDK_UPLOAD_DELIVERY_CAP},
+        )
+        return {"status": "error", "reason": SDK_UPLOAD_DELIVERY_CAP, "batch_id": batch_id}
 
     # FORK (2.96.6.1, spec 3.3): the SDK holds its 202 for this batch and never re-sends it, so a
     # failure in a step before the import is retried like a failed import. The S3 payload stays
@@ -221,7 +370,7 @@ def process_sdk_upload(
                 )
                 return {"status": "skipped", "reason": "user_not_found", "batch_id": batch_id}
     except Exception as e:
-        _retry_or_fail_before_import(self, e, user_uuid, provider, scope, run_id, batch_id)
+        _retry_or_fail_before_import(task, e, user_uuid, provider, scope, run_id, batch_id)
 
     # Log task start
     log_structured(
@@ -250,7 +399,7 @@ def process_sdk_upload(
         try:
             user_connection_service.ensure_sdk_connection(db, user_uuid, provider)
         except Exception as e:
-            _retry_or_fail_before_import(self, e, user_uuid, provider, scope, run_id, batch_id)
+            _retry_or_fail_before_import(task, e, user_uuid, provider, scope, run_id, batch_id)
 
         # Select the appropriate import service based on source
         import_service = _get_import_service(provider)
@@ -317,8 +466,8 @@ def process_sdk_upload(
                 # keeps its payload for diagnosis.
                 delete_payload_from_s3(payload_ref)
         else:
-            if result.get("retryable") and self.request.retries < self.max_retries:
-                raise self.retry(countdown=_retry_delay(self.request.retries))
+            if result.get("retryable") and task.request.retries < task.max_retries:
+                raise task.retry(countdown=_retry_delay(task.request.retries))
             emit_sync_failed(
                 user_uuid,
                 provider,
