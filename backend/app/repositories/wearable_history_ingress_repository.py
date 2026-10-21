@@ -231,7 +231,7 @@ class WearableHistoryIngressRepository:
             if (
                 not nights
                 and calendar == source.start_date - timedelta(days=1)
-                and night_placement(instant, None) == (True, source.start_date)
+                and night_placement(instant, getattr(sample, "zone_offset", None)) == (True, source.start_date)
             ):
                 raise FirstNightAssociationUnavailableError("First-night sleep interval has not arrived; retry")
         return calendar >= source.start_date

@@ -37,6 +37,10 @@ from app.services.providers.garmin.workouts import GarminWorkouts
 from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
 from app.services.raw_payload_storage import store_raw_payload
 from app.utils.structured_logging import log_structured
+from app.utils.wearable_history_ingress import (
+    FirstNightAssociationUnavailableError,
+    WearableHistoryMetadataUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +272,7 @@ class GarminWebhookHandler(BaseWebhookHandler):
         request_trace_id: str,
     ) -> dict[str, Any]:
         wellness_results: dict[str, Any] = {}
+        retry_error: FirstNightAssociationUnavailableError | WearableHistoryMetadataUnavailableError | None = None
 
         for data_type in WELLNESS_TYPES:
             if not payload.get(data_type):
@@ -284,15 +289,32 @@ class GarminWebhookHandler(BaseWebhookHandler):
                 count=len(items),
             )
 
-            result = process_wellness_items(
-                db, self.connection_repo, self.garmin_247, data_type, items, errors, synced_user_ids, request_trace_id
-            )
+            try:
+                result = process_wellness_items(
+                    db,
+                    self.connection_repo,
+                    self.garmin_247,
+                    data_type,
+                    items,
+                    errors,
+                    synced_user_ids,
+                    request_trace_id,
+                )
+            except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError) as exc:
+                # Finish sibling types so a sleep in this payload can supply proof
+                # before the existing task retry redelivers its earlier samples.
+                retry_error = retry_error or exc
+                continue
             wellness_results[data_type] = {"processed": result["processed"], "saved": result["saved"]}
 
             for uid_str in result.get("succeeded_users", []):
                 if mark_type_success(uid_str, data_type):
                     users_with_new_success.add(uid_str)
 
+        if retry_error is not None:
+            # Persist admitted siblings (including unscored sleep) before retry.
+            db.commit()
+            raise retry_error
         return wellness_results
 
     def _process_lifecycle_events(

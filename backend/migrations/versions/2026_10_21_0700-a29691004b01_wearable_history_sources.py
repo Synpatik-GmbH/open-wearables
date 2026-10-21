@@ -174,7 +174,8 @@ def upgrade() -> None:
             RETURN wh_date_admitted(source_row.user_id,source_row.provider::text,day);
         END $$;
 
-        CREATE FUNCTION wh_sample_admitted(record_source uuid, metric_id integer, instant timestamptz) RETURNS boolean
+        CREATE FUNCTION wh_sample_admitted(record_source uuid, metric_id integer, instant timestamptz,
+            sample_zone text DEFAULT NULL) RETURNS boolean
         LANGUAGE plpgsql AS $$
         DECLARE source_row data_source; boundary wearable_history_sources; metric text; calendar date;
             night date; found_interval boolean := false; admitted_interval boolean := false;
@@ -200,7 +201,8 @@ def upgrade() -> None:
                     END IF;
                 END LOOP;
                 IF found_interval THEN RETURN admitted_interval; END IF;
-                IF calendar=boundary.start_date-1 AND (instant AT TIME ZONE 'Europe/Berlin')::time >= time '18:00' THEN
+                IF calendar=boundary.start_date-1
+                    AND wh_night_day(instant,instant+interval '1 microsecond',sample_zone)=boundary.start_date THEN
                     RAISE EXCEPTION 'First-night association unavailable' USING ERRCODE='23514';
                 END IF;
             END IF;
@@ -226,7 +228,8 @@ def upgrade() -> None:
                 admitted :=
             wh_event_admitted(NEW.data_source_id,NEW.category,NEW.start_datetime,NEW.end_datetime,NEW.zone_offset);
             ELSIF TG_TABLE_NAME='data_point_series' THEN
-                admitted := wh_sample_admitted(NEW.data_source_id,NEW.series_type_definition_id,NEW.recorded_at);
+                admitted := wh_sample_admitted(NEW.data_source_id,NEW.series_type_definition_id,NEW.recorded_at,
+                    NEW.zone_offset);
             ELSIF TG_TABLE_NAME IN ('sleep_details','workout_details') THEN
                 admitted := wh_parent_admitted(NEW.record_id);
             ELSIF TG_TABLE_NAME='health_score' THEN
@@ -307,7 +310,7 @@ def downgrade() -> None:
         "wh_read_archive(uuid,integer,timestamptz,date), wh_archive_ready(uuid,integer,timestamptz), "
         "wh_read_score(uuid,uuid,text,uuid,timestamptz), wh_read_sample(uuid,integer,timestamptz), "
         "wh_read_event(uuid,text,timestamptz,timestamptz,text), wh_read_date(uuid,text,date), "
-        "wh_sample_admitted(uuid,integer,timestamptz), wh_event_admitted(uuid,text,timestamptz,timestamptz,text), "
+        "wh_sample_admitted(uuid,integer,timestamptz,text), wh_event_admitted(uuid,text,timestamptz,timestamptz,text), "
         "wh_date_admitted(uuid,text,date), wh_night_day(timestamptz,timestamptz,text)"
     )
     op.drop_table("wearable_history_sources")

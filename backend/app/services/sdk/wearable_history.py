@@ -145,7 +145,13 @@ def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None
         metric = get_series_type_from_metric_type(item.type or "")
         if metric is None:
             continue
-        sample = SimpleNamespace(user_id=member, provider=provider, series_type=metric, recorded_at=item.startDate)
+        sample = SimpleNamespace(
+            user_id=member,
+            provider=provider,
+            series_type=metric,
+            recorded_at=item.startDate,
+            zone_offset=item.zoneOffset,
+        )
         candidates.append((item, sample))
     gate.prime_samples([sample for _, sample in candidates])
     kept = []

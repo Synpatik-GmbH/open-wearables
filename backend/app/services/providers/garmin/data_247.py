@@ -1870,6 +1870,7 @@ class Garmin247Data(Base247DataTemplate):
         all_sleep_details: list[EventRecordDetailCreate] = []
         all_mct_details: list[MenstrualCycleDetailCreate] = []
         all_health_scores: list[HealthScoreCreate] = []
+        sleep_scores: list[tuple[EventRecordCreate, HealthScoreCreate]] = []
 
         for item in items:
             try:
@@ -1911,8 +1912,8 @@ class Garmin247Data(Base247DataTemplate):
                             record, detail = result
                             all_records.append(record)
                             all_sleep_details.append(detail)
-                        if health_score:
-                            all_health_scores.append(health_score)
+                            if health_score:
+                                sleep_scores.append((record, health_score))
                         for raw_nap in normalized.get("naps", []):
                             nap_result = self._build_nap_record(raw_nap, user_id, normalized.get("garmin_summary_id"))
                             if nap_result:
@@ -2087,6 +2088,11 @@ class Garmin247Data(Base247DataTemplate):
                 event_record_service.bulk_create_details(db, mct_details, detail_type="menstrual_cycle")  # ty:ignore[invalid-argument-type]
 
             count += len(inserted_ids)
+
+        for creator, score in sleep_scores:
+            parent = self.event_record_repo.find_persisted_for_creator(db, creator)
+            if parent is not None:
+                all_health_scores.append(score.model_copy(update={"event_record_id": parent.id}))
 
         if all_health_scores:
             health_score_service.bulk_create(db, all_health_scores)

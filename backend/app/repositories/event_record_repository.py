@@ -255,6 +255,26 @@ class EventRecordRepository(
 
         return list(inserted_ids)
 
+    def find_persisted_for_creator(self, db_session: DbSession, creator: EventRecordCreate) -> EventRecord | None:
+        """Resolve the exact member/source/window after a bulk insert or deduplicated replay."""
+        provider = self.data_source_repo.infer_provider_from_source(creator.source)
+        if creator.provider:
+            provider = ProviderName(creator.provider)
+        return (
+            db_session.query(EventRecord)
+            .join(DataSource)
+            .filter(
+                DataSource.user_id == creator.user_id,
+                DataSource.provider == provider,
+                DataSource.source == creator.source,
+                DataSource.device_model == creator.device_model,
+                EventRecord.category == creator.category,
+                EventRecord.start_datetime == creator.start_datetime,
+                EventRecord.end_datetime == creator.end_datetime,
+            )
+            .first()
+        )
+
     def get_record_with_details(
         self,
         db_session: DbSession,

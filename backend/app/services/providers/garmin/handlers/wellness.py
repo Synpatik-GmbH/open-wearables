@@ -15,6 +15,10 @@ from app.services.providers.garmin.backfill_state import get_trace_id
 from app.services.providers.garmin.data_247 import Garmin247Data
 from app.services.sync_status_service import emit_sync_completed, new_run_id
 from app.utils.structured_logging import log_structured
+from app.utils.wearable_history_ingress import (
+    FirstNightAssociationUnavailableError,
+    WearableHistoryMetadataUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +127,8 @@ def process_wellness_items(
                     "items": len(items),
                 },
             )
+        except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError):
+            raise
         except Exception as e:
             log_structured(
                 logger,

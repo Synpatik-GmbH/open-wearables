@@ -777,6 +777,8 @@ class Oura247Data(Base247DataTemplate):
                 stored = event_record_service.create_or_merge_sleep(
                     db, user_id, record, detail, settings.sleep_end_gap_minutes
                 )
+                if stored is None:
+                    continue
                 count += int(stored is not None)
             except Exception as e:
                 db.rollback()
@@ -791,6 +793,7 @@ class Oura247Data(Base247DataTemplate):
                     provider_user_id=provider_user_id,
                     trace_id=trace_id,
                 )
+                continue
 
             hr: OuraIntervalData | None = normalized_sleep.get("heart_rate")
             hrv: OuraIntervalData | None = normalized_sleep.get("hrv")
