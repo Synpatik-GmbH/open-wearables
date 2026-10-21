@@ -92,6 +92,7 @@ def process_wellness_items(
     total_processed = sum(len(items) for items in user_items.values())
     total_saved = 0
     succeeded_users: list[str] = []
+    blocked_users: list[str] = []
 
     retry_error: FirstNightAssociationUnavailableError | WearableHistoryMetadataUnavailableError | None = None
     db.commit()  # Earlier payload work is not this loop's to roll back.
@@ -134,18 +135,21 @@ def process_wellness_items(
                 },
             )
         except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError) as exc:
-            # A blocked profile must not consume the shared account's other profiles.
+            # Raised by the gate before this member's writes. A blocked profile must not
+            # consume the shared account's other profiles, and it is never chained.
             retry_error = retry_error or exc
+            blocked_users.append(str(uid))
             continue
         except Exception as e:
             if is_history_boundary_failure(e):
-                # The batch met the freeze or a source change at flush/commit and was
-                # rolled back whole; redelivery re-gates it under the current cutoff.
+                # The batch met the freeze or a source change at flush/commit. Earlier
+                # members are committed; this session still holds the rolled-back
+                # batch's after-commit callbacks, so it is not reused: the task retry
+                # redelivers the payload, and the gate then sees the current cutoff.
                 db.rollback()
-                retry_error = retry_error or WearableHistoryMetadataUnavailableError(
+                raise WearableHistoryMetadataUnavailableError(
                     "Wearable history boundary moved during the batch; retry"
-                )
-                continue
+                ) from e
             log_structured(
                 logger,
                 "error",
@@ -162,5 +166,6 @@ def process_wellness_items(
         "processed": total_processed,
         "saved": total_saved,
         "succeeded_users": succeeded_users,
+        "blocked_users": blocked_users,
         "retry_error": retry_error,
     }

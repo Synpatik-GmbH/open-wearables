@@ -196,8 +196,9 @@ class GarminWebhookHandler(BaseWebhookHandler):
 
         # --- data processing ---------------------------------------------
         act_result = self._process_activities(db, payload, errors, synced_user_ids, users_with_new_success, trace_id)
+        blocked_users: set[str] = set()
         well_result, retry_error = self._process_wellness(
-            db, payload, errors, synced_user_ids, users_with_new_success, trace_id
+            db, payload, errors, synced_user_ids, users_with_new_success, blocked_users, trace_id
         )
 
         # --- commit + update last_synced_at ------------------------------
@@ -219,12 +220,15 @@ class GarminWebhookHandler(BaseWebhookHandler):
             "backfill_chained": [],
         }
 
+        if retry_error is not None:
+            # Admitted members are committed; chain only members with no blocked type, so
+            # a backfill cannot advance past data the retry has not restored yet.
+            # Lifecycle events wait for the delivery that succeeds, as before.
+            self._chain_backfills(users_with_new_success - blocked_users, trace_id)
+            raise retry_error
+
         self._process_lifecycle_events(db, payload, response, trace_id)
         response["backfill_chained"] = self._chain_backfills(users_with_new_success, trace_id)
-        if retry_error is not None:
-            # Admitted members and types are committed and chained; the existing task
-            # retry redelivers the blocked ones.
-            raise retry_error
         return response
 
     # ------------------------------------------------------------------
@@ -275,6 +279,7 @@ class GarminWebhookHandler(BaseWebhookHandler):
         errors: list[str],
         synced_user_ids: set[UUID],
         users_with_new_success: set[str],
+        blocked_users: set[str],
         request_trace_id: str,
     ) -> tuple[dict[str, Any], FirstNightAssociationUnavailableError | WearableHistoryMetadataUnavailableError | None]:
         wellness_results: dict[str, Any] = {}
@@ -308,6 +313,7 @@ class GarminWebhookHandler(BaseWebhookHandler):
             # Finish sibling types so a sleep in this payload can supply proof
             # before the existing task retry redelivers its earlier samples.
             retry_error = retry_error or result["retry_error"]
+            blocked_users.update(result["blocked_users"])
             wellness_results[data_type] = {"processed": result["processed"], "saved": result["saved"]}
 
             # Mark members that succeeded even when another member of the account

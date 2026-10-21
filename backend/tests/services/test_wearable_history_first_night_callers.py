@@ -389,17 +389,27 @@ def test_garmin_freeze_crossing_sql_rejection_retries_instead_of_dropping_the_ba
         finally:
             db.rollback()
 
+    def stored(member: User) -> list:
+        source_ids = select(DataSource.id).where(DataSource.user_id == member.id)
+        return list(db.scalars(select(DataPointSeries.value).where(DataPointSeries.data_source_id.in_(source_ids))))
+
     handler = GarminWebhookHandler(MagicMock(), Garmin247Data("garmin", "https://provider.test", MagicMock()))
-    with (
-        patch.object(WearableHistoryIngressRepository, "source", stale_gate),
+    common = (
         patch("app.integrations.celery.tasks.webhook_push_task.SessionLocal", session),
         patch(
             "app.integrations.celery.tasks.webhook_push_task.ProviderFactory",
             return_value=SimpleNamespace(get_provider=lambda _: SimpleNamespace(webhooks=handler)),
         ),
         patch("app.services.providers.garmin.handlers.wellness.emit_sync_completed"),
-        patch("app.services.providers.garmin.webhook_handler.mark_type_success", return_value=True) as marked,
         patch.object(GarminWebhookHandler, "_chain_backfills", return_value=[]),
+    )
+    with (
+        common[0],
+        common[1],
+        common[2],
+        common[3],
+        patch.object(WearableHistoryIngressRepository, "source", stale_gate),
+        patch("app.services.providers.garmin.webhook_handler.mark_type_success", return_value=True) as marked,
         patch.object(
             process_webhook_push, "retry", side_effect=WearableHistoryMetadataUnavailableError("task retry")
         ) as retry,
@@ -407,8 +417,49 @@ def test_garmin_freeze_crossing_sql_rejection_retries_instead_of_dropping_the_ba
     ):
         process_webhook_push.run("garmin", payload, "freeze-crossing")
     assert isinstance(retry.call_args.kwargs["exc"], WearableHistoryMetadataUnavailableError)
-    assert marked.call_args_list == [((str(admitted.id), "epochs"),)]
-    for member, values in [(admitted, [61]), (blocked, [])]:
-        source_ids = select(DataSource.id).where(DataSource.user_id == member.id)
-        stored = db.scalars(select(DataPointSeries.value).where(DataPointSeries.data_source_id.in_(source_ids)))
-        assert list(stored) == values
+    # The rolled-back session is not reused: nothing after the blocked member runs or commits.
+    assert marked.call_args_list == []
+    assert stored(admitted) == ([] if blocked_first else [61])
+    assert stored(blocked) == []
+
+    # The redelivery's gate reads the frozen clock, rejects the pre-start sample and admits the rest.
+    with (
+        common[0],
+        common[1],
+        common[2],
+        common[3],
+        patch("app.services.providers.garmin.webhook_handler.mark_type_success", return_value=True) as marked,
+    ):
+        process_webhook_push.run("garmin", payload, "freeze-crossing-retry")
+    # A permanent pre-start rejection is a finished delivery, so both members are marked.
+    assert {c.args for c in marked.call_args_list} == {(str(admitted.id), "epochs"), (str(blocked.id), "epochs")}
+    assert stored(admitted) == [61]
+    assert stored(blocked) == []
+
+
+def test_garmin_member_blocked_on_one_type_is_not_chained_by_another_and_lifecycle_waits() -> None:
+    blocked, other = str(uuid4()), str(uuid4())
+    results = {
+        "epochs": {
+            "processed": 2,
+            "saved": 1,
+            "succeeded_users": [other],
+            "blocked_users": [blocked],
+            "retry_error": FirstNightAssociationUnavailableError("first night"),
+        },
+        "sleeps": {"processed": 1, "saved": 1, "succeeded_users": [blocked], "blocked_users": [], "retry_error": None},
+    }
+    handler = GarminWebhookHandler(MagicMock(), MagicMock())
+    with (
+        patch(
+            "app.services.providers.garmin.webhook_handler.process_wellness_items",
+            side_effect=lambda _db, _repo, _svc, data_type, *_: results[data_type],
+        ),
+        patch("app.services.providers.garmin.webhook_handler.mark_type_success", return_value=True),
+        patch.object(handler, "_chain_backfills", return_value=[]) as chained,
+        patch.object(handler, "_process_lifecycle_events") as lifecycle,
+        pytest.raises(FirstNightAssociationUnavailableError),
+    ):
+        handler.process_payload(MagicMock(), {"epochs": [{}], "sleeps": [{}], "deregistrations": [{}]}, "trace")
+    chained.assert_called_once_with({other}, "trace")
+    lifecycle.assert_not_called()
