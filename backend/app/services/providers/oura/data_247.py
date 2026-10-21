@@ -52,6 +52,7 @@ from app.utils.structured_logging import LogContext, log_structured
 from app.utils.wearable_history_ingress import (
     FirstNightAssociationUnavailableError,
     WearableHistoryMetadataUnavailableError,
+    raise_if_history_retriable,
 )
 
 
@@ -330,9 +331,10 @@ class Oura247Data(Base247DataTemplate):
                             is_daily_total=daily_total_flag(series_type, is_daily=True),
                         )
                     )
-                except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError):
-                    raise  # Retriable: the dispatch loop reports it as DataTypeFailure, holding the cursor.
                 except Exception as e:
+                    # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                    # which reports DataTypeFailure and holds the pull cursor.
+                    raise_if_history_retriable(e)
                     log_structured(
                         self.logger,
                         "warning",
@@ -418,9 +420,10 @@ class Oura247Data(Base247DataTemplate):
                         series_type=SeriesType.cardiovascular_age,
                     )
                 )
-            except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError):
-                raise  # Retriable: the dispatch loop reports it as DataTypeFailure, holding the cursor.
             except Exception as e:
+                # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                # which reports DataTypeFailure and holds the pull cursor.
+                raise_if_history_retriable(e)
                 log_structured(
                     self.logger,
                     "warning",
@@ -567,9 +570,10 @@ class Oura247Data(Base247DataTemplate):
                                 series_type=series_type,
                             )
                         )
-                    except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError):
-                        raise  # Retriable: the dispatch loop reports it as DataTypeFailure, holding the cursor.
                     except Exception as e:
+                        # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                        # which reports DataTypeFailure and holds the pull cursor.
+                        raise_if_history_retriable(e)
                         log_structured(
                             self.logger,
                             "warning",
@@ -792,9 +796,10 @@ class Oura247Data(Base247DataTemplate):
                 if stored is None:
                     continue
                 count += int(stored is not None)
-            except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError):
-                raise  # Retriable: the dispatch loop reports it as DataTypeFailure, holding the cursor.
             except Exception as e:
+                # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                # which reports DataTypeFailure and holds the pull cursor.
+                raise_if_history_retriable(e)
                 db.rollback()
                 log_structured(
                     self.logger,
@@ -840,9 +845,10 @@ class Oura247Data(Base247DataTemplate):
                     if samples:
                         timeseries_service.bulk_create_samples(db, samples)
                         db.commit()
-                except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError):
-                    raise  # Retriable: the dispatch loop reports it as DataTypeFailure, holding the cursor.
                 except Exception as e:
+                    # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                    # which reports DataTypeFailure and holds the pull cursor.
+                    raise_if_history_retriable(e)
                     log_structured(
                         self.logger,
                         "warning",
@@ -876,9 +882,10 @@ class Oura247Data(Base247DataTemplate):
                             ],
                         )
                         db.commit()
-                    except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError):
-                        raise  # Retriable: the dispatch loop reports it as DataTypeFailure, holding the cursor.
                     except Exception as e:
+                        # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                        # which reports DataTypeFailure and holds the pull cursor.
+                        raise_if_history_retriable(e)
                         log_structured(
                             self.logger,
                             "warning",
@@ -1016,9 +1023,10 @@ class Oura247Data(Base247DataTemplate):
                             series_type=SeriesType.oxygen_saturation,
                         )
                     )
-                except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError):
-                    raise  # Retriable: the dispatch loop reports it as DataTypeFailure, holding the cursor.
                 except Exception as e:
+                    # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                    # which reports DataTypeFailure and holds the pull cursor.
+                    raise_if_history_retriable(e)
                     log_structured(
                         self.logger,
                         "warning",
@@ -1043,9 +1051,10 @@ class Oura247Data(Base247DataTemplate):
                             series_type=SeriesType.breathing_disturbance_index,
                         )
                     )
-                except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError):
-                    raise  # Retriable: the dispatch loop reports it as DataTypeFailure, holding the cursor.
                 except Exception as e:
+                    # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                    # which reports DataTypeFailure and holds the pull cursor.
+                    raise_if_history_retriable(e)
                     log_structured(
                         self.logger,
                         "warning",
@@ -1118,9 +1127,10 @@ class Oura247Data(Base247DataTemplate):
                         series_type=SeriesType.heart_rate,
                     )
                 )
-            except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError):
-                raise  # Retriable: the dispatch loop reports it as DataTypeFailure, holding the cursor.
             except Exception as e:
+                # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                # which reports DataTypeFailure and holds the pull cursor.
+                raise_if_history_retriable(e)
                 log_structured(
                     self.logger,
                     "warning",
@@ -1274,9 +1284,10 @@ class Oura247Data(Base247DataTemplate):
                         series_type=SeriesType.vo2_max,
                     )
                 )
-            except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError):
-                raise  # Retriable: the dispatch loop reports it as DataTypeFailure, holding the cursor.
             except Exception as e:
+                # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                # which reports DataTypeFailure and holds the pull cursor.
+                raise_if_history_retriable(e)
                 log_structured(
                     self.logger,
                     "warning",

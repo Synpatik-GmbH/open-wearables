@@ -38,3 +38,18 @@ def is_history_boundary_failure(exc: BaseException) -> bool:
             return True
         candidate = candidate.__cause__ or candidate.__context__
     return False
+
+
+def raise_if_history_retriable(exc: BaseException) -> None:
+    """Re-raise what a per-item catch must not swallow, so the caller can retry.
+
+    A retriable history error passes through unchanged; a wh_ingress rejection met at
+    flush or commit becomes ``WearableHistoryMetadataUnavailableError``. Anything else
+    returns, and the catch keeps its existing handling.
+    """
+    if isinstance(exc, (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError)):
+        raise exc
+    if is_history_boundary_failure(exc):
+        raise WearableHistoryMetadataUnavailableError(
+            "Wearable history boundary moved during the write; retry"
+        ) from exc

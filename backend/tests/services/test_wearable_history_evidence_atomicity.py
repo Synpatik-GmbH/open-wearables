@@ -186,7 +186,17 @@ def test_oura_retriable_history_error_holds_the_pull_cursor(failure: str) -> Non
     assert results["sleep"] == 0  # Ordinary types still report their counts.
 
 
-@pytest.mark.parametrize("failure", ["first_night", "metadata"])
+class _BoundaryDiag:
+    message_primary = "Frozen source rejects pre-start data"
+
+
+class _BoundaryRejectionError(Exception):
+    """A deferred wh_ingress rejection as psycopg raises it at commit."""
+
+    diag = _BoundaryDiag()
+
+
+@pytest.mark.parametrize("failure", ["first_night", "metadata", "sql_boundary"])
 def test_oura_sleep_history_error_inside_save_reaches_the_cursor_classifier(failure: str) -> None:
     """Codex P1 on #46 at 8546b1ae: save_sleep_data's own catch swallowed the retriable error."""
     from unittest.mock import MagicMock
@@ -198,11 +208,11 @@ def test_oura_sleep_history_error_inside_save_reaches_the_cursor_classifier(fail
         WearableHistoryMetadataUnavailableError,
     )
 
-    error = (
-        FirstNightAssociationUnavailableError("first night")
-        if failure == "first_night"
-        else WearableHistoryMetadataUnavailableError("metadata")
-    )
+    error = {
+        "first_night": FirstNightAssociationUnavailableError("first night"),
+        "metadata": WearableHistoryMetadataUnavailableError("metadata"),
+        "sql_boundary": _BoundaryRejectionError("commit rejected"),
+    }[failure]
     service = Oura247Data("oura", "https://provider.test", MagicMock())
     night = datetime(2026, 10, 12, 22, tzinfo=UTC)
     sleep = {
@@ -233,4 +243,5 @@ def test_oura_sleep_history_error_inside_save_reaches_the_cursor_classifier(fail
     ):
         results = service.load_and_save_all(MagicMock(), uuid4())
     assert isinstance(results["sleep"], DataTypeFailure)
-    assert results["sleep"].code == type(error).__name__
+    expected = WearableHistoryMetadataUnavailableError if failure == "sql_boundary" else type(error)
+    assert results["sleep"].code == expected.__name__
