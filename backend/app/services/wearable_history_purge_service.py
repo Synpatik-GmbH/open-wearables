@@ -68,8 +68,7 @@ _PURGE_RECORDS = text(
 _TRIM_NIGHTS = text(
     """
     UPDATE wearable_history_sources
-    SET night_dates = ARRAY(SELECT d FROM unnest(night_dates) AS d WHERE d >= start_date ORDER BY d),
-        records_purged_at = clock_timestamp()
+    SET night_dates = ARRAY(SELECT d FROM unnest(night_dates) AS d WHERE d >= start_date ORDER BY d)
     WHERE id = :id
     """
 )
@@ -115,6 +114,15 @@ class WearableHistoryPurgeService:
         counts = db.execute(_PURGE_RECORDS, {"member": source.user_id, "provider": source.provider}).one()
         db.execute(_TRIM_NIGHTS, {"id": source.id})
         return dict(counts._mapping)
+
+    def stamp_records_purged(self, db: Session, source_id: UUID) -> None:
+        """D-03: written after the D-01 commit, so a read that starts after the stamp sees the
+        purged state; an export requested before it is deleted by the adapter's cutoff."""
+        db.execute(
+            update(WearableHistorySource)
+            .where(WearableHistorySource.id == source_id)
+            .values(records_purged_at=func.clock_timestamp())
+        )
 
     def clear_sleep_state(self, source: WearableHistorySource) -> None:
         """D-02: the Apple sleep buffer, when the night it would record is before the start date."""
@@ -167,12 +175,23 @@ class WearableHistoryPurgeService:
                 db.rollback()
                 return "skipped"
             source.purge_attempts += 1
-            if source.records_purged_at is None:
+            stamp = source.records_purged_at is None
+            if stamp:
+                # Re-running after a failed stamp is safe: nothing rejected is left to delete.
                 self.purge_records(db, source)
+            source_id = source.id
             db.commit()
         except Exception as error:
             self._fail(db, member, provider, "records", error, count_attempt=True)
             return "failed"
+        if stamp:
+            try:
+                self.stamp_records_purged(db, source_id)
+                db.commit()
+            except Exception as error:
+                self._fail(db, member, provider, "records", error)
+                return "failed"
+            db.refresh(source)
 
         failed = False
         waiting = False

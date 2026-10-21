@@ -317,3 +317,44 @@ def test_the_purge_is_scheduled_every_fifteen_minutes_and_purges_due_sources(db:
         assert purge_frozen_sources_task.run() == {"due": 1, "completed": 1, "failed": 0, "waiting": 0}
     assert present(db, apple.deleted()) == set()
     assert history(db, member.id, "apple").purge_completed_at is not None
+
+
+def test_records_are_stamped_only_after_their_deletion_commits(db: Session) -> None:
+    """D-03: an export requested after the stamp can only read the purged state, so the stamp
+    is written by its own statement after the D-01 commit, never inside that transaction."""
+    member, apple, *_ = seed(db)
+    service = WearableHistoryPurgeService()
+    order: list[str] = []
+    real_commit, real_purge, real_stamp = db.commit, service.purge_records, service.stamp_records_purged
+
+    def commit() -> None:
+        order.append("commit")
+        real_commit()
+
+    def purge(db_: Session, source: WearableHistorySource) -> dict[str, int]:
+        order.append("delete")
+        return real_purge(db_, source)
+
+    def stamp(db_: Session, source_id: UUID) -> None:
+        order.append("stamp")
+        real_stamp(db_, source_id)
+
+    with (
+        patch.object(db, "commit", side_effect=commit),
+        patch.object(service, "purge_records", side_effect=purge),
+        patch.object(service, "stamp_records_purged", side_effect=stamp),
+    ):
+        service.purge_source(db, member.id, "apple")
+    assert order[:4] == ["delete", "commit", "stamp", "commit"]
+
+
+def test_a_failed_stamp_leaves_the_records_purged_and_is_stamped_next_run(db: Session) -> None:
+    member, apple, *_ = seed(db)
+    service = WearableHistoryPurgeService()
+    with patch.object(service, "stamp_records_purged", side_effect=ConnectionError("lost")):
+        assert service.run(db).failed == 1
+    source = history(db, member.id, "apple")
+    assert present(db, apple.deleted()) == set()
+    assert (source.records_purged_at, source.purge_last_error) == (None, "records: ConnectionError")
+    assert service.run(db).completed == 1
+    assert history(db, member.id, "apple").records_purged_at is not None
