@@ -196,7 +196,9 @@ class GarminWebhookHandler(BaseWebhookHandler):
 
         # --- data processing ---------------------------------------------
         act_result = self._process_activities(db, payload, errors, synced_user_ids, users_with_new_success, trace_id)
-        well_result = self._process_wellness(db, payload, errors, synced_user_ids, users_with_new_success, trace_id)
+        well_result, retry_error = self._process_wellness(
+            db, payload, errors, synced_user_ids, users_with_new_success, trace_id
+        )
 
         # --- commit + update last_synced_at ------------------------------
         db.commit()
@@ -219,6 +221,10 @@ class GarminWebhookHandler(BaseWebhookHandler):
 
         self._process_lifecycle_events(db, payload, response, trace_id)
         response["backfill_chained"] = self._chain_backfills(users_with_new_success, trace_id)
+        if retry_error is not None:
+            # Admitted members and types are committed and chained; the existing task
+            # retry redelivers the blocked ones.
+            raise retry_error
         return response
 
     # ------------------------------------------------------------------
@@ -289,33 +295,28 @@ class GarminWebhookHandler(BaseWebhookHandler):
                 count=len(items),
             )
 
-            try:
-                result = process_wellness_items(
-                    db,
-                    self.connection_repo,
-                    self.garmin_247,
-                    data_type,
-                    items,
-                    errors,
-                    synced_user_ids,
-                    request_trace_id,
-                )
-            except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError) as exc:
-                # Finish sibling types so a sleep in this payload can supply proof
-                # before the existing task retry redelivers its earlier samples.
-                retry_error = retry_error or exc
-                continue
+            result = process_wellness_items(
+                db,
+                self.connection_repo,
+                self.garmin_247,
+                data_type,
+                items,
+                errors,
+                synced_user_ids,
+                request_trace_id,
+            )
+            # Finish sibling types so a sleep in this payload can supply proof
+            # before the existing task retry redelivers its earlier samples.
+            retry_error = retry_error or result["retry_error"]
             wellness_results[data_type] = {"processed": result["processed"], "saved": result["saved"]}
 
+            # Mark members that succeeded even when another member of the account
+            # will retry: the mark fires once, so a retry would never chain them.
             for uid_str in result.get("succeeded_users", []):
                 if mark_type_success(uid_str, data_type):
                     users_with_new_success.add(uid_str)
 
-        if retry_error is not None:
-            # Persist admitted siblings (including unscored sleep) before retry.
-            db.commit()
-            raise retry_error
-        return wellness_results
+        return wellness_results, retry_error
 
     def _process_lifecycle_events(
         self,

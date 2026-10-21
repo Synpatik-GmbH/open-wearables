@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.webhook_push_task import process_webhook_push
@@ -322,6 +322,8 @@ def test_garmin_history_retry_preserves_other_members_of_the_same_provider_accou
             return_value=SimpleNamespace(get_provider=lambda _: SimpleNamespace(webhooks=handler)),
         ),
         patch("app.services.providers.garmin.handlers.wellness.emit_sync_completed"),
+        patch("app.services.providers.garmin.webhook_handler.mark_type_success", return_value=True) as marked,
+        patch.object(GarminWebhookHandler, "_chain_backfills", return_value=[]) as chained,
         patch.object(process_webhook_push, "retry", side_effect=failure("task retry")) as retry,
     ):
         for delivery in range(4):  # Initial delivery plus the unchanged three retries.
@@ -329,6 +331,9 @@ def test_garmin_history_retry_preserves_other_members_of_the_same_provider_accou
                 process_webhook_push.run("garmin", payload, f"multi-member-{delivery}")
             assert retry.call_count == delivery + 1
             assert isinstance(retry.call_args.kwargs["exc"], failure)
+            # The admitted member is marked and chained before the blocked one retries.
+            assert marked.call_args_list[-1].args == (str(admitted.id), "epochs")
+            assert chained.call_args.args[0] == {str(admitted.id)}
             source_ids = select(DataSource.id).where(DataSource.user_id == admitted.id)
             assert list(
                 db.scalars(select(DataPointSeries.value).where(DataPointSeries.data_source_id.in_(source_ids)))
@@ -338,3 +343,72 @@ def test_garmin_history_retry_preserves_other_members_of_the_same_provider_accou
                 list(db.scalars(select(DataPointSeries).where(DataPointSeries.data_source_id.in_(blocked_sources))))
                 == []
             )
+
+
+@pytest.mark.parametrize("blocked_first", [False, True])
+def test_garmin_freeze_crossing_sql_rejection_retries_instead_of_dropping_the_batch(
+    db: Session, blocked_first: bool
+) -> None:
+    blocked = connected(db, "garmin")
+    admitted = connected(db, "garmin")
+    # Both sources are frozen by the database clock; only the admitted one reaches 5 Oct.
+    db.query(WearableHistorySource).filter(WearableHistorySource.user_id == admitted.id).update(
+        {WearableHistorySource.start_date: datetime(2026, 10, 1).date()}
+    )
+    for member, position in [(blocked, 0 if blocked_first else 1), (admitted, 1 if blocked_first else 0)]:
+        connection = db.scalar(select(UserConnection).where(UserConnection.user_id == member.id))
+        connection.created_at = datetime(2026, 10, 13, 12, position, tzinfo=UTC)
+    db.commit()
+    sample_at = datetime(2026, 10, 5, 12, tzinfo=UTC)
+    payload = {
+        "epochs": [
+            {
+                "userId": "provider-member",
+                "startTimeInSeconds": int(sample_at.timestamp()),
+                "startTimeOffsetInSeconds": 0,
+                "meanHeartRateInBeatsPerMinute": 61,
+            }
+        ]
+    }
+    original_source = WearableHistoryIngressRepository.source
+
+    def stale_gate(self: WearableHistoryIngressRepository, identity: tuple) -> object:
+        source = original_source(self, identity)
+        if identity[0] == blocked.id:
+            # The Python gate read its clock just before the freeze; SQL reads after it.
+            self.now = source.freeze_at - timedelta(seconds=1)
+        return source
+
+    @contextmanager
+    def session() -> Iterator[Session]:
+        # The test transaction never commits, so check the deferred guard at write time,
+        # where a real commit would check it.
+        db.execute(text("SET CONSTRAINTS wh_ingress IMMEDIATE"))
+        try:
+            yield db
+        finally:
+            db.rollback()
+
+    handler = GarminWebhookHandler(MagicMock(), Garmin247Data("garmin", "https://provider.test", MagicMock()))
+    with (
+        patch.object(WearableHistoryIngressRepository, "source", stale_gate),
+        patch("app.integrations.celery.tasks.webhook_push_task.SessionLocal", session),
+        patch(
+            "app.integrations.celery.tasks.webhook_push_task.ProviderFactory",
+            return_value=SimpleNamespace(get_provider=lambda _: SimpleNamespace(webhooks=handler)),
+        ),
+        patch("app.services.providers.garmin.handlers.wellness.emit_sync_completed"),
+        patch("app.services.providers.garmin.webhook_handler.mark_type_success", return_value=True) as marked,
+        patch.object(GarminWebhookHandler, "_chain_backfills", return_value=[]),
+        patch.object(
+            process_webhook_push, "retry", side_effect=WearableHistoryMetadataUnavailableError("task retry")
+        ) as retry,
+    ):
+        with pytest.raises(WearableHistoryMetadataUnavailableError, match="task retry"):
+            process_webhook_push.run("garmin", payload, "freeze-crossing")
+    assert isinstance(retry.call_args.kwargs["exc"], WearableHistoryMetadataUnavailableError)
+    assert marked.call_args_list == [((str(admitted.id), "epochs"),)]
+    for member, values in [(admitted, [61]), (blocked, [])]:
+        source_ids = select(DataSource.id).where(DataSource.user_id == member.id)
+        stored = db.scalars(select(DataPointSeries.value).where(DataPointSeries.data_source_id.in_(source_ids)))
+        assert list(stored) == values
