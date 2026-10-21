@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import DataPointSeries, EventRecord, User, UserConnection
@@ -69,6 +71,39 @@ def test_failed_single_sleep_write_leaves_no_night_evidence(db: Session) -> None
 
     with pytest.raises(RuntimeError, match="detail write failed"):
         WearableHistoryIngressRepository(db).persist_event(record, failing_write)
+    db.commit()  # A provider that catches the failure and carries on still commits.
+    db.expire_all()
+    source = WearableHistoryRepository().get(db, member.id, "garmin")
+    assert source.night_dates == []
+    assert source.start_date == connection_day
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_sleep_write_rejected_by_a_constraint_leaves_no_night_evidence(db: Session, wrapped: bool) -> None:
+    """The rejection branch decides admission after the rollback; it must not record the night again."""
+
+    member, data_source, connection_day = provisional_source(db)
+    night_start = datetime.combine(connection_day - timedelta(days=11), datetime.min.time(), UTC) + timedelta(hours=22)
+    record = EventRecord(
+        id=uuid4(),
+        data_source_id=data_source.id,
+        category="sleep",
+        type="sleep_session",
+        source_name="Garmin",
+        start_datetime=night_start,
+        end_datetime=night_start + timedelta(hours=8),
+        zone_offset="+00:00",
+    )
+    violation = IntegrityError("INSERT INTO sleep_details", {}, Exception("null value in column"))
+
+    def rejected_write() -> None:
+        if wrapped:
+            # Decorated repositories surface SQL errors as HTTPException over the IntegrityError.
+            raise HTTPException(status_code=500) from violation
+        raise violation
+
+    with pytest.raises((IntegrityError, HTTPException)):
+        WearableHistoryIngressRepository(db).persist_event(record, rejected_write)
     db.commit()  # A provider that catches the failure and carries on still commits.
     db.expire_all()
     source = WearableHistoryRepository().get(db, member.id, "garmin")

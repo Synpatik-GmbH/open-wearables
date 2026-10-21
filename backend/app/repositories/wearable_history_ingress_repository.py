@@ -59,7 +59,10 @@ class WearableHistoryIngressRepository:
                 exc.__cause__, IntegrityError
             ):
                 raise
-            if not WearableHistoryIngressRepository(self.db).filter_events([record]):
+            # Admission only: the night was not stored, so it is not recorded again here.
+            # Observing cannot change admission (before the freeze every event is admitted,
+            # and after it the evidence is fixed).
+            if not WearableHistoryIngressRepository(self.db).event_admitted(record):
                 return None
             raise
         if commit:
