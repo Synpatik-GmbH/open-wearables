@@ -184,3 +184,53 @@ def test_oura_retriable_history_error_holds_the_pull_cursor(failure: str) -> Non
     assert isinstance(results["heart_rate"], DataTypeFailure)
     assert results["heart_rate"].code == type(error).__name__
     assert results["sleep"] == 0  # Ordinary types still report their counts.
+
+
+@pytest.mark.parametrize("failure", ["first_night", "metadata"])
+def test_oura_sleep_history_error_inside_save_reaches_the_cursor_classifier(failure: str) -> None:
+    """Codex P1 on #46 at 8546b1ae: save_sleep_data's own catch swallowed the retriable error."""
+    from unittest.mock import MagicMock
+
+    from app.schemas.sync_status import DataTypeFailure
+    from app.services.providers.oura.data_247 import Oura247Data
+    from app.utils.wearable_history_ingress import (
+        FirstNightAssociationUnavailableError,
+        WearableHistoryMetadataUnavailableError,
+    )
+
+    error = (
+        FirstNightAssociationUnavailableError("first night")
+        if failure == "first_night"
+        else WearableHistoryMetadataUnavailableError("metadata")
+    )
+    service = Oura247Data("oura", "https://provider.test", MagicMock())
+    night = datetime(2026, 10, 12, 22, tzinfo=UTC)
+    sleep = {
+        "id": str(uuid4()),
+        "start_time": night.isoformat(),
+        "end_time": (night + timedelta(hours=8)).isoformat(),
+        "timezone_offset": "+00:00",
+        "stages": {},
+    }
+    getters = {
+        name: MagicMock(return_value=[])
+        for name in dir(service)
+        if (name.startswith("get_") and name.endswith("_data")) or name == "get_personal_info"
+    }
+    getters["get_sleep_data"] = MagicMock(return_value=[sleep])
+    others = {
+        name: MagicMock(return_value=0)
+        for name in dir(service)
+        if name.startswith("save_") and name != "save_sleep_data"
+    }
+    with (
+        patch.multiple(service, **getters, **others),
+        patch.object(service, "normalize_sleeps", return_value=[sleep]),
+        patch(
+            "app.services.providers.oura.data_247.event_record_service.create_or_merge_sleep",
+            side_effect=error,
+        ),
+    ):
+        results = service.load_and_save_all(MagicMock(), uuid4())
+    assert isinstance(results["sleep"], DataTypeFailure)
+    assert results["sleep"].code == type(error).__name__
