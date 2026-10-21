@@ -432,6 +432,10 @@ Implements [approved v0.4](docs/specs/2026-10-21-2_96_9-wearable-history-start-d
 
 Typed SDK payloads are selected before queue/S3 persistence and again on worker delivery after freeze. Shared repository, ORM and PostgreSQL guards also reject frozen pre-start normalized data; weight is exempt. Optional opaque provider/FIT archives stop at freeze, and archival aggregation checks every contributor before deleting any. Migration `a29691004b01` follows `635d0674389f`; apply the schema before dependent backend and adapter code.
 
+SDK import persists accepted sleep before its samples, so a single batch carrying the first retained night and its evening HR trace can pass the final frozen write guard. Workout details still follow all HR samples, and busy sleep locks remain retryable. Recorded-night evidence preserves Calibra's existing P6 clock classification: provider `is_nap` flags do not override the 18:00–06:00 rule.
+
+Polar flushes the interval before its HR and writes HR plus provider score through the existing callback before the single night commit. A failed contributor leaves the night uncommitted and retryable; no stored night can lose its required HR/score through a later write failure.
+
 For Dragan: this PR targets `release/0.9.0-syn`, never the pristine upstream `main`. Merge this backend schema/API before the adapter's version-133 schema and dependent code for 30 October. Physical S12 deletion and the XML/pre-signed S3 path are a follow-up explicitly authorized by Andrei on 21 October. **Both must be merged and live before any production source reaches its freeze.** Use the earliest persisted `freeze_at`, not the release date plus seven days. For a source first connected on 30 October, freeze is 6 November 00:00 Europe/Berlin.
 
 XML uploads remain available, including weight. In the follow-up, frozen pre-start XML records never leave the upload file; the file is deleted after processing. All physical deletion failures, including the existing swallowed S3 failure on the purge path, stay pending and retry without reporting completion. This PR does not implement physical S12 purge or the XML boundary.

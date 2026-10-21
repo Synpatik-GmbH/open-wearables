@@ -1170,36 +1170,35 @@ class Polar247Data(Base247DataTemplate):
         """Store sleep records with their scores and heart-rate samples. Raises on any failure."""
         count = 0
         for record, detail, score, hr in self.normalize_sleep(raw_items, user_id):
-            # The night's heart rate first, then the sleep record and its score in ONE commit:
-            # the record commits (and is announced) inside create_or_merge_sleep, and from then on
-            # the night counts as stored and is not fetched again, so anything saved after that
-            # commit and failing would be lost for good. A failure before it leaves the night
-            # missing, so the next pull asks again; the heart-rate and score writes do nothing on
-            # a row already there, so the retry is safe.
-            self._save_timeseries(db, hr)
+            # Flush the sleep interval before its HR so the frozen first night's evening
+            # has association proof. Keep HR and score in the existing before-commit hook:
+            # after that single commit the night counts as stored and is not fetched again.
+            # A failed contributor still rolls back the night and leaves it retryable.
             event_record_service.create_or_merge_sleep(
                 db,
                 user_id,
                 record,
                 detail,
                 settings.sleep_end_gap_minutes,
-                before_commit=self._score_writer(db, score),
+                before_commit=self._sleep_contributors_writer(db, hr, score),
             )
             count += 1
         return count
 
-    def _score_writer(self, db: DbSession, score: HealthScoreCreate | None) -> Callable[[EventRecord], None] | None:
-        """The night's score, written in the sleep record's own transaction and pointing at it.
+    def _sleep_contributors_writer(
+        self, db: DbSession, samples: list[TimeSeriesSampleCreate], score: HealthScoreCreate | None
+    ) -> Callable[[EventRecord], None]:
+        """The night's HR and score, written in its own transaction after the interval exists.
 
         The score cannot be written before the record: it references the record (foreign key).
         It points at the record the night ended up in, which after a merge is not the id
         ``normalize_sleep`` minted.
         """
-        if score is None:
-            return None
 
         def write(stored: EventRecord) -> None:
-            self._save_scores(db, [score.model_copy(update={"event_record_id": stored.id})])
+            self._save_timeseries(db, samples)
+            if score is not None:
+                self._save_scores(db, [score.model_copy(update={"event_record_id": stored.id})])
 
         return write
 

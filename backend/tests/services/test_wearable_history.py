@@ -1,4 +1,5 @@
 import importlib.util
+from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -185,6 +186,226 @@ def test_arriving_sleep_updates_source_before_provider_selection_and_is_retained
     assert source.start_date == connection - timedelta(days=8)
     assert len(records) == 10
     assert db.get(type(records[0]), records[0].id) is not None
+
+
+@pytest.mark.parametrize("path", ["orm", "bulk"])
+def test_night_evidence_preserves_p6_clock_rule_when_provider_nap_flag_disagrees(db: Session, path: str) -> None:
+    from app.models import SleepDetails
+    from app.repositories.event_record_detail_repository import EventRecordDetailRepository
+    from app.repositories.wearable_history_repository import WearableHistoryRepository
+    from app.schemas.model_crud.activities import EventRecordDetailCreate
+    from tests.factories import DataSourceFactory, EventRecordFactory, SleepDetailsFactory, UserFactory
+
+    member = UserFactory()
+    source = WearableHistoryRepository().begin_source(db, member.id, "polar")
+    data_source = DataSourceFactory(user=member, provider="polar")
+    connection = source.connection_day
+    for offset, is_nap in [(-2, True), (-3, False), (-1, False), (0, False)]:
+        night = connection + timedelta(days=offset)
+        record = EventRecordFactory(
+            data_source=data_source,
+            category="sleep",
+            start_datetime=datetime.combine(night - timedelta(days=1), datetime.min.time(), UTC)
+            + timedelta(hours=12 if offset == -3 else 20),
+            end_datetime=datetime.combine(night, datetime.min.time(), UTC) + timedelta(hours=4),
+        )
+        if offset == -2:
+            assert source.start_date == connection - timedelta(days=2)
+            assert source.night_dates == [connection - timedelta(days=2)]
+        if path == "orm":
+            SleepDetailsFactory(event_record=record, is_nap=is_nap)
+        else:
+            EventRecordDetailRepository(SleepDetails).bulk_create(
+                db, [EventRecordDetailCreate(record_id=record.id, is_nap=is_nap)], detail_type="sleep"
+            )
+        db.flush()
+    db.expire(source)
+    assert source.start_date == connection - timedelta(days=2)
+    assert source.night_dates == [connection - timedelta(days=2), connection - timedelta(days=1), connection]
+
+
+def test_frozen_sdk_first_night_and_its_samples_import_in_one_batch_without_a_preexisting_event(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import MagicMock
+
+    from sqlalchemy import select
+
+    from app.integrations.celery.tasks.finalize_stale_sleep_task import finalize_stale_sleeps
+    from app.models import DataPointSeries, DataSource, EventRecord
+    from app.repositories.wearable_history_repository import WearableHistoryRepository
+    from app.services.sdk.import_service import import_service
+    from tests.factories import UserFactory
+
+    monkeypatch.setattr(finalize_stale_sleeps, "delay", MagicMock())
+    member = UserFactory()
+    source = WearableHistoryRepository().begin_source(db, member.id, "apple")
+    source.freeze_at = datetime.now(UTC) - timedelta(seconds=1)
+    db.flush()
+    start = datetime.combine(source.start_date - timedelta(days=1), datetime.min.time(), UTC) + timedelta(hours=20)
+    end = start + timedelta(hours=8)
+    raw = {
+        "provider": "apple",
+        "sdkVersion": "1",
+        "syncTimestamp": datetime.now(UTC).isoformat(),
+        "data": {
+            "sleep": [{"stage": "light", "startDate": start.isoformat(), "endDate": end.isoformat()}],
+            "records": [
+                dict(type="HEART_RATE", value=60, unit="count", startDate=d.isoformat(), endDate=d.isoformat())
+                for d in [start, end]
+            ],
+        },
+    }
+    assert not list(db.scalars(select(EventRecord).join(DataSource).where(DataSource.user_id == member.id)))
+    result = import_service.load_data(db, raw, str(member.id))
+    assert result["sleep_saved"] == 1
+    assert result["records_inserted"] == 2
+    db.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+    sleeps = list(db.scalars(select(EventRecord).join(DataSource).where(DataSource.user_id == member.id)))
+    assert [(r.start_datetime, r.end_datetime) for r in sleeps] == [(start, end)]
+    samples = list(db.scalars(select(DataPointSeries).join(DataSource).where(DataSource.user_id == member.id)))
+    assert sorted(s.recorded_at for s in samples) == [start, end]
+
+
+def test_ac12_divergent_source_cutoffs_filter_ingress_and_reads_independently(db: Session) -> None:
+    from uuid import uuid4
+
+    from sqlalchemy import select
+
+    from app.models import DataPointSeries
+    from app.repositories.data_point_series_repository import DataPointSeriesRepository
+    from app.repositories.wearable_history_repository import WearableHistoryRepository
+    from app.schemas.enums import SeriesType, get_series_type_id
+    from app.schemas.model_crud.activities import TimeSeriesSampleCreate
+    from tests.factories import UserFactory
+
+    member = UserFactory()
+    history = WearableHistoryRepository()
+    apple = history.begin_source(db, member.id, "apple")
+    polar = history.begin_source(db, member.id, "polar")
+    connection = apple.connection_day
+    history.observe_nights(
+        db, member.id, "polar", [connection - timedelta(days=n) for n in range(6)], datetime.now(UTC)
+    )
+    assert apple.start_date == connection
+    assert polar.start_date == connection - timedelta(days=5)
+    apple.freeze_at = polar.freeze_at = datetime.now(UTC) - timedelta(seconds=1)
+    db.flush()
+    instant = datetime.combine(connection - timedelta(days=3), datetime.min.time(), UTC) + timedelta(hours=12)
+    samples = [
+        TimeSeriesSampleCreate(
+            id=uuid4(),
+            user_id=member.id,
+            provider=p,
+            source=p,
+            recorded_at=instant,
+            series_type=SeriesType.heart_rate,
+            value=value,
+        )
+        for p, value in [("apple", 99), ("polar", 60)]
+    ]
+    repository = DataPointSeriesRepository(DataPointSeries)
+    counts = repository.bulk_create(db, samples)
+    db.flush()
+    db.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+    assert counts.inserted == 1
+    assert set(db.scalars(select(DataPointSeries.id).where(DataPointSeries.id.in_([s.id for s in samples])))) == {
+        samples[1].id
+    }
+    assert repository.query_series(
+        db,
+        member.id,
+        get_series_type_id(SeriesType.heart_rate),
+        instant - timedelta(seconds=1),
+        instant + timedelta(seconds=1),
+    ) == [(instant, 60.0)]
+
+
+@pytest.mark.parametrize("fail_first", [False, True])
+def test_frozen_polar_first_night_keeps_hr_and_score_atomic_and_retryable(db: Session, fail_first: bool) -> None:
+    from unittest.mock import patch
+
+    from sqlalchemy import select
+
+    from app.models import DataPointSeries, DataSource, EventRecord, HealthScore
+    from app.repositories.wearable_history_repository import WearableHistoryRepository
+    from app.services.providers.polar.strategy import PolarStrategy
+    from tests.factories import UserFactory
+
+    member = UserFactory()
+    member_id = member.id
+    source = WearableHistoryRepository().begin_source(db, member_id, "polar")
+    source.freeze_at = datetime.now(UTC) - timedelta(seconds=1)
+    start = datetime.combine(source.start_date - timedelta(days=1), datetime.min.time(), UTC) + timedelta(hours=20)
+    end = start + timedelta(hours=8)
+    db.commit()
+    raw = {
+        "date": source.start_date.isoformat(),
+        "sleep_start_time": start.isoformat(),
+        "sleep_end_time": end.isoformat(),
+        "light_sleep": 8 * 3600,
+        "sleep_score": 80,
+        "heart_rate_samples": {"20:00": 60, "04:00": 58},
+    }
+    service = PolarStrategy().data_247
+    if fail_first:
+        with (
+            patch.object(service, "_save_timeseries", side_effect=RuntimeError("sample write unavailable")),
+            pytest.raises(RuntimeError, match="sample write unavailable"),
+        ):
+            service._save_sleep_items(db, member_id, [raw])
+        db.rollback()
+        assert not list(db.scalars(select(EventRecord).join(DataSource).where(DataSource.user_id == member_id)))
+        assert not list(db.scalars(select(HealthScore).where(HealthScore.user_id == member_id)))
+    assert service._save_sleep_items(db, member_id, [raw]) == 1
+    db.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+    sleeps = list(db.scalars(select(EventRecord).join(DataSource).where(DataSource.user_id == member_id)))
+    assert [(r.start_datetime, r.end_datetime) for r in sleeps] == [(start, end)]
+    samples = list(db.scalars(select(DataPointSeries).join(DataSource).where(DataSource.user_id == member_id)))
+    assert sorted((s.recorded_at, int(s.value)) for s in samples) == [(start, 60), (end, 58)]
+    provider_scores = list(
+        db.scalars(select(HealthScore).where(HealthScore.user_id == member_id, HealthScore.provider == "polar"))
+    )
+    assert [(s.event_record_id, int(s.value)) for s in provider_scores] == [(sleeps[0].id, 80)]
+
+
+@pytest.mark.parametrize("sink", ["raw-log", "raw-s3", "fit"])
+def test_frozen_raw_archive_denial_reaches_each_storage_sink(
+    db: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, sink: str
+) -> None:
+    from contextlib import contextmanager
+    from unittest.mock import MagicMock
+
+    import app.database
+    from app.repositories.wearable_history_repository import WearableHistoryRepository
+    from app.services import raw_payload_storage
+    from tests.factories import UserFactory
+
+    member = UserFactory()
+    source = WearableHistoryRepository().begin_source(db, member.id, "apple")
+    source.freeze_at = datetime.now(UTC) - timedelta(seconds=1)
+    db.flush()
+
+    @contextmanager
+    def archive_session() -> Iterator[Session]:
+        yield db
+
+    client = MagicMock()
+    monkeypatch.setattr(app.database, "SessionLocal", archive_session)
+    monkeypatch.setattr(raw_payload_storage, "_storage_backend", "log" if sink == "raw-log" else "s3")
+    monkeypatch.setattr(raw_payload_storage, "_s3_client", client)
+    monkeypatch.setattr(raw_payload_storage, "_s3_bucket", "test-bucket")
+    monkeypatch.setattr(raw_payload_storage, "_fit_files_enabled", True)
+    if sink == "fit":
+        raw_payload_storage.store_fit_file(
+            provider="apple", user_id=str(member.id), fit_bytes=b"dated FIT", activity_id="first-night"
+        )
+    else:
+        raw_payload_storage.store_raw_payload(
+            source="sdk", provider="apple", user_id=str(member.id), payload={"old": 1}
+        )
+    assert capsys.readouterr().out == ""
+    client.put_object.assert_not_called()
 
 
 def test_ac7_frozen_orm_ingress_rejects_prestart_samples_and_preserves_weight(db: Session) -> None:

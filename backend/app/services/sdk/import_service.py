@@ -374,6 +374,12 @@ class ImportService:
         sleep_saved = 0
         types: set[str] = set()
 
+        # Save accepted sleep intervals before samples: the frozen first night's evening
+        # belongs to its night date, and both repository and final SQL guards need proof.
+        if request.data.sleep:
+            handle_sleep_data(db_session, request, user_id, raise_when_busy=True)
+            sleep_saved = len(request.data.sleep)
+
         # Process workouts in batch
         workout_bundles = list(self._build_workout_bundles(request, user_id))
         details_to_insert: list[EventRecordDetailCreate] = []
@@ -420,12 +426,6 @@ class ImportService:
 
         # Commit all workout and timeseries changes in one transaction
         db_session.commit()
-
-        # Process sleep (count sleep segments from input)
-        if request.data.sleep:
-            # FORK (2.96.6.1): a busy sleep lock makes this batch retryable (process_sdk_upload).
-            handle_sleep_data(db_session, request, user_id, raise_when_busy=True)
-            sleep_saved = len(request.data.sleep)
 
         return {
             "workouts_saved": workouts_saved,
