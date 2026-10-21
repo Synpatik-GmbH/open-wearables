@@ -41,10 +41,12 @@ class WearableHistoryIngressRepository:
         Callbacks must not commit: the gate commits only after the item and its
         deferred source constraints have succeeded, when the caller requests it.
         """
-        if not self.filter_events([record]):
-            return None
         try:
             with self.db.begin_nested():
+                # Night evidence is recorded inside the item's savepoint, so a sleep whose
+                # write fails leaves no evidence that could move the start date earlier.
+                if not self.filter_events([record]):
+                    return None
                 result = write()
                 self.db.flush()
                 # Check this item's deferred details/samples while its savepoint can
@@ -99,6 +101,9 @@ class WearableHistoryIngressRepository:
         provider = getattr(observation, "provider", None)
         if provider is None:
             provider = ProviderName.from_source_string(getattr(observation, "source", None))
+        elif isinstance(provider, str) and provider not in ProviderName._value2member_map_:
+            # An importer alias such as "apple_health_xml" names its provider inside the string.
+            provider = ProviderName.from_source_string(provider)
         if provider == ProviderName.INTERNAL:
             return None  # Derived OW score; attributed scores already resolved their parent/source above.
         return member, getattr(provider, "value", provider)
@@ -108,12 +113,18 @@ class WearableHistoryIngressRepository:
             member, provider = identity
             source = self.history.get(self.db, member, provider, lock=True)
             if source is None:
-                connected = self.db.scalar(
-                    select(UserConnection.id).where(
+                connected_at = self.db.scalar(
+                    select(UserConnection.created_at).where(
                         UserConnection.user_id == member, UserConnection.provider == provider
                     )
                 )
-                if connected or self.history.list_sources(self.db, member):
+                if connected_at is not None:
+                    # The connection committed but its history write did not (OAuth callback
+                    # failure): begin the source from the connection's own persisted clock,
+                    # exactly as the callback would have.
+                    self.history.begin_source(self.db, member, provider, connected_at)
+                    source = self.history.get(self.db, member, provider, lock=True)
+                elif self.history.list_sources(self.db, member):
                     raise WearableHistoryMetadataUnavailableError("Connected source history is unavailable")
             self.sources[identity] = source
             self.now = self.db.scalar(select(func.clock_timestamp()))

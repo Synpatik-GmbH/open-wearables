@@ -186,6 +186,16 @@ class EventRecordRepository(
         db_session: DbSession,
         creators: list[EventRecordCreate],
     ) -> list[UUID]:
+        # One savepoint for the night evidence and the insert: a batch that fails to
+        # insert leaves no evidence that could move a source's start date earlier.
+        with db_session.begin_nested():
+            return self._bulk_create(db_session, creators)
+
+    def _bulk_create(
+        self,
+        db_session: DbSession,
+        creators: list[EventRecordCreate],
+    ) -> list[UUID]:
         creators = WearableHistoryIngressRepository(db_session).filter_events(creators)
         if not creators:
             return []

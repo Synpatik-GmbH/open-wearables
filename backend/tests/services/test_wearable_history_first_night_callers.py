@@ -294,9 +294,15 @@ def test_garmin_history_retry_preserves_other_members_of_the_same_provider_accou
     for member, position in [(blocked, 0 if failed_first else 1), (admitted, 1 if failed_first else 0)]:
         connection = db.scalar(select(UserConnection).where(UserConnection.user_id == member.id))
         connection.created_at = datetime(2026, 10, 13, 12, position, tzinfo=UTC)
-    if failure is WearableHistoryMetadataUnavailableError:
-        db.query(WearableHistorySource).filter(WearableHistorySource.user_id == blocked.id).delete()
     db.commit()
+    original_source = WearableHistoryIngressRepository.source
+
+    def source_read(self: WearableHistoryIngressRepository, identity: tuple) -> object:
+        # A metadata outage is a failed read; a missing row of a connected source is repaired.
+        if failure is WearableHistoryMetadataUnavailableError and identity[0] == blocked.id:
+            raise WearableHistoryMetadataUnavailableError("Connected source history is unavailable")
+        return original_source(self, identity)
+
     payload = {
         "epochs": [
             {
@@ -316,6 +322,7 @@ def test_garmin_history_retry_preserves_other_members_of_the_same_provider_accou
             db.rollback()
 
     with (
+        patch.object(WearableHistoryIngressRepository, "source", source_read),
         patch("app.integrations.celery.tasks.webhook_push_task.SessionLocal", session),
         patch(
             "app.integrations.celery.tasks.webhook_push_task.ProviderFactory",

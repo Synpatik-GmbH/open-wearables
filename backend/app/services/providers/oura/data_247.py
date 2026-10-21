@@ -31,6 +31,7 @@ from app.schemas.providers.oura import (
     OuraSleepJSON,
 )
 from app.schemas.providers.oura.imports import OuraIntervalData, OuraMetJSON, OuraPersonalInfoJSON
+from app.schemas.sync_status import DataTypeFailure
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.providers.api_client import make_authenticated_request
@@ -44,9 +45,14 @@ from app.services.providers.oura.coverage import (
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.raw_payload_storage import store_raw_payload
+from app.services.sync_error_code import UNKNOWN, error_code
 from app.services.timeseries_service import timeseries_service
 from app.utils.dates import offset_to_iso, parse_iso_datetime, to_rfc3339
 from app.utils.structured_logging import LogContext, log_structured
+from app.utils.wearable_history_ingress import (
+    FirstNightAssociationUnavailableError,
+    WearableHistoryMetadataUnavailableError,
+)
 
 
 class Oura247Data(Base247DataTemplate):
@@ -1279,7 +1285,7 @@ class Oura247Data(Base247DataTemplate):
         start_time: datetime | str | None = None,
         end_time: datetime | str | None = None,
         is_first_sync: bool = False,
-    ) -> dict[str, int]:
+    ) -> dict[str, int | DataTypeFailure]:
         """Load and save all 247 data types.
 
         Args:
@@ -1335,13 +1341,18 @@ class Oura247Data(Base247DataTemplate):
             "vo2_max": lambda: self.save_vo2_data(db, user_id, self.get_vo2_data(db, user_id, start_time, end_time)),
         }
 
-        results: dict[str, int] = {}
+        results: dict[str, int | DataTypeFailure] = {}
         for data_type, fn in tasks.items():
             try:
                 results[data_type] = fn()
             except Exception as e:
                 db.rollback()
-                results[data_type] = 0
+                # A retriable history error holds the cursor, so the next pull asks for this
+                # span again; any other failure keeps the existing "nothing saved" result.
+                retriable = isinstance(
+                    e, (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError)
+                )
+                results[data_type] = DataTypeFailure(code=error_code(e) or UNKNOWN) if retriable else 0
                 log_structured(
                     self.logger,
                     "error",

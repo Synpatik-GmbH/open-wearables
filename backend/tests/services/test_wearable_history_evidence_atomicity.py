@@ -1,0 +1,186 @@
+"""Night evidence counts only for a sleep that was actually stored (Codex P1 on #46 at 0100f1f1)."""
+
+from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
+from uuid import uuid4
+
+import pytest
+from sqlalchemy.orm import Session
+
+from app.models import EventRecord, User
+from app.repositories.event_record_repository import EventRecordRepository
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
+from app.repositories.wearable_history_repository import WearableHistoryRepository
+from app.schemas.model_crud.activities import EventRecordCreate
+from tests.factories import DataSourceFactory, UserFactory
+
+
+def provisional_source(db: Session) -> tuple:
+    member = UserFactory()
+    # Connected in the future, so the source stays provisional whatever the test clock reads.
+    connected = datetime.now(UTC) + timedelta(days=2)
+    source = WearableHistoryRepository().begin_source(db, member.id, "garmin", connected)
+    data_source = DataSourceFactory(user=member, provider="garmin", source="garmin")
+    db.commit()
+    return member, data_source, source.connection_day
+
+
+def sleep_creator(member: User, night_start: datetime) -> EventRecordCreate:
+    return EventRecordCreate(
+        id=uuid4(),
+        user_id=member.id,
+        source="garmin",
+        source_name="Garmin",
+        category="sleep",
+        type="sleep_session",
+        start_datetime=night_start,
+        end_datetime=night_start + timedelta(hours=8),
+        zone_offset="+00:00",
+    )
+
+
+def test_failed_single_sleep_write_leaves_no_night_evidence(db: Session) -> None:
+    member, data_source, connection_day = provisional_source(db)
+    night_start = datetime.combine(connection_day - timedelta(days=11), datetime.min.time(), UTC) + timedelta(hours=22)
+    record = EventRecord(
+        id=uuid4(),
+        data_source_id=data_source.id,
+        category="sleep",
+        type="sleep_session",
+        source_name="Garmin",
+        start_datetime=night_start,
+        end_datetime=night_start + timedelta(hours=8),
+        zone_offset="+00:00",
+    )
+
+    def failing_write() -> None:
+        raise RuntimeError("detail write failed")
+
+    with pytest.raises(RuntimeError, match="detail write failed"):
+        WearableHistoryIngressRepository(db).persist_event(record, failing_write)
+    db.commit()  # A provider that catches the failure and carries on still commits.
+    db.expire_all()
+    source = WearableHistoryRepository().get(db, member.id, "garmin")
+    assert source.night_dates == []
+    assert source.start_date == connection_day
+
+
+def test_failed_bulk_sleep_insert_leaves_no_night_evidence(db: Session) -> None:
+    member, _, connection_day = provisional_source(db)
+    night_start = datetime.combine(connection_day - timedelta(days=11), datetime.min.time(), UTC) + timedelta(hours=22)
+    repository = EventRecordRepository(EventRecord)
+    with (
+        patch.object(
+            repository.data_source_repo, "batch_ensure_data_sources", side_effect=RuntimeError("insert failed")
+        ),
+        pytest.raises(Exception, match="insert failed"),
+    ):
+        repository.bulk_create(db, [sleep_creator(member, night_start)])
+    db.commit()
+    db.expire_all()
+    source = WearableHistoryRepository().get(db, member.id, "garmin")
+    assert source.night_dates == []
+    assert source.start_date == connection_day
+
+
+def test_connection_without_history_row_begins_its_source_from_the_connection_clock(db: Session) -> None:
+    """Codex P2 on #46: a failed history write after the OAuth commit must not strand the connection."""
+    from app.models import DataPointSeries, UserConnection
+    from app.models.wearable_history_source import WearableHistorySource
+    from app.repositories.data_point_series_repository import DataPointSeriesRepository
+    from app.schemas.enums import SeriesType
+    from app.schemas.model_crud.activities import TimeSeriesSampleCreate
+    from tests.factories import UserConnectionFactory
+
+    member = UserFactory()
+    WearableHistoryRepository().begin_source(db, member.id, "apple")  # Another source has authority.
+    UserConnectionFactory(user=member, provider="polar")
+    # The factory begins the source as OAuth does; remove it to model a failed history write.
+    db.query(WearableHistorySource).filter(
+        WearableHistorySource.user_id == member.id, WearableHistorySource.provider == "polar"
+    ).delete()
+    connected_at = datetime(2026, 10, 18, 21, 30, tzinfo=UTC)  # 23:30 Berlin, still the 18th
+    db.query(UserConnection).filter(UserConnection.user_id == member.id).update(
+        {UserConnection.created_at: connected_at}
+    )
+    db.commit()
+    sample = TimeSeriesSampleCreate(
+        id=uuid4(),
+        user_id=member.id,
+        provider="polar",
+        source="polar",
+        recorded_at=datetime.now(UTC),
+        series_type=SeriesType.heart_rate,
+        value=60,
+    )
+    assert DataPointSeriesRepository(DataPointSeries).bulk_create(db, [sample]).inserted == 1
+    source = WearableHistoryRepository().get(db, member.id, "polar")
+    assert source is not None
+    assert source.connection_day.isoformat() == "2026-10-18"
+
+
+def test_xml_importer_alias_is_judged_by_the_apple_source() -> None:
+    """Codex P1 on #46: XML sleep names its provider "apple_health_xml"."""
+    from types import SimpleNamespace
+
+    from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository as Gate
+
+    member = uuid4()
+    gate = Gate.__new__(Gate)
+    sleep = SimpleNamespace(category="sleep", user_id=member, provider="apple_health_xml")
+    assert gate.identity(sleep) == (member, "apple")
+
+
+def test_xml_sleep_with_an_apple_source_is_admitted_instead_of_raising(db: Session) -> None:
+    from types import SimpleNamespace
+
+    member = UserFactory()
+    connected = datetime.now(UTC) + timedelta(days=2)
+    WearableHistoryRepository().begin_source(db, member.id, "apple", connected)
+    db.commit()
+    night_start = datetime.now(UTC) - timedelta(hours=10)
+    sleep = SimpleNamespace(
+        category="sleep",
+        user_id=member.id,
+        provider="apple_health_xml",
+        start_datetime=night_start,
+        end_datetime=night_start + timedelta(hours=8),
+        zone_offset="+00:00",
+    )
+    assert WearableHistoryIngressRepository(db).event_admitted(sleep) is True
+
+
+@pytest.mark.parametrize("failure", ["first_night", "metadata"])
+def test_oura_retriable_history_error_holds_the_pull_cursor(failure: str) -> None:
+    """Codex P1 on #46: a swallowed retry error let the cursor pass an acknowledged sample."""
+    from unittest.mock import MagicMock
+
+    from app.schemas.sync_status import DataTypeFailure
+    from app.services.providers.oura.data_247 import Oura247Data
+    from app.utils.wearable_history_ingress import (
+        FirstNightAssociationUnavailableError,
+        WearableHistoryMetadataUnavailableError,
+    )
+
+    error = (
+        FirstNightAssociationUnavailableError("first night")
+        if failure == "first_night"
+        else WearableHistoryMetadataUnavailableError("metadata")
+    )
+    service = Oura247Data("oura", "https://provider.test", MagicMock())
+    db = MagicMock()
+    with patch.multiple(
+        service,
+        **{
+            name: MagicMock(return_value=[])
+            for name in dir(service)
+            if name.startswith("get_") and name.endswith("_data") or name == "get_personal_info"
+        },
+    ):
+        saves = {name: MagicMock(return_value=0) for name in dir(service) if name.startswith("save_")}
+        saves["save_heart_rate_data"] = MagicMock(side_effect=error)
+        with patch.multiple(service, **saves):
+            results = service.load_and_save_all(db, uuid4())
+    assert isinstance(results["heart_rate"], DataTypeFailure)
+    assert results["heart_rate"].code == type(error).__name__
+    assert results["sleep"] == 0  # Ordinary types still report their counts.
