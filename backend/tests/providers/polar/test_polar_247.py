@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 
 from app.schemas.enums import HealthScoreCategory, SeriesType
-from app.services.providers.polar.data_247 import Polar247Data
+from app.services.providers.polar.data_247 import Polar247Data, _ContinuousHrOffsets
 from app.services.providers.polar.strategy import PolarStrategy
 
 
@@ -206,7 +206,7 @@ class TestPolar247ContinuousHRNormalization:
 
     def test_produces_hr_timeseries(self, data_247: Polar247Data, sample_chr: dict) -> None:
         user_id = uuid4()
-        samples = data_247.normalize_continuous_hr([sample_chr], user_id)
+        samples = data_247.normalize_continuous_hr([sample_chr], user_id, _ContinuousHrOffsets({}))
 
         assert len(samples) == 3
         assert all(s.series_type == SeriesType.heart_rate for s in samples)
@@ -214,13 +214,13 @@ class TestPolar247ContinuousHRNormalization:
 
     def test_bpm_values(self, data_247: Polar247Data, sample_chr: dict) -> None:
         user_id = uuid4()
-        samples = data_247.normalize_continuous_hr([sample_chr], user_id)
+        samples = data_247.normalize_continuous_hr([sample_chr], user_id, _ContinuousHrOffsets({}))
         bpm_values = [s.value for s in samples]
         assert bpm_values == [62, 65, 60]
 
     def test_timestamps_use_date_as_anchor(self, data_247: Polar247Data, sample_chr: dict) -> None:
         user_id = uuid4()
-        samples = data_247.normalize_continuous_hr([sample_chr], user_id)
+        samples = data_247.normalize_continuous_hr([sample_chr], user_id, _ContinuousHrOffsets({}))
         assert samples[0].recorded_at.date().isoformat() == "2024-01-15"
         assert samples[0].recorded_at.hour == 8
         assert samples[0].recorded_at.minute == 0
@@ -228,10 +228,10 @@ class TestPolar247ContinuousHRNormalization:
     def test_missing_samples_skipped(self, data_247: Polar247Data, sample_chr: dict) -> None:
         sample_chr["heart_rate_samples"] = []
         user_id = uuid4()
-        assert data_247.normalize_continuous_hr([sample_chr], user_id) == []
+        assert data_247.normalize_continuous_hr([sample_chr], user_id, _ContinuousHrOffsets({})) == []
 
     def test_empty_input(self, data_247: Polar247Data) -> None:
-        assert data_247.normalize_continuous_hr([], uuid4()) == []
+        assert data_247.normalize_continuous_hr([], uuid4(), _ContinuousHrOffsets({})) == []
 
 
 # ---------------------------------------------------------------------------

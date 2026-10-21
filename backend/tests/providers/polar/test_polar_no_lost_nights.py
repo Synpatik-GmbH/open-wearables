@@ -94,7 +94,8 @@ class FakePolar:
             return sleep
         if endpoint == "/v3/users/nightly-recharge":
             return {"recharges": self.recharges}
-        return [] if endpoint != "/v3/users/continuous-heart-rate" else {"heart_rates": []}
+        # The range (pull) and a day's path (webhook) both answer as Polar does, with a body.
+        return [] if not endpoint.startswith("/v3/users/continuous-heart-rate") else {"heart_rates": []}
 
     def requested(self, endpoint: str) -> list[dict[str, Any] | None]:
         return [p for e, p in self.calls if e == endpoint]

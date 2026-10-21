@@ -26,21 +26,27 @@ Three rules, all read and written here, all keyed on the Polar connection:
   past the pull interval, at most once every ``ON_OPEN_INTERVAL`` and ``ON_OPEN_DAILY_CAP`` times a
   Berlin day (``claim_on_open``). Each costs at most three calls, so a day of them adds at most 36
   to a worst-case day of 146, inside the 200 that 50 members leave each (AC17, AC18).
+- 2.96.8 (spec v1.1, P7, AC11): a continuous heart-rate webhook costs two calls, the day and the
+  sleep listing its offsets come from. At most ``WEBHOOK_HR_DAILY_CAP`` of them call Polar in any
+  24 hours (``claim_continuous_hr_webhook``), so they add at most 18: 146 + 36 + 18 = 200. Past
+  the cap a webhook calls nothing and the day is stored by the next full fetch.
 
 The state is one ``PolarPullState`` row. Writes commit at once: the claim has to be visible to
 a pull starting in another worker, and a fetch already stored must not be forgotten when a
-later type of the same pull fails.
+later type of the same pull fails. The webhook claims are a Redis key per member: the instants
+of the last 24 hours' claims, no health value, expiring 24 hours after the last.
 """
 
 from collections.abc import Iterable
 from datetime import datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import case, literal, select, type_coerce, update
 from sqlalchemy.dialects.postgresql import JSONB, insert
 
 from app.database import DbSession
+from app.integrations.redis_client import get_redis_client
 from app.models import PolarPullState
 
 PULL_INTERVAL = timedelta(minutes=55)
@@ -49,10 +55,25 @@ RETRY_FIRST_GAP = timedelta(hours=1)
 RETRY_MAX_GAP = timedelta(hours=21)
 ON_OPEN_INTERVAL = timedelta(seconds=30)
 ON_OPEN_DAILY_CAP = 12
+WEBHOOK_HR_DAILY_CAP = 9
+_WEBHOOK_HR_WINDOW = timedelta(hours=24)
+# Drop the claims older than the window, then claim one if fewer than the cap are left. One
+# script, so two webhooks at once cannot both claim the last one; only a claim is recorded, so
+# any 24 hours hold at most the cap. KEYS[1] the member's key; ARGV now, window, cap, claim id.
+_CLAIM_WEBHOOK_LUA = """
+redis.call("zremrangebyscore", KEYS[1], "-inf", tonumber(ARGV[1]) - tonumber(ARGV[2]))
+if redis.call("zcard", KEYS[1]) >= tonumber(ARGV[3]) then
+    return 0
+end
+redis.call("zadd", KEYS[1], ARGV[1], ARGV[4])
+redis.call("expire", KEYS[1], ARGV[2])
+return 1
+"""
 
-# Why an ask on open was refused.
+# Why an ask on open, or a continuous heart-rate webhook, was refused.
 TOO_SOON = "too_soon"
 DAILY_CAP = "daily_cap"
+COUNT_UNAVAILABLE = "count_unavailable"
 
 _BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -238,7 +259,33 @@ def claim_on_open(db: DbSession, connection_id: UUID, now: datetime) -> str | No
     return DAILY_CAP
 
 
+def claim_continuous_hr_webhook(user_id: UUID, now: datetime) -> str | None:
+    """Record that a continuous heart-rate webhook calls Polar now (2.96.8, P7).
+
+    Returns None when claimed, or why not: ``DAILY_CAP`` while ``WEBHOOK_HR_DAILY_CAP`` were claimed
+    in the 24 hours before ``now``, ``COUNT_UNAVAILABLE`` when the claims cannot be read. A webhook
+    that is not claimed calls nothing, so claims that cannot be read cost nothing either. The
+    window rolls rather than resetting at midnight: a calendar day would let the 24 hours across
+    one midnight hold twice the cap.
+    """
+    window = int(_WEBHOOK_HR_WINDOW.total_seconds())
+    try:
+        claimed = get_redis_client().eval(
+            _CLAIM_WEBHOOK_LUA,
+            1,
+            f"polar_hr_webhook:{user_id}",
+            now.timestamp(),
+            window,
+            WEBHOOK_HR_DAILY_CAP,
+            uuid4().hex,
+        )
+    except Exception:
+        return COUNT_UNAVAILABLE
+    return None if int(claimed) == 1 else DAILY_CAP
+
+
 __all__ = [
+    "COUNT_UNAVAILABLE",
     "DAILY_CAP",
     "FULL_INTERVAL",
     "ON_OPEN_DAILY_CAP",
@@ -248,6 +295,8 @@ __all__ = [
     "RETRY_FIRST_GAP",
     "RETRY_MAX_GAP",
     "TOO_SOON",
+    "WEBHOOK_HR_DAILY_CAP",
+    "claim_continuous_hr_webhook",
     "claim_on_open",
     "claim_pull",
     "full_due",
