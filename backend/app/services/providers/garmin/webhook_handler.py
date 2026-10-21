@@ -276,7 +276,7 @@ class GarminWebhookHandler(BaseWebhookHandler):
         synced_user_ids: set[UUID],
         users_with_new_success: set[str],
         request_trace_id: str,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], FirstNightAssociationUnavailableError | WearableHistoryMetadataUnavailableError | None]:
         wellness_results: dict[str, Any] = {}
         retry_error: FirstNightAssociationUnavailableError | WearableHistoryMetadataUnavailableError | None = None
 
