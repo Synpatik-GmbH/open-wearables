@@ -403,9 +403,9 @@ def test_garmin_freeze_crossing_sql_rejection_retries_instead_of_dropping_the_ba
         patch.object(
             process_webhook_push, "retry", side_effect=WearableHistoryMetadataUnavailableError("task retry")
         ) as retry,
+        pytest.raises(WearableHistoryMetadataUnavailableError, match="task retry"),
     ):
-        with pytest.raises(WearableHistoryMetadataUnavailableError, match="task retry"):
-            process_webhook_push.run("garmin", payload, "freeze-crossing")
+        process_webhook_push.run("garmin", payload, "freeze-crossing")
     assert isinstance(retry.call_args.kwargs["exc"], WearableHistoryMetadataUnavailableError)
     assert marked.call_args_list == [((str(admitted.id), "epochs"),)]
     for member, values in [(admitted, [61]), (blocked, [])]:
