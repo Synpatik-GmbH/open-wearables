@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -261,3 +262,40 @@ def test_provisional_sdk_payload_keeps_opaque_extensions_and_worker_validation_p
     with patch("sentry_sdk.capture_message") as capture:
         assert sanitize_sdk_payload(db, member.id, raw) is raw
     capture.assert_not_called()
+
+
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize(
+    "broken",
+    [
+        {"data": {"sleep": "not-a-list"}},
+        {"data": "not-a-dict"},
+        {"sdkVersion": None},
+    ],
+)
+def test_frozen_sdk_upload_with_an_invalid_envelope_is_rejected_not_retried(
+    db: Session, offload: bool, broken: dict
+) -> None:
+    """Parsing a frozen source's payload must not turn a permanent 400 into a retryable 503."""
+
+    member, _ = frozen_source(db)
+    body = {
+        "provider": "apple",
+        "sdkVersion": "1",
+        "syncTimestamp": datetime.now(UTC).isoformat(),
+        "data": {"records": [], "sleep": [], "workouts": []},
+        **broken,
+    }
+    with (
+        patch.object(settings, "sdk_payload_s3_offload", offload),
+        patch("app.api.routes.v1.sdk_sync.load_sleep_state", return_value=None),
+        patch("app.api.routes.v1.sdk_sync.store_raw_payload") as archive,
+        patch("app.api.routes.v1.sdk_sync.put_payload_to_s3") as s3,
+        patch("app.api.routes.v1.sdk_sync.process_sdk_upload.delay") as queue,
+        pytest.raises(HTTPException) as rejected,
+    ):
+        sync_sdk_data(str(member.id), body, SimpleNamespace(auth_type="api_key"), db)
+    assert rejected.value.status_code == 400
+    archive.assert_not_called()
+    s3.assert_not_called()
+    queue.assert_not_called()

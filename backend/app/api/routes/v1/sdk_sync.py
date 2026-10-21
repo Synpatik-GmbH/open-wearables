@@ -3,6 +3,7 @@ import uuid
 from logging import getLogger
 
 from fastapi import APIRouter, HTTPException, status
+from pydantic import ValidationError
 
 from app.config import settings
 from app.constants.sdk_providers import normalize_sdk_provider, sdk_providers
@@ -65,8 +66,9 @@ def sync_sdk_data(
         UploadDataResponse with 202 status and task queued message
 
     Raises:
-        HTTPException: 403 if token doesn't match user_id, 400 if provider unsupported.
-        Payload validation runs async in the worker, not here.
+        HTTPException: 403 if token doesn't match user_id, 400 if provider unsupported, 400 if a
+        frozen source's payload has an invalid envelope (its history gate parses it here).
+        Other payload validation runs async in the worker, not here.
     """
     if auth.auth_type == "sdk_token" and (not auth.user_id or str(auth.user_id) != user_id):
         raise HTTPException(
@@ -94,6 +96,9 @@ def sync_sdk_data(
         body = sanitize_sdk_payload(db, uuid.UUID(user_id), body, load_sleep_state(user_id))
     except HTTPException:
         raise  # An unknown member is the service's 404, not a retryable outage.
+    except ValidationError as exc:
+        # A frozen source's payload is parsed here; an invalid envelope is permanent, not an outage.
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid sync payload") from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Wearable history admission unavailable; retry") from exc
 
