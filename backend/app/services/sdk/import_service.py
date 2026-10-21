@@ -361,6 +361,10 @@ class ImportService:
         # validation_ms measures the parse/per-record pass so we can watch the cost of a
         # malformed payload in the logs.
         started = time.perf_counter()
+        from app.services.sdk.sleep_service import load_sleep_state
+        from app.services.sdk.wearable_history import sanitize_sdk_payload
+
+        raw = sanitize_sdk_payload(db_session, UUID(user_id), raw, load_sleep_state(user_id))
         request, dropped = _parse_sync_request(raw)
         validation_ms = round((time.perf_counter() - started) * 1000, 1)
         workouts_saved = 0

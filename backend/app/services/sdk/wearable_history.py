@@ -1,0 +1,104 @@
+from types import SimpleNamespace
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.constants.series_types.sdk import get_apple_sleep_phase, get_series_type_from_metric_type
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
+from app.schemas.providers.mobile_sdk import SLEEP_START_STATES
+from app.utils.sleep_interval import interval_gap
+
+
+def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None) -> dict:
+    """Run before payload persistence and again on worker delivery. Provisional imports stay whole."""
+    gate = WearableHistoryIngressRepository(db)
+    provider = raw.get("provider")
+    if not isinstance(provider, str):
+        return raw  # Envelope validation remains with the importer; no records are persisted.
+    source = gate.source((member, provider))
+    if source is None or gate.now < source.freeze_at:
+        return raw
+    from app.services.sdk.import_service import _parse_sync_request
+
+    request, _dropped = _parse_sync_request(raw)
+    intervals = []
+    if state is not None and state.provider == provider:
+        intervals.append(
+            SimpleNamespace(
+                category="sleep",
+                user_id=member,
+                provider=provider,
+                start_datetime=state.start_time,
+                end_datetime=state.end_time,
+                zone_offset=state.zone_offset,
+            )
+        )
+    stages = sorted(request.data.sleep, key=lambda s: s.startDate)
+    for item in stages:
+        phase = get_apple_sleep_phase(item.stage)
+        if phase is None or item.endDate <= item.startDate:
+            continue
+        near = next(
+            (
+                r
+                for r in reversed(intervals)
+                if interval_gap(item.startDate, item.endDate, r.start_datetime, r.end_datetime)
+                <= settings.sleep_end_gap_minutes * 60
+            ),
+            None,
+        )
+        if near is not None:
+            near.start_datetime = min(near.start_datetime, item.startDate)
+            near.end_datetime = max(near.end_datetime, item.endDate)
+        elif phase in SLEEP_START_STATES:
+            intervals.append(
+                SimpleNamespace(
+                    category="sleep",
+                    user_id=member,
+                    provider=provider,
+                    start_datetime=item.startDate,
+                    end_datetime=item.endDate,
+                    zone_offset=item.zoneOffset,
+                )
+            )
+    admitted_intervals = [r for r in intervals if gate.event_admitted(r)]
+    request.data.sleep = [
+        s
+        for s in stages
+        if any(r.start_datetime <= s.startDate and s.endDate <= r.end_datetime for r in admitted_intervals)
+    ]
+    request.data.workouts = [
+        w
+        for w in request.data.workouts
+        if gate.event_admitted(
+            SimpleNamespace(
+                category="workout",
+                user_id=member,
+                provider=provider,
+                start_datetime=w.startDate,
+                end_datetime=w.endDate,
+                zone_offset=w.zoneOffset,
+            )
+        )
+    ]
+    # These opaque extensions have no normalized consumers. They can contain additional
+    # dated observations, so they cannot bypass the frozen record admission boundary.
+    for workout in request.data.workouts:
+        workout.samples = workout.route = workout.segments = workout.laps = workout.metadata = None
+    for sleep in request.data.sleep:
+        sleep.metadata = None
+    kept = []
+    for item in request.data.records:
+        metric = get_series_type_from_metric_type(item.type or "")
+        if metric is None:
+            continue
+        sample = SimpleNamespace(user_id=member, provider=provider, series_type=metric, recorded_at=item.endDate)
+        if gate.sample_admitted(sample, intervals):
+            if getattr(metric, "value", metric) != "weight":
+                item.metadata = None
+            kept.append(item)
+    request.data.records = kept
+    # At the frozen boundary, unknown payload fields cannot carry unclassified raw history.
+    return request.model_dump(mode="json", by_alias=True)

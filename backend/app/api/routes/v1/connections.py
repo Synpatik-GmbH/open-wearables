@@ -9,15 +9,23 @@ from app.repositories.provider_settings_repository import ProviderSettingsReposi
 from app.schemas.auth import ConnectionStatus, LiveSyncMode, SDKAuthContext
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.user_management import UserConnectionWithCapabilities
+from app.schemas.wearable_history import WearableHistorySourceRead
 from app.services import ApiKeyDep, user_connection_service
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.polar.oauth import polar_registration_pending
+from app.services.wearable_history_sources_service import wearable_history_sources_service
 from app.utils.auth import CombinedAuthDep
 
 router = APIRouter()
 factory = ProviderFactory()
 provider_settings_repo = ProviderSettingsRepository()
+
+
+@router.get("/users/{user_id}/wearable-history-sources")
+def get_wearable_history_sources(user_id: UUID, db: DbSession, _api_key: ApiKeyDep) -> list[WearableHistorySourceRead]:
+    """Adapter-only history metadata, independently retained across disconnects."""
+    return wearable_history_sources_service.list_sources(db, user_id)
 
 
 def _with_capabilities(

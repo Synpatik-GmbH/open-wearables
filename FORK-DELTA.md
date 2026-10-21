@@ -423,3 +423,15 @@ GIT_SEQUENCE_EDITOR="cp /path/to/rebase-todo.txt" GIT_EDITOR=true \
 Drop `GIT_EDITOR=true` if you want to reword each of the 8 combined messages as you go
 (recommended — e.g. commit 1 should read "session-lifecycle hardening", not just "cache
 last_synced_at").
+
+## Wearable history start date — 2.96.9.1, 30 October 2026
+
+Implements [approved v0.4](docs/specs/2026-10-21-2_96_9-wearable-history-start-date-spec-v0_4.md). The new `wearable_history_sources` store has an independent lifetime from provider connections. Successful connection begins its Berlin day; accepted nights in the fixed connection-minus-28 through connection window can move the provisional date earlier until Berlin midnight after connection day 7. Disconnect/reconnect preserves it; member erasure cascades it.
+
+`GET /api/v1/users/{user_id}/wearable-history-sources` requires an API key and returns `provider`, `connection_day`, `start_date`, `freeze_at`. SDK tokens cannot read it. The adapter mirrors these internal values; they add no app response or prompt facts. Baseline and sleep scoring reads use the current cutoff, including the whole first night. Raw provisional history remains available for evidence and the existing bounded history reads.
+
+Typed SDK payloads are selected before queue/S3 persistence and again on worker delivery after freeze. Shared repository, ORM and PostgreSQL guards also reject frozen pre-start normalized data; weight is exempt. Optional opaque provider/FIT archives stop at freeze, and archival aggregation checks every contributor before deleting any. Migration `a29691004b01` follows `635d0674389f`; apply the schema before dependent backend and adapter code.
+
+For Dragan: this PR targets `release/0.9.0-syn`, never the pristine upstream `main`. Merge this backend schema/API before the adapter's version-133 schema and dependent code for 30 October. Physical S12 deletion and the XML/pre-signed S3 path are a follow-up explicitly authorized by Andrei on 21 October. **Both must be merged and live before any production source reaches its freeze.** Use the earliest persisted `freeze_at`, not the release date plus seven days. For a source first connected on 30 October, freeze is 6 November 00:00 Europe/Berlin.
+
+XML uploads remain available, including weight. In the follow-up, frozen pre-start XML records never leave the upload file; the file is deleted after processing. All physical deletion failures, including the existing swallowed S3 failure on the purge path, stay pending and retry without reporting completion. This PR does not implement physical S12 purge or the XML boundary.

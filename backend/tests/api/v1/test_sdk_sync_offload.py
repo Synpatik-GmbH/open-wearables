@@ -7,9 +7,8 @@ import pytest
 from starlette.testclient import TestClient
 
 from app.config import settings
-from tests.factories import ApiKeyFactory
+from tests.factories import ApiKeyFactory, UserFactory
 
-_USER_ID = "123e4567-e89b-12d3-a456-426614174000"
 _REF = "s3://bucket/raw-payloads/apple/sdk/2026-08-26/user/x.json"
 _BODY = {
     "provider": "apple",
@@ -28,8 +27,9 @@ def mock_task() -> Generator[MagicMock, None, None]:
 
 def _sync(client: TestClient, api_v1_prefix: str) -> object:
     api_key = ApiKeyFactory()
+    member = UserFactory()
     return client.post(
-        f"{api_v1_prefix}/sdk/users/{_USER_ID}/sync/",
+        f"{api_v1_prefix}/sdk/users/{member.id}/sync/",
         headers={"X-Open-Wearables-API-Key": api_key.plain_key},
         json=_BODY,
     )

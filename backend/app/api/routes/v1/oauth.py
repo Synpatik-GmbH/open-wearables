@@ -19,6 +19,7 @@ from app.services import ApiKeyDep, DeveloperDep, user_connection_service
 from app.services.provider_settings_service import ProviderSettingsService
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
+from app.services.wearable_history_sources_service import wearable_history_sources_service
 
 router = APIRouter()
 factory = ProviderFactory()
@@ -102,6 +103,7 @@ def oauth_callback(
 
     assert strategy.oauth
     oauth_state = strategy.oauth.handle_callback(db, code, state)
+    wearable_history_sources_service.begin_source(db, oauth_state.user_id, provider_name.value)
 
     # Stamp last_synced_at=now so the first periodic sync uses the connection
     # timestamp as its live-sync cursor and won't attempt to pull all history.

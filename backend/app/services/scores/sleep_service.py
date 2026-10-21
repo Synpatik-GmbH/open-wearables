@@ -20,6 +20,7 @@ from app.constants.sleep import SleepStageType
 from app.database import DbSession
 from app.models import EventRecord, SleepDetails
 from app.repositories.event_record_repository import EventRecordRepository
+from app.repositories.wearable_history_read_repository import WearableHistoryReadRepository
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import EventRecordQueryParams, HealthScoreCreate, ScoreComponent
 from app.schemas.model_crud.activities.sleep import SleepStage
@@ -160,7 +161,10 @@ class SleepScoreService:
                 limit=20,
             ),
             str(user_id),
+            restrict_to_record_ids=WearableHistoryReadRepository(db_session, user_id).sleep_record_ids(),
         )
+        history_boundary = WearableHistoryReadRepository(db_session, user_id)
+        records = [(record, provider) for record, provider in records if history_boundary.event_eligible(record)]
 
         # Keep non-nap sessions that actually started on sleep_date (local time).
         sessions = [
@@ -191,7 +195,12 @@ class SleepScoreService:
                 limit=sleep_config.rolling_window_nights * 4,
             ),
             str(user_id),
+            restrict_to_record_ids=WearableHistoryReadRepository(db_session, user_id).sleep_record_ids(),
         )
+        history_boundary = WearableHistoryReadRepository(db_session, user_id)
+        hist_records = [
+            (record, provider) for record, provider in hist_records if history_boundary.event_eligible(record)
+        ]
 
         # Deduplicate by calendar date so multiple sessions on one night (e.g. two
         # sources syncing the same sleep, or a split session) don't crowd out earlier
@@ -314,7 +323,12 @@ class SleepScoreService:
                 limit=min(1000, (len(record_wakes) + sleep_config.rolling_window_nights) * 4),
             ),
             str(user_id),
+            restrict_to_record_ids=WearableHistoryReadRepository(db_session, user_id).sleep_record_ids(),
         )
+        history_boundary = WearableHistoryReadRepository(db_session, user_id)
+        all_records = [
+            (record, provider) for record, provider in all_records if history_boundary.event_eligible(record)
+        ]
 
         # Build a sorted list of all valid non-nap sessions in the window for
         # history lookup, and separately index the target sessions by record id.
@@ -426,7 +440,12 @@ class SleepScoreService:
                 limit=(len(dates) + sleep_config.rolling_window_nights) * 4,
             ),
             str(user_id),
+            restrict_to_record_ids=WearableHistoryReadRepository(db_session, user_id).sleep_record_ids(),
         )
+        history_boundary = WearableHistoryReadRepository(db_session, user_id)
+        all_records = [
+            (record, provider) for record, provider in all_records if history_boundary.event_eligible(record)
+        ]
 
         # Build a per-night index keeping the longest non-nap session per calendar date.
         sessions_by_date: dict[date, tuple[EventRecord, SleepDetails]] = {}

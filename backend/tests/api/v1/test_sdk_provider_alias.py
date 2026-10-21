@@ -8,7 +8,7 @@ import pytest
 from httpx import Response
 from starlette.testclient import TestClient
 
-from tests.factories import ApiKeyFactory
+from tests.factories import ApiKeyFactory, UserFactory
 
 
 @pytest.fixture(autouse=True)
@@ -20,7 +20,7 @@ def mock_celery_tasks() -> Generator[MagicMock, None, None]:
 
 def _post(client: TestClient, api_v1_prefix: str, provider: str) -> Response:
     api_key = ApiKeyFactory()
-    user_id = "123e4567-e89b-12d3-a456-426614174000"
+    user_id = UserFactory().id
     return client.post(
         f"{api_v1_prefix}/sdk/users/{user_id}/sync/",
         headers={"X-Open-Wearables-API-Key": api_key.plain_key},

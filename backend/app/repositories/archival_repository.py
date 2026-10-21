@@ -13,6 +13,7 @@ from app.models import DataPointSeries, DataPointSeriesArchive, DataSource
 from app.models.archival_setting import ArchivalSetting
 from app.models.series_type_definition import SeriesTypeDefinition
 from app.repositories.repositories import timeline_key_column, utc_bucket_start
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.enums import (
     AGGREGATION_METHOD_BY_TYPE,
     AggregationMethod,
@@ -23,6 +24,7 @@ from app.schemas.enums import (
     get_series_type_from_id,
     get_series_type_id,
 )
+from app.utils.wearable_history_ingress import PreStartDataRejectedError
 
 # ---------------------------------------------------------------------------
 # Archival Settings repository
@@ -177,6 +179,19 @@ class DataPointSeriesArchiveRepository:
                 break
 
             source_id_list = [s[0] for s in source_ids]
+
+            gate = WearableHistoryIngressRepository(db)
+            contributors = (
+                db.query(DataPointSeries)
+                .filter(
+                    DataPointSeries.data_source_id.in_(source_id_list),
+                    cast(DataPointSeries.recorded_at, Date) < cutoff_date,
+                )
+                .yield_per(1000)
+            )
+            for sample in contributors:
+                if not gate.sample_admitted(sample):
+                    raise PreStartDataRejectedError("Archive contains a frozen pre-start contributor")
 
             # Step 2: Group by (source, type, date) and compute all aggregates
             # We'll post-process to select the correct one per type

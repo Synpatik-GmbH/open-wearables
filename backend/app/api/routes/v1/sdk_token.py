@@ -7,6 +7,7 @@ from app.config import settings
 from app.database import DbSession
 from app.schemas.auth import SDKTokenRequest, TokenResponse
 from app.services import application_service, create_sdk_user_token, refresh_token_service, user_service
+from app.services.wearable_history_sources_service import wearable_history_sources_service
 from app.utils.auth import DeveloperOptionalDep
 
 router = APIRouter()
@@ -87,6 +88,7 @@ def create_user_token(
         user_id=str(user_id),
     )
 
+    wearable_history_sources_service.begin_source(db, user_id, "apple")
     refresh_token = refresh_token_service.mint_sdk_refresh_token(db, user_id, app_id)
 
     return TokenResponse(

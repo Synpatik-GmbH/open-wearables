@@ -6,6 +6,7 @@ from app.database import DbSession
 from app.models import UserConnection
 from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
+from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.schemas.enums import ProviderName, SdkConnectionOutcome
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
 from app.schemas.responses.upload import ConnectionsCoverage, ProviderConnectionCount
@@ -71,9 +72,11 @@ class UserConnectionService(
         because it feeds the webhook idempotency key: this runs on every batch and the
         Celery task retries, so a row-derived key is what collapses the duplicates.
         """
+        WearableHistoryRepository().begin_source(db_session, user_id, provider)
         connection, outcome = self.crud.ensure_sdk_connection(db_session, user_id, provider)
 
         if outcome == SdkConnectionOutcome.EXISTING:
+            db_session.commit()
             return connection
 
         connected_at = connection.created_at if outcome == SdkConnectionOutcome.CREATED else connection.updated_at

@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import insert
 from app.database import DbSession
 from app.models import DataSource, HealthScore
 from app.repositories.repositories import CrudRepository
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.enums import HealthScoreCategory
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
 from app.utils.pagination import decode_cursor
@@ -49,6 +50,8 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
 
     def bulk_create(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> None:
         """Bulk insert health scores, doing nothing on conflict with the unique constraint."""
+        gate = WearableHistoryIngressRepository(db_session)
+        creators = [creator for creator in creators if gate.score_admitted(creator)]
         if not creators:
             return
 

@@ -46,6 +46,7 @@ from app.repositories.repositories import (
     timeline_key_column,
     utc_bucket_start,
 )
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.enums import (
     BUCKET_SIZES,
     AggregationMethod,
@@ -218,6 +219,7 @@ class DataPointSeriesRepository(
         Returns the number of rows actually written, split into inserted (new)
         vs updated (refreshed in place via ON CONFLICT).
         """
+        creators = WearableHistoryIngressRepository(db_session).filter_samples(creators)
         if not creators:
             return WriteCounts(0, 0)
 
@@ -1574,7 +1576,7 @@ class DataPointSeriesRepository(
         [start_dt, end_dt), ordered by recorded_at ascending.
         """
         results = (
-            db_session.query(self.model.recorded_at, self.model.value)
+            db_session.query(self.model, DataSource)
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
@@ -1585,4 +1587,12 @@ class DataPointSeriesRepository(
             .order_by(self.model.recorded_at, self.model.id)
             .all()
         )
-        return [(row.recorded_at, float(row.value)) for row in results]
+        from app.repositories.wearable_history_read_repository import WearableHistoryReadRepository
+        from app.schemas.enums import get_series_type_from_id
+
+        return WearableHistoryReadRepository(db_session, user_id).filter_series(
+            [(sample, source) for sample, source in results],
+            start_dt,
+            end_dt,
+            weight=get_series_type_from_id(type_id).value == "weight",
+        )

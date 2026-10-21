@@ -6,10 +6,14 @@ from fastapi import APIRouter, HTTPException, status
 
 from app.config import settings
 from app.constants.sdk_providers import normalize_sdk_provider, sdk_providers
+from app.database import DbSession
 from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_upload
+from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.schemas.providers.mobile_sdk import SyncRequest
 from app.schemas.responses.upload import UploadDataResponse
 from app.services.raw_payload_storage import put_payload_to_s3, store_raw_payload
+from app.services.sdk.sleep_service import load_sleep_state
+from app.services.sdk.wearable_history import sanitize_sdk_payload
 from app.utils.api_utils import inline_schema_defs
 from app.utils.auth import SDKAuthDep
 from app.utils.sentry_helpers import log_and_capture_error
@@ -34,6 +38,7 @@ def sync_sdk_data(
     user_id: str,
     body: dict,
     auth: SDKAuthDep,
+    db: DbSession,
 ) -> UploadDataResponse:
     """Import health data from SDK provider asynchronously via Celery.
 
@@ -83,6 +88,12 @@ def sync_sdk_data(
     # The worker and import service re-read the provider from the payload, so the
     # canonical slug has to replace the alias here rather than travel alongside it.
     body["provider"] = provider
+    try:
+        WearableHistoryRepository().begin_source(db, uuid.UUID(user_id), provider)
+        db.commit()
+        body = sanitize_sdk_payload(db, uuid.UUID(user_id), body, load_sleep_state(user_id))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Wearable history admission unavailable; retry") from exc
 
     # Generate unique batch ID for tracking
     batch_id = str(uuid.uuid4())

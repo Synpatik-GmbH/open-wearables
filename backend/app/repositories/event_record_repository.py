@@ -29,6 +29,7 @@ from app.database import DbSession
 from app.models import DataPointSeries, DataSource, EventRecord, SleepDetails, WorkoutDetails
 from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.repositories import CrudRepository, source_filter_conditions, utc_bucket_start
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.enums import ProviderName, SeriesType, TimelineBucket, get_series_type_id
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -182,6 +183,7 @@ class EventRecordRepository(
         db_session: DbSession,
         creators: list[EventRecordCreate],
     ) -> list[UUID]:
+        creators = WearableHistoryIngressRepository(db_session).filter_events(creators)
         if not creators:
             return []
 
@@ -1042,4 +1044,11 @@ class EventRecordRepository(
             )
             .all()
         )
-        return [(event_record, sleep_details) for event_record, sleep_details in rows]
+        from app.repositories.wearable_history_read_repository import WearableHistoryReadRepository
+
+        history = WearableHistoryReadRepository(db_session, user_id)
+        return [
+            (event_record, sleep_details)
+            for event_record, sleep_details in rows
+            if history.event_eligible(event_record)
+        ]

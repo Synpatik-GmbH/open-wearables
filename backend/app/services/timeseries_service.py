@@ -12,6 +12,7 @@ from app.database import DbSession
 from app.models import DataPointSeries, DataSource
 from app.repositories import DataPointSeriesRepository
 from app.repositories.data_point_series_repository import AggregatedSample, WriteCounts
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.enums import (
     Resolution,
     SeriesType,
@@ -142,7 +143,8 @@ class TimeSeriesService(
         batch then holds one batch at a time however slow the send is (Codex on #43); every other
         caller keeps the thread.
         """
-        counts = self.crud.bulk_create(db_session, samples)  # ty:ignore[invalid-argument-type]
+        samples = WearableHistoryIngressRepository(db_session).filter_samples(samples)
+        counts = self.crud.bulk_create(db_session, samples)
         written = getattr(counts, "written_ids", None)
         if emit_only_written and written is not None:
             samples_copy = [s for s in samples if s.id in written]

@@ -25,6 +25,7 @@ from .sync_run_data_type import SyncRunDataType
 from .user import User
 from .user_connection import UserConnection
 from .user_invitation_code import UserInvitationCode
+from .wearable_history_source import WearableHistorySource
 from .workout_details import WorkoutDetails
 
 # Single source of truth mapping detail_type -> concrete model, derived from the
@@ -48,6 +49,7 @@ __all__ = [
     "RefreshToken",
     "User",
     "UserConnection",
+    "WearableHistorySource",
     "UserInvitationCode",
     "EventRecord",
     "EventRecordDetail",
@@ -66,3 +68,6 @@ __all__ = [
     "DetailType",
     "DETAIL_MODELS",
 ]
+
+# Register the shared guard after every model is registered (single-row ORM writes).
+from app.repositories import wearable_history_orm as _wearable_history_orm  # noqa: E402, F401

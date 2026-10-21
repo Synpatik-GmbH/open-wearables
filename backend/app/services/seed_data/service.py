@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.models import PersonalRecord, UserConnection
 from app.repositories import CrudRepository
+from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.schemas.enums import ProviderName, SeriesType, WorkoutType
 from app.schemas.model_crud.user_management import UserConnectionUpdate, UserCreate
 from app.schemas.utils.seed_data import SeedDataRequest
@@ -142,6 +143,7 @@ class SeedDataService:
                 created = connection_repo.create(db, conn_data)
                 if created:
                     prov = ProviderName(conn_data.provider)
+                    WearableHistoryRepository().begin_source(db, user.id, prov.value)
                     connection_repo.update(db, created, UserConnectionUpdate(last_synced_at=provider_sync_times[prov]))
                     summary["connections"] += 1
 

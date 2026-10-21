@@ -29,6 +29,7 @@ from app.schemas.providers.mobile_sdk import (
 from app.services.event_record_service import event_record_service
 from app.services.sdk.device_resolution import extract_device_info
 from app.utils.exceptions import SleepLockBusyError
+from app.utils.sleep_interval import interval_gap
 from app.utils.structured_logging import log_structured
 
 logger = getLogger(__name__)
@@ -132,15 +133,7 @@ def _apply_transition(
     # that arrive out of chronological order: a sample that chains directly onto an
     # earlier part of the night will have a near-zero distance to the session window
     # even if it was enqueued after a later-night payload was already processed.
-    if start_time <= state.end_time and end_time >= state.start_time:
-        # New sample overlaps with the current session window → same session.
-        delta_seconds = 0.0
-    elif end_time <= state.start_time:
-        # New sample is entirely before the session start.
-        delta_seconds = (state.start_time - end_time).total_seconds()
-    else:
-        # New sample is entirely after the session end.
-        delta_seconds = (start_time - state.end_time).total_seconds()
+    delta_seconds = interval_gap(start_time, end_time, state.start_time, state.end_time)
 
     if delta_seconds > settings.sleep_end_gap_minutes * 60:
         finish_sleep(db_session, user_id, state)
@@ -306,6 +299,23 @@ def handle_sleep_data(
 
         # Persist the accumulated state to Redis only once after processing the entire batch
         if current_state:
+            from types import SimpleNamespace
+
+            from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
+            from app.utils.wearable_history_ingress import PreStartDataRejectedError
+
+            gate = WearableHistoryIngressRepository(db_session)
+            if not gate.event_admitted(
+                SimpleNamespace(
+                    category="sleep",
+                    user_id=UUID(user_id),
+                    provider=current_state.provider,
+                    start_datetime=current_state.start_time,
+                    end_datetime=current_state.end_time,
+                    zone_offset=current_state.zone_offset,
+                )
+            ):
+                raise PreStartDataRejectedError("Frozen source rejects pre-start sleep state")
             save_sleep_state(user_id, current_state)
 
         # Finalise synchronously if the session is already stale.  Historical

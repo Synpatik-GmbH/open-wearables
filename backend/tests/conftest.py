@@ -69,6 +69,23 @@ def engine(_postgres_url: str) -> Any:
         max_overflow=10,
     )
     BaseDbModel.metadata.create_all(bind=test_engine)
+    # PostgreSQL functions/triggers are operational schema, absent from create_all.
+    # Install the actual new migration in this private Testcontainers database.
+    import importlib.util
+    from pathlib import Path
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    migration_path = (
+        Path(__file__).parents[1] / "migrations/versions/2026_10_21_0700-a29691004b01_wearable_history_sources.py"
+    )
+    migration_spec = importlib.util.spec_from_file_location("history_schema", migration_path)
+    migration = importlib.util.module_from_spec(migration_spec)
+    migration_spec.loader.exec_module(migration)
+    with test_engine.begin() as connection, Operations.context(MigrationContext.configure(connection)):
+        Operations(MigrationContext.configure(connection)).drop_table("wearable_history_sources")
+        migration.upgrade()
 
     # Seed series type definitions (these need to exist for foreign key constraints)
     with Session(bind=test_engine) as session:

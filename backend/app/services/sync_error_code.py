@@ -65,6 +65,7 @@ _FIXED_WORDS = frozenset(
 # and fails when one is missing from here.
 _APP_MODULES = (
     "app.utils.exceptions",
+    "app.utils.wearable_history_ingress",
     "app.integrations.celery.tasks.send_email_task",
     "app.services.providers.google_health.data_247",
     "app.services.providers.withings.handlers.rpc_client",
