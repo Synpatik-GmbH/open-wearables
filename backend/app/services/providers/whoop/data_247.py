@@ -295,8 +295,9 @@ class Whoop247Data(Base247DataTemplate):
         db: DbSession,
         user_id: UUID,
         normalized_sleep: dict[str, Any],
-    ) -> None:
-        """Save normalized sleep data to database as EventRecord with SleepDetails."""
+        health_score: HealthScoreCreate | None = None,
+    ) -> EventRecord | None:
+        """Save sleep and its dependent series; return the persisted or merged night."""
         sleep_id = normalized_sleep["id"]
 
         # Parse start and end times
@@ -325,7 +326,7 @@ class Whoop247Data(Base247DataTemplate):
                 task="save_sleep_data",
                 user_id=str(user_id),
             )
-            return
+            return None
 
         # Create EventRecord for sleep
         record = EventRecordCreate(
@@ -368,8 +369,16 @@ class Whoop247Data(Base247DataTemplate):
             is_nap=normalized_sleep.get("is_nap", False),
         )
 
+        def save_score(stored: EventRecord) -> None:
+            if health_score is not None:
+                health_score_service.bulk_create(db, [health_score.model_copy(update={"event_record_id": stored.id})])
+
         try:
-            event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
+            stored = event_record_service.create_or_merge_sleep(
+                db, user_id, record, detail, settings.sleep_end_gap_minutes, before_commit=save_score
+            )
+            if stored is None:
+                return None
         except Exception as e:
             log_structured(
                 self.logger,
@@ -379,6 +388,7 @@ class Whoop247Data(Base247DataTemplate):
                 task="save_sleep_data",
                 user_id=str(user_id),
             )
+            return None
 
         # WHOOP exposes respiratory rate as a sleep-score component, not a
         # timeseries, so it never reaches data_point_series via the recovery path
@@ -413,6 +423,7 @@ class Whoop247Data(Base247DataTemplate):
                     task="save_sleep_data",
                     user_id=str(user_id),
                 )
+        return stored
 
     def get_sleep_record(
         self,
@@ -449,9 +460,9 @@ class Whoop247Data(Base247DataTemplate):
         cycle_id = str(cycle_id) if cycle_id else None
         try:
             normalized, health_score = self.normalize_sleep(raw, user_id)
-            self.save_sleep_data(db, user_id, normalized)
-            if health_score:
-                health_score_service.create(db, health_score)
+            stored = self.save_sleep_data(db, user_id, normalized, health_score)
+            if stored is None:
+                return 0, cycle_id
             return 1, cycle_id
         except Exception as e:
             log_structured(
@@ -473,14 +484,13 @@ class Whoop247Data(Base247DataTemplate):
         """Load sleep data from API and save to database. Returns (saved, partial)."""
         raw_data, truncated = self._fetch_paginated(db, user_id, _SLEEP_ENDPOINT, start_time, end_time, "sleep")
         count = 0
-        health_scores: list[HealthScoreCreate] = []
         for item in raw_data:
             try:
                 normalized, health_score = self.normalize_sleep(item, user_id)
-                self.save_sleep_data(db, user_id, normalized)
+                stored = self.save_sleep_data(db, user_id, normalized, health_score)
+                if stored is None:
+                    continue
                 count += 1
-                if health_score:
-                    health_scores.append(health_score)
             except Exception as e:
                 db.rollback()
                 log_structured(
@@ -491,9 +501,6 @@ class Whoop247Data(Base247DataTemplate):
                     task="load_and_save_sleep",
                     user_id=str(user_id),
                 )
-        if health_scores:
-            health_score_service.bulk_create(db, health_scores)
-            db.commit()
         return count, truncated
 
     def load_and_save_all(

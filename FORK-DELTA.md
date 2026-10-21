@@ -437,6 +437,8 @@ SDK import persists accepted sleep before its samples, so a single batch carryin
 
 Polar flushes the interval before its HR and writes HR plus provider score through the existing callback before the single night commit. A failed contributor leaves the night uncommitted and retryable; no stored night can lose its required HR/score through a later write failure.
 
+Suunto and WHOOP consume permanent sleep rejection before dependent nightly series and saved counts in pull and webhook callers. WHOOP writes the provider sleep score through the same flush-only callback, linked to the actual persisted or merged night. The first-night score uses its parent's night date; merged sessions retain one linked provider score. A score-write failure leaves the night unsaved. Independent WHOOP cycle refresh keeps its own admission rule.
+
 For Dragan: this PR targets `release/0.9.0-syn`, never the pristine upstream `main`. Merge this backend schema/API before the adapter's version-133 schema and dependent code for 30 October. Physical S12 deletion and the XML/pre-signed S3 path are a follow-up explicitly authorized by Andrei on 21 October. **Both must be merged and live before any production source reaches its freeze.** Use the earliest persisted `freeze_at`, not the release date plus seven days. For a source first connected on 30 October, freeze is 6 November 00:00 Europe/Berlin.
 
 XML uploads remain available, including weight. In the follow-up, frozen pre-start XML records never leave the upload file; the file is deleted after processing. All physical deletion failures, including the existing swallowed S3 failure on the purge path, stay pending and retry without reporting completion. This PR does not implement physical S12 purge or the XML boundary.
