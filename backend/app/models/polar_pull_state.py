@@ -18,10 +18,7 @@ class PolarPullState(BaseDbModel):
       first. A pull that starts less than ``PULL_INTERVAL`` later is skipped.
     - ``full_fetched_at``: for each data type with a full form, when it was last fetched in
       full without failing, as an ISO instant. A type is fetched in full again once that is
-      ``FULL_INTERVAL`` old; until then each pull fetches its short form, or nothing. It also holds
-      ``continuous_hr_retimed`` once ``scripts/data_migrations/retime_polar_continuous_hr.py`` has
-      run for the connection (2.96.8, AC9); ``full_due`` asks only for data types, so that key is
-      never read as one.
+      ``FULL_INTERVAL`` old; until then each pull fetches its short form, or nothing.
     - ``full_retry`` (spec cause 3, AC4): for each data type whose full fetch failed, how many
       times in a row (``failures``) and when it may be asked for again (``next``, an ISO instant).
       Cleared for the type by its next full fetch that succeeds. Read by ``full_due``.
