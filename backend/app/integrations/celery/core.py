@@ -202,6 +202,12 @@ def create_celery() -> Celery:
             "args": (),
             "kwargs": {},
         },
+        "clean-xml-uploads": {
+            "task": "app.integrations.celery.tasks.wearable_history_purge_task.clean_xml_uploads",
+            "schedule": crontab(minute="*/15"),
+            "args": (),
+            "kwargs": {},
+        },
         "renew-oura-webhooks-monthly": {
             "task": "app.integrations.celery.tasks.renew_oura_webhooks_task.renew_oura_webhooks",
             "schedule": crontab(day_of_month=1, hour=0, minute=0),  # 1st of each month at 00:00 UTC

@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session
 
 from app.models import XmlUpload
 from app.models.wearable_history_source import WearableHistorySource
+from app.services.apple.apple_xml.aws_service import get_s3_client
+from app.services.apple.apple_xml.xml_upload_lifecycle import member_has_incomplete_upload
 from app.services.sdk.sleep_service import delete_sleep_state, load_sleep_state
 from app.services.sdk.sleep_stages import normalized_sleep_window
 from app.utils.structured_logging import log_structured
@@ -126,14 +128,12 @@ class WearableHistoryPurgeService:
 
     def uploads_waiting(self, db: Session, member: UUID) -> bool:
         """D-03: an Apple source completes only once no upload file of the member is left."""
-        return (
-            db.scalar(
-                select(XmlUpload.id)
-                .where(XmlUpload.user_id == member, XmlUpload.state.in_(_WAITING_UPLOAD_STATES))
-                .limit(1)
-            )
-            is not None
+        tracked = db.scalar(
+            select(XmlUpload.id)
+            .where(XmlUpload.user_id == member, XmlUpload.state.in_(_WAITING_UPLOAD_STATES))
+            .limit(1)
         )
+        return tracked is not None or member_has_incomplete_upload(get_s3_client(), member)
 
     def _fail(
         self, db: Session, member: UUID, provider: str, step: str, error: Exception, *, count_attempt: bool = False

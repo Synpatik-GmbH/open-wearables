@@ -19,6 +19,7 @@ from app.services.apple.apple_xml.aws_service import get_s3_client
 from app.services.apple.apple_xml.multipart_upload_service import multipart_upload_service
 from app.services.apple.apple_xml.wearable_history_filter import PrestartSkipper
 from app.services.apple.apple_xml.xml_service import XMLService
+from app.services.apple.apple_xml.xml_upload_lifecycle import mark_import, record_completed_upload
 from app.services.sdk.sleep_service import handle_sleep_data
 from app.services.sync_status_service import (
     emit_sync_completed,
@@ -30,6 +31,7 @@ from app.services.timeseries_service import timeseries_service
 from app.services.user_service import user_service
 from app.utils.exceptions import ResourceNotFoundError
 from app.utils.sentry_helpers import log_and_capture_error
+from app.utils.structured_logging import log_structured
 from app.utils.wearable_history_ingress import PreStartDataRejectedError
 
 logger = getLogger(__name__)
@@ -148,6 +150,23 @@ def _as_uuid(user_id: str) -> UUID | None:
         return None
 
 
+def _mark_import(bucket_name: str, object_key: str, state: str) -> None:
+    """Record the import's outcome; a row left pending is failed by the beat task after a day."""
+    try:
+        with SessionLocal() as db:
+            mark_import(db, bucket_name, object_key, state)
+    except Exception as error:
+        log_structured(
+            logger,
+            "error",
+            "XML upload state not recorded",
+            provider="apple_xml",
+            object_key=object_key,
+            state=state,
+            error=type(error).__name__,
+        )
+
+
 def _run_import_task(
     task: Task,
     *,
@@ -190,9 +209,13 @@ def _run_import_task(
             and not _upload_completion_persisted(bucket_name, object_key, user_id)
         ):
             _ensure_upload_completed(bucket_name, object_key, upload_id, parts, user_id)
+            # 2.96.9.2 D-04: the upload is complete; track its file until it is deleted.
+            with SessionLocal() as db:
+                record_completed_upload(db, bucket_name, object_key, user_id)
             _store_upload_completion(bucket_name, object_key, user_id)
         result = _process_aws_upload(bucket_name, object_key, user_id)
         _store_completed_import(bucket_name, object_key, user_id, result)
+        _mark_import(bucket_name, object_key, "imported")
         if user_uuid is not None:
             emit_sync_completed(
                 user_uuid,
@@ -212,6 +235,7 @@ def _run_import_task(
             raise task.retry(exc=exc, countdown=min(10 * (2**task.request.retries), 300)) from exc
 
         _release_import_claim(bucket_name, object_key, user_id, run_id)
+        _mark_import(bucket_name, object_key, "failed")
         if user_uuid is not None:
             emit_sync_failed(
                 user_uuid,

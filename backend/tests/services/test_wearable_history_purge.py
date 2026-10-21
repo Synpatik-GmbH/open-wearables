@@ -5,6 +5,7 @@ from decimal import Decimal
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
@@ -240,9 +241,10 @@ def test_apple_sleep_state_is_cleared_only_when_its_night_is_prestart(db: Sessio
     assert load_sleep_state(str(later.id)) is not None
 
 
-def test_apple_source_waits_for_upload_files_without_recording_an_error(db: Session) -> None:
+@pytest.mark.parametrize("state", ["pending_import", "imported", "failed"])
+def test_apple_source_waits_for_upload_files_without_recording_an_error(db: Session, state: str) -> None:
     member, apple, *_ = seed(db)
-    db.add(XmlUpload(id=uuid4(), user_id=member.id, bucket="b", object_key="k", state="imported"))
+    db.add(XmlUpload(id=uuid4(), user_id=member.id, bucket="b", object_key="k", state=state))
     db.commit()
 
     run = WearableHistoryPurgeService().run(db)
