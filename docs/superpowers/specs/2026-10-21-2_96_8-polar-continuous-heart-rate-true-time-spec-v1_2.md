@@ -1,6 +1,7 @@
-# 2.96.8 Polar continuous heart rate at its true time: Spec v1.1
+# 2.96.8 Polar continuous heart rate at its true time: Spec v1.2
 
-Status: v1.1, 21 Oct 2026. Becomes the contract on Andrei's agreement to the five build decisions of 21 Oct; until then v1.0 stands.
+Status: v1.2, 21 Oct 2026. Becomes the contract on Andrei's agreement to the PR #45 review decisions of 21 Oct; until then v1.1 stands.
+Change from v1.1 (after the PR #45 review, relayed 21 Oct 2026): the dev clean-up step is dropped, so AC9 no longer corrects stored rows and AC10 uses only data recorded after deploy; P7 wording narrowed to the calls the pull budget counts; two limits added to non-goals.
 Change from v1.0 (after CC's pre-build read, relayed 21 Oct 2026): Polar sleep records store no offset, so P1's offset is read from Polar's own sleep data at ingest (option A); P1 wording corrected (re-ratification on Andrei's agreement); new P7 call budget; AC9 rewritten (clean-up method); two limits added to non-goals; DP ruling note corrected.
 Earlier changes: v1.0 ratified P1 to P6 and decided R-2026-10-21-c; v0.2 dropped the pre-build verification query (AC10 is the check).
 Product item: 2.96.8 Polar heart-rate and daily-activity times (Notion 3f98f5efacd281d78968d6f6f8aea2fe). Build child: 2.96.8.1 (Notion 4008f5efacd281d49260ef05cec0cd09). Parent: 2.96 Wearable integrations at launch.
@@ -25,8 +26,7 @@ Technical facts below are attributed to CC's read-only investigation and pre-bui
 - OW fork: `data_point_series` rows with source `polar` and series type heart rate.
 - OW fork: the per-member Polar call budget in `pull_budget.py`.
 - OW fork: FORK-DELTA entry for the change.
-- Dev only: the internal Polar account's stored Polar heart-rate rows.
-- Adapter, read only, no code change expected (per relay 21 Oct): `NightHeartRate.cs`, OW zone calculation and `WorkoutHrZoneHealService.cs`, the `rhr-coverage` recompute with `?days=28` for the dev check.
+- Adapter, read only, no code change expected (per relay 21 Oct): `NightHeartRate.cs`, OW zone calculation and `WorkoutHrZoneHealService.cs`.
 
 ## 3. Acceptance criteria
 
@@ -38,8 +38,8 @@ Technical facts below are attributed to CC's read-only investigation and pre-bui
 - AC6: Polar workout start and end times (fixed in 2.96.6.1) are identical before and after the change for the same payload.
 - AC7: Ingesting the same continuous heart-rate payload twice after the change, by any mix of full pull and webhook, leaves the stored sample count unchanged (P2).
 - AC8: No continuous heart-rate sample in a fixture payload is dropped: stored count after the change equals the payload's sample count (P3 covers days with no offset source).
-- AC9: After the change is deployed on dev, the internal Polar account's Polar heart-rate rows for the last 28 days are at their true instants with no duplicates, and an `rhr-coverage` recompute with `?days=28` has run. Method, in order of preference: (a) disconnect and reconnect Polar on that account, if that removes its Polar rows and re-pulls 28 days; (b) otherwise an idempotent startup data step that does nothing unless a dev-only deployment variable names the account, runs once, and never touches sleep records. No Alembic migration carrying an account id. No manual database step.
-- AC10: Polar account check (P4), which is also the check that Polar's continuous times were local: for 3 nights, the time of the lowest heart rate overnight shown in Calibra is within the tolerance in P4 of the low in Polar Flow's 24/7 heart-rate graph, and for 1 workout the zone minutes shown in Calibra are within the tolerance in P4 of Polar Flow's zone minutes. Andrei runs the side-by-side. If AC10 fails, the change does not ship in the 30 Oct release.
+- AC9: The change carries no clean-up of stored rows: no startup data step, no migration, no manual database step. Polar heart-rate rows stored before the change is deployed stay as they are, on dev and anywhere else; production is covered by the decided wipe.
+- AC10: Polar account check (P4), which is also the check that Polar's continuous times were local, using only nights and a workout recorded after the change is deployed on dev: for 3 nights, the time of the lowest heart rate overnight shown in Calibra is within the tolerance in P4 of the low in Polar Flow's 24/7 heart-rate graph, and for 1 workout the zone minutes shown in Calibra are within the tolerance in P4 of Polar Flow's zone minutes. Andrei runs the side-by-side. If AC10 fails, the change does not ship in the 30 Oct release.
 - AC11: The PR states the worst-case Polar calls per member per day with the change, and it is within P7.
 
 ## 4. Invariants
@@ -62,25 +62,29 @@ Technical facts below are attributed to CC's read-only investigation and pre-bui
 - Storing an offset on Polar sleep records or heart-rate rows (options B and C of 21 Oct, rejected).
 - Open Wearables' own daily heart-rate summaries, which feed only the export: per relay 21 Oct, samples just after local midnight may land on the UTC date. Accepted limit.
 - P3 duplicate: a sample stored uncorrected under P3 is stored again at its true time if Polar later serves a sleep record for that date, and the uncorrected row stays. Accepted limit (needs no Polar sleep or workout within 3 days either side).
+- Correcting Polar heart-rate rows stored before deploy, dev included. Per relay 21 Oct, disconnecting Polar does not delete rows; the internal account's earlier nights read as before until they leave the 28-day window.
+- Offset-change day: on a day the member's UTC offset changes, if a nearer offset source arrives after the day was first stored, the sample is stored again at the new instant and the old row stays. Accepted limit, same shape as the P3 duplicate.
+- Polar calls caused by sleep, workout, activity-summary and SleepWise webhooks, which per relay 21 Oct the pull budget does not count. Pre-existing; P7 covers what this item adds.
 - Any adapter read-code change.
 - Re-deriving zones for stored workouts beyond what the dev check needs.
 - Any member-facing copy change.
 
 ## 6. Predicates
 
-- P1 True instant: stored instant = local wall time minus the UTC offset in force for the member at that moment, read at ingest from Polar's sleep data for that night (sleep listing) or from that day's stored Polar workout `zone_offset`. `ratified 21 Oct 2026; wording corrected in v1.1, re-ratified on Andrei's agreement`
+- P1 True instant: stored instant = local wall time minus the UTC offset in force for the member at that moment, read at ingest from Polar's sleep data for that night (sleep listing) or from that day's stored Polar workout `zone_offset`. `ratified 21 Oct 2026 (wording re-ratified 21 Oct 2026 in v1.1)`
 - P2 Re-ingest: ingesting the same payload twice adds 0 rows. `ratified 21 Oct 2026`
 - P3 No offset source: a continuous sample on a date with no Polar sleep record and no Polar workout is still stored, using the member's nearest Polar sleep or workout offset within 3 days before or after; if none exists, stored as today (no correction) and counted in the build's report. Such samples feed no member-facing read at launch. `ratified 21 Oct 2026`
 - P4 Polar account check tolerance: time of the overnight low within 10 minutes of Polar Flow; workout zone minutes within 2 minutes per zone of Polar Flow. `ratified 21 Oct 2026`
 - P5 Clocks-change nights: an error of up to 1 hour for samples after the change on the two nights a year is accepted for this item. `ratified 21 Oct 2026`
 - P6 Cut-off: merged by end of 28 Oct 2026, Polar account check done by end of 29 Oct 2026; if missed, the item moves to the first release after launch. `ratified 21 Oct 2026`
-- P7 Call budget: worst-case Polar calls per member per day, including any extra call on the webhook path, stay at or under 200. `ratified on Andrei's agreement`
+- P7 Call budget: worst-case Polar calls per member per day counted by the pull budget, including the continuous heart-rate webhook call this item adds, stay at or under 200. `ratified 21 Oct 2026; wording narrowed in v1.2, re-ratified on Andrei's agreement`
 
 ## 7. Data-protection ruling
 
 - R-2026-10-21-c (decided by Andrei, 21 Oct 2026): covered by the existing ingestion processing, with conditions.
 - Why: same data, purpose, basis and store; storing the true instant improves accuracy (Art. 5(1)(d)).
 - Conditions: no new stored field holding a member's UTC offset or time zone beyond what is already stored (per relay 21 Oct, only Polar workouts store an offset; Polar sleep records do not); dev clean-up and re-pull touch only the internal staff Polar account; no production rows touched by this item.
+- v1.2 note: no clean-up step, so no stored row is touched by this item anywhere.
 - v1.1 note: option A reads Polar's offsets at ingest and stores nothing new, so the conditions hold as decided. Options B and C would each store a new offset and would go back to the desk.
 - Documents affected: none.
 - DPO: no need.
