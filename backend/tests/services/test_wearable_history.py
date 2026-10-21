@@ -170,6 +170,29 @@ def test_ac19_member_erasure_cascades_source_store(db: Session) -> None:
     assert fresh.connection_day == connected.astimezone(BERLIN).date()
     assert fresh.start_date == fresh.connection_day
     assert fresh.night_dates == []
+    # The new connection works out its own date from its own nights only.
+    nights = [fresh.connection_day - timedelta(days=n) for n in range(5, -1, -1)]
+    computed = WearableHistoryRepository().observe_nights(db, replacement.id, "apple", nights, connected)
+    assert computed.start_date == fresh.connection_day - timedelta(days=5)
+
+
+def test_ac13_andrei_fixture_starts_polar_on_13_october(db: Session) -> None:
+    from app.repositories.wearable_history_repository import WearableHistoryRepository
+    from tests.factories import UserFactory
+
+    member = UserFactory()
+    repository = WearableHistoryRepository()
+    connected = datetime(2026, 10, 13, 8, tzinfo=UTC)  # 10:00 Berlin on the account's first day
+    source = repository.begin_source(db, member.id, "polar", connected)
+    assert source.connection_day == date(2026, 10, 13)
+    # His export: one night on 27 Sep, then a night every night from 13 Oct, arriving nightly.
+    repository.observe_nights(db, member.id, "polar", [date(2026, 9, 27), date(2026, 10, 13)], connected)
+    for day in range(14, 21):
+        repository.observe_nights(db, member.id, "polar", [date(2026, 10, day)], datetime(2026, 10, day, 6, tzinfo=UTC))
+    frozen = repository.get(db, member.id, "polar")
+    assert frozen.freeze_at == datetime(2026, 10, 19, 22, tzinfo=UTC)
+    assert frozen.start_date == date(2026, 10, 13)
+    assert frozen.night_dates == [date(2026, 9, 27), date(2026, 10, 13)]
 
 
 def test_arriving_sleep_updates_source_before_provider_selection_and_is_retained(db: Session) -> None:
