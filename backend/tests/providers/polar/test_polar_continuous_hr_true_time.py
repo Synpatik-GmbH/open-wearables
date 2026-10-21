@@ -383,6 +383,28 @@ class TestNoOffsetSource:
         assert _stored(db, user_id) == [_utc(DAY, "12:00", 3)]
 
     @pytest.mark.parametrize("path", INGEST)
+    @pytest.mark.parametrize(("days", "local_start", "hours"), [(3, time(22, 0), -5), (-3, time(0, 30), 14)])
+    def test_a_workout_at_either_edge_of_its_local_day_3_days_away_is_found(
+        self,
+        db: Session,
+        data_247: Polar247Data,
+        polar: FakePolar,
+        user_id: UUID,
+        path: str,
+        days: int,
+        local_start: time,
+        hours: int,
+    ) -> None:
+        # Codex on #45: DAY + 3 at 22:00 at -05:00 is stored on DAY + 4 (03:00Z), past a lookup that
+        # ended at midnight UTC; DAY - 3 at 00:30 at +14:00 is stored on DAY - 4 (10:30Z).
+        _polar_workout(db, user_id, datetime.combine(DAY + timedelta(days=days), local_start), hours)
+        polar.heart_rates = [_day(DAY, ["12:00"])]
+
+        INGEST[path](data_247, db, user_id)
+
+        assert _stored(db, user_id) == [_utc(DAY, "12:00", hours)]
+
+    @pytest.mark.parametrize("path", INGEST)
     def test_the_earlier_of_two_equally_near_offsets_is_used(
         self, db: Session, data_247: Polar247Data, polar: FakePolar, user_id: UUID, path: str
     ) -> None:
@@ -426,7 +448,7 @@ class TestNoOffsetSource:
 
     @pytest.mark.parametrize("path", INGEST)
     def test_no_sample_is_dropped(
-        self, db: Session, data_247: Polar247Data, polar: FakePolar, user_id: UUID, path: str
+        self, db: Session, data_247: Polar247Data, polar: FakePolar, user_id: UUID, path: str, capsys: Any
     ) -> None:
         # AC8: stored count equals the payload's, across a corrected, a nearest and an uncorrected day.
         polar.nights = [_night(DAY, 2)]
@@ -436,6 +458,8 @@ class TestNoOffsetSource:
         INGEST[path](data_247, db, user_id)
 
         assert len(_stored(db, user_id)) == 3 * 288
+        (line,) = _logged(capsys, "polar_continuous_hr_uncorrected")
+        assert line["count"] == 288, "only DAY - 9 has no offset within 3 days"
 
 
 class TestWebhookBudget:

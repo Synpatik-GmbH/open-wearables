@@ -540,7 +540,9 @@ class Polar247Data(Base247DataTemplate):
             except (AttributeError, ValueError):
                 continue
         if days:
-            margin = timedelta(days=_OFFSET_SEARCH_DAYS + 1)
+            # The bounds are UTC midnights and a workout's local day is not its UTC day: one day of
+            # margin past the search covers a local day anywhere from -12:00 to +14:00 (Codex, #45).
+            margin = timedelta(days=_OFFSET_SEARCH_DAYS + 2)
             workouts = (
                 db.query(EventRecord.start_datetime, EventRecord.zone_offset)
                 .join(DataSource, EventRecord.data_source_id == DataSource.id)
