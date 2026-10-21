@@ -12,7 +12,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.webhook_push_task import process_webhook_push
-from app.models import DataPointSeries, DataSource, EventRecord, HealthScore, User
+from app.models import DataPointSeries, DataSource, EventRecord, HealthScore, User, UserConnection
+from app.models.wearable_history_source import WearableHistorySource
 from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.repositories.wearable_history_repository import WearableHistoryRepository
@@ -277,3 +278,63 @@ def test_oura_failed_sleep_never_writes_orphaned_companions(db: Session) -> None
         assert service.save_sleep_data(db, member.id, service.normalize_sleeps([raw], member.id)) == 0
     source_ids = select(DataSource.id).where(DataSource.user_id == member.id)
     assert list(db.scalars(select(DataPointSeries).where(DataPointSeries.data_source_id.in_(source_ids)))) == []
+
+
+@pytest.mark.parametrize("failure", [FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError])
+@pytest.mark.parametrize("failed_first", [False, True])
+def test_garmin_history_retry_preserves_other_members_of_the_same_provider_account(
+    db: Session, failure: type[RuntimeError], failed_first: bool
+) -> None:
+    blocked = connected(db, "garmin")
+    admitted = connected(db, "garmin")
+    service = Garmin247Data("garmin", "https://provider.test", MagicMock())
+    handler = GarminWebhookHandler(MagicMock(), service)
+    first = datetime(2026, 10, 12, 20, tzinfo=UTC)
+    assert service.process_items_batch(db, admitted.id, "sleeps", [garmin_sleep(first, None)]) == 1
+    for member, position in [(blocked, 0 if failed_first else 1), (admitted, 1 if failed_first else 0)]:
+        connection = db.scalar(select(UserConnection).where(UserConnection.user_id == member.id))
+        connection.created_at = datetime(2026, 10, 13, 12, position, tzinfo=UTC)
+    if failure is WearableHistoryMetadataUnavailableError:
+        db.query(WearableHistorySource).filter(WearableHistorySource.user_id == blocked.id).delete()
+    db.commit()
+    payload = {
+        "epochs": [
+            {
+                "userId": "provider-member",
+                "startTimeInSeconds": int(first.timestamp()),
+                "startTimeOffsetInSeconds": 0,
+                "meanHeartRateInBeatsPerMinute": 61,
+            }
+        ]
+    }
+
+    @contextmanager
+    def session() -> Iterator[Session]:
+        try:
+            yield db
+        finally:
+            db.rollback()
+
+    with (
+        patch("app.integrations.celery.tasks.webhook_push_task.SessionLocal", session),
+        patch(
+            "app.integrations.celery.tasks.webhook_push_task.ProviderFactory",
+            return_value=SimpleNamespace(get_provider=lambda _: SimpleNamespace(webhooks=handler)),
+        ),
+        patch("app.services.providers.garmin.handlers.wellness.emit_sync_completed"),
+        patch.object(process_webhook_push, "retry", side_effect=failure("task retry")) as retry,
+    ):
+        for delivery in range(4):  # Initial delivery plus the unchanged three retries.
+            with pytest.raises(failure, match="task retry"):
+                process_webhook_push.run("garmin", payload, f"multi-member-{delivery}")
+            assert retry.call_count == delivery + 1
+            assert isinstance(retry.call_args.kwargs["exc"], failure)
+            source_ids = select(DataSource.id).where(DataSource.user_id == admitted.id)
+            assert list(
+                db.scalars(select(DataPointSeries.value).where(DataPointSeries.data_source_id.in_(source_ids)))
+            ) == [61]
+            blocked_sources = select(DataSource.id).where(DataSource.user_id == blocked.id)
+            assert (
+                list(db.scalars(select(DataPointSeries).where(DataPointSeries.data_source_id.in_(blocked_sources))))
+                == []
+            )

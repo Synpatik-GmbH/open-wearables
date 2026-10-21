@@ -92,6 +92,7 @@ def process_wellness_items(
     total_saved = 0
     succeeded_users: list[str] = []
 
+    retry_error: FirstNightAssociationUnavailableError | WearableHistoryMetadataUnavailableError | None = None
     for uid, items in user_items.items():
         trace_id = get_trace_id(uid) or request_trace_id
         is_secondary = uid in secondary_primary
@@ -127,8 +128,10 @@ def process_wellness_items(
                     "items": len(items),
                 },
             )
-        except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError):
-            raise
+        except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError) as exc:
+            # A blocked profile must not consume the shared account's other profiles.
+            retry_error = retry_error or exc
+            continue
         except Exception as e:
             log_structured(
                 logger,
@@ -141,4 +144,6 @@ def process_wellness_items(
             )
             errors.append(f"{summary_type} error: {e}")
 
+    if retry_error is not None:
+        raise retry_error
     return {"processed": total_processed, "saved": total_saved, "succeeded_users": succeeded_users}
