@@ -18,6 +18,7 @@ from app.schemas.sync_status import (
     SyncStatus,
 )
 from app.services import event_record_service
+from app.services.apple.apple_xml.wearable_history_filter import PrestartSkipper
 from app.services.apple.apple_xml.xml_service import XMLService
 from app.services.sdk.sleep_service import handle_sleep_data
 from app.services.sync_status_service import (
@@ -31,6 +32,7 @@ from app.services.sync_status_service import (
 from app.services.timeseries_service import timeseries_service
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
+from app.utils.wearable_history_ingress import PreStartDataRejectedError
 
 log = getLogger(__name__)
 
@@ -134,6 +136,7 @@ def process_xml_upload(file_contents: bytes, filename: str, user_id: str) -> dic
                     "workouts_skipped": stats.workouts.skipped,
                     "sleep_processed": stats.sleep.processed,
                     "sleep_skipped": stats.sleep.skipped,
+                    "skipped_prestart": stats.skipped_prestart,
                     "skip_reasons": stats.get_skip_summary(),
                 },
             }
@@ -187,7 +190,12 @@ def _import_xml_data(db: Session, xml_path: str, user_id: str) -> XMLParseStats:
     """
     xml_service = XMLService(Path(xml_path), log)
 
+    skipper = PrestartSkipper.for_member(db, user_id)
     for time_series_records, workouts, sync_request in xml_service.parse_xml(user_id):
+        # 2.96.9.2 D-04: after the Apple freeze, pre-start records never leave the upload file.
+        time_series_records = skipper.samples(time_series_records)
+        workouts = skipper.workouts(workouts)
+        sync_request = skipper.sleep(sync_request)
         for record, detail in workouts:
             try:
                 created_record = event_record_service.create(db, record)
@@ -216,6 +224,11 @@ def _import_xml_data(db: Session, xml_path: str, user_id: str) -> XMLParseStats:
             db.commit()
 
         if sync_request and sync_request.data.sleep:
-            handle_sleep_data(db, sync_request, user_id)
+            try:
+                handle_sleep_data(db, sync_request, user_id)
+            except PreStartDataRejectedError:
+                if not skipper.rejected_sleep_batch(len(sync_request.data.sleep)):
+                    raise
 
+    xml_service.stats.skipped_prestart = skipper.skipped
     return xml_service.stats

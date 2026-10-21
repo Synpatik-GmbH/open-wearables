@@ -23,6 +23,8 @@ class XMLParseStats:
     records: ParseMetric = field(default_factory=ParseMetric)
     workouts: ParseMetric = field(default_factory=ParseMetric)
     sleep: ParseMetric = field(default_factory=ParseMetric)
+    # 2.96.9.2 D-04: records dated before a frozen Apple source's start date.
+    skipped_prestart: int = 0
 
     def any_skipped(self) -> bool:
         return self.records.skipped > 0 or self.workouts.skipped > 0 or self.sleep.skipped > 0
