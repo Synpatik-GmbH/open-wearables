@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -34,22 +34,35 @@ _NIGHT_PHYSIOLOGY = frozenset(
 class WearableHistoryIngressRepository:
     """One source lock and current cutoff for each ingestion operation."""
 
-    def persist_event(self, record: Any, write: Callable[[], EventRecord]) -> EventRecord | None:
-        """Skip a permanently rejected item; preserve the caller's commit/flush boundary."""
+    def persist_event[T](self, record: Any, write: Callable[[], T], *, commit: bool = False) -> T | None:
+        """Isolate a flush-only item; retain earlier pending writes on permanent rejection.
+
+        ``begin_nested`` first flushes earlier work outside this item's savepoint.
+        Callbacks must not commit: the gate commits only after the item and its
+        deferred source constraints have succeeded, when the caller requests it.
+        """
         if not self.filter_events([record]):
             return None
         try:
-            return write()
+            with self.db.begin_nested():
+                result = write()
+                self.db.flush()
+                # Check this item's deferred details/samples while its savepoint can
+                # still roll it back. Keep the constraint immediate for the remaining
+                # transaction; already-immediate callers are never weakened.
+                self.db.execute(text("SET CONSTRAINTS wh_ingress IMMEDIATE"))
         except Exception as exc:
             # Decorated repositories wrap SQL errors in HTTPException; inspect its cause.
             if not isinstance(exc, (PreStartDataRejectedError, IntegrityError)) and not isinstance(
                 exc.__cause__, IntegrityError
             ):
                 raise
-            self.db.rollback()
             if not WearableHistoryIngressRepository(self.db).filter_events([record]):
                 return None
             raise
+        if commit:
+            self.db.commit()
+        return result
 
     def __init__(self, db: Session) -> None:
         self.db = db

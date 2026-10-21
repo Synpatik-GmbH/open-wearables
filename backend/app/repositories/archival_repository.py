@@ -238,6 +238,7 @@ class DataPointSeriesArchiveRepository:
 
             # Step 3: For each group, pick the correct aggregate column based on series type
             values_list = []
+            archived_keys: list[tuple[UUID, int, date]] = []
             for row in raw_aggregates:
                 try:
                     series_type = get_series_type_from_id(row.series_type_definition_id)
@@ -263,6 +264,7 @@ class DataPointSeriesArchiveRepository:
                             "sample_count": row.sample_count,
                         }
                     )
+                    archived_keys.append((row.data_source_id, row.series_type_definition_id, row.date))
                 except KeyError:
                     # Unknown series type ID — skip this aggregate but don't
                     # delete the corresponding live rows either.
@@ -286,17 +288,21 @@ class DataPointSeriesArchiveRepository:
                 )
                 db.execute(stmt)
 
-            # Step 5: Delete the live rows we just archived
-            deleted_count = (
-                db.query(DataPointSeries)
-                .filter(
-                    DataPointSeries.data_source_id.in_(source_id_list),
-                    ready_bucket,
-                    cast(DataPointSeries.recorded_at, Date) < cutoff_date,
+            # Readiness uses a volatile source clock and newly arrived intervals. Delete
+            # only the materialized buckets successfully upserted above, never a second
+            # evaluation of readiness that could include unarchived samples.
+            for i in range(0, len(archived_keys), ARCHIVE_BATCH_SIZE):
+                total_deleted += (
+                    db.query(DataPointSeries)
+                    .filter(
+                        tuple_(
+                            DataPointSeries.data_source_id,
+                            DataPointSeries.series_type_definition_id,
+                            cast(DataPointSeries.recorded_at, Date),
+                        ).in_(archived_keys[i : i + ARCHIVE_BATCH_SIZE])
+                    )
+                    .delete(synchronize_session=False)
                 )
-                .delete(synchronize_session=False)
-            )
-            total_deleted += deleted_count
 
             db.commit()
 

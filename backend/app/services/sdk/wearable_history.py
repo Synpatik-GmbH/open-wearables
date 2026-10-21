@@ -9,8 +9,8 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.constants.series_types.sdk import get_apple_sleep_phase, get_series_type_from_metric_type
 from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
-from app.schemas.providers.mobile_sdk import SLEEP_START_STATES
-from app.services.sdk.sleep_stages import ordered_sleep_stages
+from app.schemas.providers.mobile_sdk import SLEEP_START_STATES, SleepStateStage
+from app.services.sdk.sleep_stages import normalized_sleep_window, ordered_sleep_stages
 from app.utils.sleep_interval import interval_gap
 from app.utils.structured_logging import log_structured
 
@@ -67,6 +67,7 @@ def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None
                 start_datetime=state.start_time,
                 end_datetime=state.end_time,
                 zone_offset=state.zone_offset,
+                stages=list(state.stages),
             )
         )
     stages = ordered_sleep_stages(request.data.sleep)
@@ -83,7 +84,9 @@ def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None
             ),
             None,
         )
+        stage = SleepStateStage(stage=phase.value, start_time=item.startDate, end_time=item.endDate)
         if near is not None:
+            near.stages.append(stage)
             near.start_datetime = min(near.start_datetime, item.startDate)
             near.end_datetime = max(near.end_datetime, item.endDate)
             if item.zoneOffset and not near.zone_offset:
@@ -97,9 +100,21 @@ def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None
                     start_datetime=item.startDate,
                     end_datetime=item.endDate,
                     zone_offset=item.zoneOffset,
+                    stages=[stage],
                 )
             )
-    admitted_intervals = [r for r in intervals if gate.event_admitted(r)]
+    normalized_intervals = []
+    admitted_intervals = []
+    for raw_interval in intervals:
+        start, end = normalized_sleep_window(
+            raw_interval.stages, raw_interval.start_datetime, raw_interval.end_datetime
+        )
+        normalized = SimpleNamespace(**{**vars(raw_interval), "start_datetime": start, "end_datetime": end})
+        normalized_intervals.append(normalized)
+        if gate.event_admitted(normalized):
+            admitted_intervals.append(raw_interval)
+    # Keep wrappers of an admitted night for the existing in-bed arithmetic; only
+    # its cleaned window supplies night placement and physiology association.
     request.data.sleep = [
         s
         for s in stages
@@ -135,7 +150,7 @@ def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None
     gate.prime_samples([sample for _, sample in candidates])
     kept = []
     for item, sample in candidates:
-        if gate.sample_admitted(sample, intervals):
+        if gate.sample_admitted(sample, normalized_intervals):
             if getattr(sample.series_type, "value", sample.series_type) != "weight":
                 item.metadata = None
             kept.append(item)

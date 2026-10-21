@@ -177,7 +177,7 @@ class TestSuuntoImport:
             assert result["payload"][1]["activityId"] == 2  # Cycling
 
     @patch("app.services.providers.suunto.workouts.SuuntoWorkouts._make_api_request")
-    @patch("app.services.event_record_service.event_record_service.create")
+    @patch("app.repositories.event_record_repository.EventRecordRepository.create_and_flush")
     @patch("app.services.event_record_service.event_record_service.create_detail")
     @patch("app.repositories.data_source_repository.DataSourceRepository.ensure_data_source")
     def test_load_data_creates_event_records(

@@ -103,7 +103,7 @@ class EventRecordService(
     def create_if_admitted(self, db_session: DbSession, creator: EventRecordCreate) -> EventRecord | None:
         """Provider loops skip permanent rejections while metadata/write failures remain retryable."""
         return WearableHistoryIngressRepository(db_session).persist_event(
-            creator, lambda: self.create(db_session, creator)
+            creator, lambda: self.crud.create_and_flush(db_session, creator), commit=True
         )
 
     def _workout_hr_zone_fields(
@@ -340,7 +340,7 @@ class EventRecordService(
         detail: EventRecordDetailCreate,
         threshold_minutes: int,
         before_commit: Callable[[EventRecord], None] | None = None,
-    ) -> EventRecord:
+    ) -> EventRecord | None:
         """Create a sleep record, merging with any adjacent session within threshold_minutes.
 
         When an adjacent session already exists in the database within the gap threshold,
@@ -356,12 +356,17 @@ class EventRecordService(
         commit, so a caller can write rows that must exist whenever the night does (a provider's
         sleep score, which points at the record). If it raises, nothing is committed.
         """
-        result, inserted, final_detail = self._create_or_merge_sleep_inner(
-            db_session, user_id, record, detail, threshold_minutes
-        )
-        if before_commit is not None:
-            before_commit(result)
-        db_session.commit()
+
+        def write() -> tuple[EventRecord, bool, EventRecordDetailCreate]:
+            result = self._create_or_merge_sleep_inner(db_session, user_id, record, detail, threshold_minutes)
+            if before_commit is not None:
+                before_commit(result[0])
+            return result
+
+        written = WearableHistoryIngressRepository(db_session).persist_event(record, write, commit=True)
+        if written is None:
+            return None
+        result, inserted, final_detail = written
         if inserted:
             eff = final_detail.sleep_efficiency_score
             has_stages = any(

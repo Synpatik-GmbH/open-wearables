@@ -142,7 +142,9 @@ class BaseWorkoutsTemplate(ABC):
     ) -> None:
         """Internal method to save the workout to the database."""
         # TODO: Add logic to check if workout already exists to avoid duplicates
-        WearableHistoryIngressRepository(db).persist_event(record, lambda: self.workout_repo.create(db, record))
+        WearableHistoryIngressRepository(db).persist_event(
+            record, lambda: self.workout_repo.create_and_flush(db, record), commit=True
+        )
         # Detail saving is handled by services in load_data implementations
 
     def _make_api_request(

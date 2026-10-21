@@ -58,6 +58,8 @@ class DataSourceRepository(
         software_version: str | None = None,
         source: str | None = None,
         original_source_name: str | None = None,
+        *,
+        commit: bool = True,
     ) -> DataSource:
         existing = self.get_by_identity(db_session, user_id, provider, device_model, source)
         if existing:
@@ -96,7 +98,23 @@ class DataSourceRepository(
             device_type=device_type.value if device_type != DeviceType.UNKNOWN else None,
             original_source_name=original_source_name,
         )
-        result = self.create(db_session, create_payload)
+        if commit:
+            result = self.create(db_session, create_payload)
+        else:
+            # Event item gates own their savepoint/commit. Source resolution must
+            # not commit earlier pending work or close that item's savepoint.
+            self.batch_ensure_data_sources(db_session, provider, user_connection_id, {(user_id, device_model, source)})
+            return self.ensure_data_source(
+                db_session,
+                user_id,
+                provider,
+                user_connection_id,
+                device_model,
+                software_version,
+                source,
+                original_source_name,
+                commit=False,
+            )
         assert result is not None
         return result
 

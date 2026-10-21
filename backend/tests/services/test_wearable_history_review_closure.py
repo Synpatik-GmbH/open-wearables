@@ -70,7 +70,7 @@ def test_real_single_item_rejection_keeps_prior_uncommitted_admitted_samples(db:
         value=61,
     )
     db.add(sample)
-    assert WearableHistoryIngressRepository(db).persist_event(record, lambda: repo.create(db, record)) is None
+    assert WearableHistoryIngressRepository(db).persist_event(record, lambda: repo.create_and_flush(db, record)) is None
     db.flush()
     db.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
     assert db.scalar(select(DataPointSeries.value).where(DataPointSeries.id == sample.id)) == 61
@@ -131,7 +131,7 @@ def test_single_item_crossing_freeze_is_skipped_and_the_next_record_persists(db:
         while datetime.now(UTC) <= deadline:
             sleep(0.01)
         if path == "orm":
-            return repo.create(db, record)
+            return repo.create_and_flush(db, record)
         try:
             db.execute(
                 insert(EventRecord).values(
@@ -154,7 +154,10 @@ def test_single_item_crossing_freeze_is_skipped_and_the_next_record_persists(db:
     admitted = record.model_copy(
         update={"id": uuid4(), "start_datetime": day + timedelta(hours=12), "end_datetime": day + timedelta(hours=13)}
     )
-    assert WearableHistoryIngressRepository(db).persist_event(admitted, lambda: repo.create(db, admitted)) is not None
+    assert (
+        WearableHistoryIngressRepository(db).persist_event(admitted, lambda: repo.create_and_flush(db, admitted))
+        is not None
+    )
     db.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
     assert db.get(EventRecord, admitted.id) is not None
 

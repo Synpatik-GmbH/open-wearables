@@ -1312,7 +1312,7 @@ class Polar247Data(Base247DataTemplate):
             # has association proof. Keep HR and score in the existing before-commit hook:
             # after that single commit the night counts as stored and is not fetched again.
             # A failed contributor still rolls back the night and leaves it retryable.
-            event_record_service.create_or_merge_sleep(
+            stored = event_record_service.create_or_merge_sleep(
                 db,
                 user_id,
                 record,
@@ -1320,7 +1320,7 @@ class Polar247Data(Base247DataTemplate):
                 settings.sleep_end_gap_minutes,
                 before_commit=self._sleep_contributors_writer(db, hr, score),
             )
-            count += 1
+            count += int(stored is not None)
         return count
 
     def _sleep_contributors_writer(

@@ -50,7 +50,9 @@ class EventRecordRepository(
         super().__init__(model)
         self.data_source_repo = DataSourceRepository()
 
-    def _build_creation(self, db_session: DbSession, creator: EventRecordCreate) -> tuple[UUID, EventRecord]:
+    def _build_creation(
+        self, db_session: DbSession, creator: EventRecordCreate, *, commit_source: bool = True
+    ) -> tuple[UUID, EventRecord]:
         """Resolve the data source and build the ORM object without touching the session."""
         if creator.data_source_id:
             data_source_id = creator.data_source_id
@@ -68,6 +70,7 @@ class EventRecordRepository(
                 source=creator.source,
                 software_version=creator.software_version,
                 original_source_name=creator.source,
+                commit=commit_source,
             )
             data_source_id = data_source.id
 
@@ -164,7 +167,7 @@ class EventRecordRepository(
         Uses a savepoint for IntegrityError handling so a conflict rolls back only
         the INSERT and leaves the outer transaction intact.
         """
-        data_source_id, creation = self._build_creation(db_session, creator)
+        data_source_id, creation = self._build_creation(db_session, creator, commit_source=False)
         nested = db_session.begin_nested()
         try:
             db_session.add(creation)
@@ -1028,6 +1031,13 @@ class EventRecordRepository(
         threshold = timedelta(minutes=threshold_minutes)
         filters = [
             DataSource.user_id == user_id,
+            func.wh_event_admitted(
+                self.model.data_source_id,
+                self.model.category,
+                self.model.start_datetime,
+                self.model.end_datetime,
+                self.model.zone_offset,
+            ),
             self.model.category == "sleep",
             self.model.type == "sleep_session",
             self.model.start_datetime <= end_time + threshold,

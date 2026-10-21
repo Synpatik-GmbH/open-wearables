@@ -66,8 +66,10 @@ class GoogleHealthApiSleep:
             if start is None or end is None or not (start_time <= end < end_time):
                 continue
             record, detail = self._normalize(point, sleep, interval, start, end, user_id)
-            event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
-            count += 1
+            stored = event_record_service.create_or_merge_sleep(
+                db, user_id, record, detail, settings.sleep_end_gap_minutes
+            )
+            count += int(stored is not None)
         return count
 
     def _fetch(self, db: DbSession, user_id: UUID, start_time: datetime, end_time: datetime) -> list[dict[str, Any]]:

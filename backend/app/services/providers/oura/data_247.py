@@ -774,8 +774,10 @@ class Oura247Data(Base247DataTemplate):
             )
 
             try:
-                event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
-                count += 1
+                stored = event_record_service.create_or_merge_sleep(
+                    db, user_id, record, detail, settings.sleep_end_gap_minutes
+                )
+                count += int(stored is not None)
             except Exception as e:
                 db.rollback()
                 log_structured(
