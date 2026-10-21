@@ -26,18 +26,31 @@ def _berlin_date(instant: datetime) -> date:
 
 @dataclass
 class PrestartSkipper:
-    """``start_date`` is None while the source is provisional: then nothing is skipped."""
+    """``start_date`` is None while the source is provisional: then nothing is skipped.
+
+    Frozen is decided at the start of each parsed chunk (``refresh``), so an import that
+    crosses ``freeze_at`` switches at its next chunk and, frozen being final, stays switched.
+    """
 
     start_date: date | None
     skipped: int = 0
+    user_id: str | None = None
 
     @classmethod
     def for_member(cls, db: Session, user_id: str) -> "PrestartSkipper":
-        source = WearableHistoryRepository().get(db, UUID(user_id), "apple")
+        skipper = cls(None, user_id=user_id)
+        skipper.refresh(db)
+        return skipper
+
+    def refresh(self, db: Session) -> None:
+        if self.start_date is not None or self.user_id is None:
+            return
+        source = WearableHistoryRepository().get(db, UUID(self.user_id), "apple")
         if source is None:
-            return cls(None)
+            return
         now = db.scalar(select(func.clock_timestamp()))
-        return cls(source.start_date if now is not None and now >= source.freeze_at else None)
+        if now is not None and now >= source.freeze_at:
+            self.start_date = source.start_date
 
     def _prestart(self, day: date) -> bool:
         if self.start_date is None or day >= self.start_date:

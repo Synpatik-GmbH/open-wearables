@@ -395,6 +395,7 @@ def _import_xml_data(db: Session, xml_source: str | Path | BinaryIO, user_id: st
 
     skipper = PrestartSkipper.for_member(db, user_id)
     for time_series_records, workouts, sync_request in xml_service.parse_xml(user_id):
+        skipper.refresh(db)
         # 2.96.9.2 D-04: after the Apple freeze, pre-start records never leave the upload file.
         time_series_records = skipper.samples(time_series_records)
         workouts = skipper.workouts(workouts)

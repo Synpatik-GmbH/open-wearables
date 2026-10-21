@@ -134,3 +134,45 @@ def test_both_xml_paths_write_only_admitted_records_and_complete(db: Session, pa
     assert [c.args[1].start_datetime.date() for c in events.create.call_args_list] == [date(2026, 10, 2)]
     assert [r.startDate for r in sleep_handler.call_args.args[1].data.sleep] == [datetime(2026, 9, 30, 20, tzinfo=UTC)]
     assert skipped == 4 + (1 if sleep_rejected else 0)
+
+
+@pytest.mark.parametrize("path", ["aws", "direct"])
+def test_an_import_crossing_the_freeze_switches_at_its_next_chunk(db: Session, path: str) -> None:
+    from sqlalchemy import text
+
+    user_id = frozen_member(db, frozen=False)
+    module = (
+        "app.integrations.celery.tasks.process_aws_upload_task"
+        if path == "aws"
+        else "app.integrations.celery.tasks.process_xml_upload_task"
+    )
+
+    def chunks():  # noqa: ANN202
+        yield chunk(user_id)
+        db.execute(
+            text("UPDATE wearable_history_sources SET freeze_at=:f, start_date=:s WHERE user_id=:m"),
+            {"f": datetime(2026, 10, 8, tzinfo=UTC), "s": START, "m": user_id},
+        )
+        yield chunk(user_id)
+
+    service = MagicMock()
+    service.parse_xml.return_value = chunks()
+    service.stats.skipped_prestart = 0
+    written: list = []
+    with (
+        patch(f"{module}.XMLService", return_value=service),
+        patch(f"{module}.event_record_service"),
+        patch(f"{module}.timeseries_service") as series,
+        patch(f"{module}.handle_sleep_data"),
+    ):
+        series.bulk_create_samples.side_effect = lambda _db, samples: written.append(len(samples))
+        if path == "aws":
+            from app.integrations.celery.tasks.process_aws_upload_task import _import_xml_data
+
+            skipped = _import_xml_data(db, MagicMock(), user_id)
+        else:
+            from app.integrations.celery.tasks.process_xml_upload_task import _import_xml_data
+
+            skipped = _import_xml_data(db, "/tmp/unused.xml", user_id).skipped_prestart
+    assert written == [4, 2]
+    assert skipped == 4
