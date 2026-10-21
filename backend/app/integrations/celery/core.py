@@ -189,6 +189,13 @@ def create_celery() -> Celery:
             "args": (),
             "kwargs": {},
         },
+        # 2.96.9.2 D-02/D-03: temporary copies are bounded to seven days, checked every 15 minutes.
+        "sweep-expired-copies": {
+            "task": "app.integrations.celery.tasks.wearable_history_purge_task.sweep_expired_copies",
+            "schedule": crontab(minute="*/15"),
+            "args": (),
+            "kwargs": {},
+        },
         "renew-oura-webhooks-monthly": {
             "task": "app.integrations.celery.tasks.renew_oura_webhooks_task.renew_oura_webhooks",
             "schedule": crontab(day_of_month=1, hour=0, minute=0),  # 1st of each month at 00:00 UTC

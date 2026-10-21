@@ -38,9 +38,11 @@ from .renew_oura_webhooks_task import renew_oura_webhooks
 from .seed_data_task import generate_seed_data
 from .send_email_task import send_invitation_email_task
 from .sync_vendor_data_task import sync_vendor_data
+from .wearable_history_purge_task import sweep_expired_copies_task
 from .webhook_push_task import process_webhook_push
 
 __all__ = [
+    "sweep_expired_copies_task",
     # Garmin backfill (30-day webhook-based sync)
     "GARMIN_BACKFILL_DATA_TYPES",
     "check_garmin_triggered_timeout",
