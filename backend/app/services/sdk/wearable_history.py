@@ -1,7 +1,9 @@
+from logging import getLogger
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
+import sentry_sdk
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -9,6 +11,9 @@ from app.constants.series_types.sdk import get_apple_sleep_phase, get_series_typ
 from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.providers.mobile_sdk import SLEEP_START_STATES
 from app.utils.sleep_interval import interval_gap
+from app.utils.structured_logging import log_structured
+
+logger = getLogger(__name__)
 
 
 def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None) -> dict:
@@ -22,7 +27,25 @@ def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None
         return raw
     from app.services.sdk.import_service import _parse_sync_request
 
-    request, _dropped = _parse_sync_request(raw)
+    request, dropped = _parse_sync_request(raw)
+    if dropped:
+        # The frozen transport cannot retain invalid raw items for worker diagnostics.
+        # Report their locations/count here; an already-cleaned worker delivery is quiet.
+        errors = [{key: item[key] for key in ("collection", "index", "loc", "type")} for item in dropped[:20]]
+        with sentry_sdk.push_scope() as scope:
+            scope.set_level("warning")
+            scope.set_context(
+                "dropped_records", {"provider": provider, "dropped_count": len(dropped), "errors": errors}
+            )
+            sentry_sdk.capture_message(f"{provider} SDK payload: dropped invalid records, kept the rest")
+        log_structured(
+            logger,
+            "warning",
+            "SDK validation rejected records before frozen transport",
+            provider=provider,
+            action=f"{provider}_sdk_records_dropped",
+            dropped_count=len(dropped),
+        )
     intervals = []
     if state is not None and state.provider == provider:
         intervals.append(
@@ -88,13 +111,13 @@ def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None
     for workout in request.data.workouts:
         workout.samples = workout.route = workout.segments = workout.laps = workout.metadata = None
     for sleep in request.data.sleep:
-        sleep.metadata = None
+        sleep.values = sleep.metadata = None
     kept = []
     for item in request.data.records:
         metric = get_series_type_from_metric_type(item.type or "")
         if metric is None:
             continue
-        sample = SimpleNamespace(user_id=member, provider=provider, series_type=metric, recorded_at=item.endDate)
+        sample = SimpleNamespace(user_id=member, provider=provider, series_type=metric, recorded_at=item.startDate)
         if gate.sample_admitted(sample, intervals):
             if getattr(metric, "value", metric) != "weight":
                 item.metadata = None

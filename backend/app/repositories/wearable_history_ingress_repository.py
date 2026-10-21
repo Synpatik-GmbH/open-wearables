@@ -139,15 +139,19 @@ class WearableHistoryIngressRepository:
             matching = [
                 r for r in sleeps if r.start_datetime <= instant <= r.end_datetime and self.identity(r) == identity
             ]
-            if any(
-                (recorded_night_date(r.start_datetime, r.end_datetime, r.zone_offset) or date.min) >= source.start_date
+            # Only recorded nights override a sample's calendar date. Daytime nap
+            # intervals do not turn admitted daytime physiology into pre-start data.
+            nights = [
+                night
                 for r in matching
-            ):
+                if (night := recorded_night_date(r.start_datetime, r.end_datetime, r.zone_offset)) is not None
+            ]
+            if any(night >= source.start_date for night in nights):
                 return True
-            if matching:
+            if nights:
                 return False
             if (
-                not matching
+                not nights
                 and calendar == source.start_date - timedelta(days=1)
                 and night_placement(instant, None) == (True, source.start_date)
             ):
