@@ -72,10 +72,16 @@ def installed_history_migration(db: Session) -> None:
             '2026-09-01 00:00+00','avg',70,1 FROM series_type_definition WHERE code='heart_rate';
         """)
     )
+    purge_path = path.parent / "2026_10_21_2300-c4e1d2b7a9f3_wearable_history_purge_state.py"
+    purge_spec = importlib.util.spec_from_file_location("history_purge_migration", purge_path)
+    purge = importlib.util.module_from_spec(purge_spec)
+    purge_spec.loader.exec_module(purge)
     context = MigrationContext.configure(db.connection())
     with Operations.context(context):
+        purge.downgrade()
         module.downgrade()
         module.upgrade()
+        purge.upgrade()
 
 
 def test_migration_keeps_previous_member_and_does_not_backfill_a_source(db: Session) -> None:

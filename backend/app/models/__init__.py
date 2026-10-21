@@ -26,6 +26,7 @@ from .user import User
 from .user_connection import UserConnection
 from .user_invitation_code import UserInvitationCode
 from .wearable_history_source import WearableHistorySource
+from .xml_upload import XmlUpload
 from .workout_details import WorkoutDetails
 
 # Single source of truth mapping detail_type -> concrete model, derived from the
@@ -50,6 +51,7 @@ __all__ = [
     "User",
     "UserConnection",
     "WearableHistorySource",
+    "XmlUpload",
     "UserInvitationCode",
     "EventRecord",
     "EventRecordDetail",
