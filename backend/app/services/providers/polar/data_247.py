@@ -1,3 +1,4 @@
+import re
 from collections.abc import Callable
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -59,6 +60,7 @@ from app.services.providers.api_client import make_authenticated_request
 from app.services.providers.polar.coverage import ACTIVITY_SERIES
 from app.services.providers.polar.pull_budget import (
     RATE_LIMITED,
+    claim_continuous_hr_webhook,
     full_due,
     interrupted_full_fetches,
     record_full_end,
@@ -79,6 +81,35 @@ from app.services.timeseries_service import timeseries_service
 from app.utils.structured_logging import log_structured
 
 _T = TypeVar("_T", bound=BaseModel)
+
+_SLEEP_LISTING = "/v3/users/sleep/available"
+
+# FORK (2.96.8, spec v1.1 P3): a date with no offset of its own takes the nearest one this many
+# days before or after it; the earlier of two equally near.
+_OFFSET_SEARCH_DAYS = 3
+_ZONE_OFFSET = re.compile(r"^([+-])(\d{2}):(\d{2})$")
+
+
+class _ContinuousHrOffsets:
+    """FORK (2.96.8, spec v1.1 P1, P3): the UTC offset in force on each local date, read at ingest.
+
+    Polar's continuous heart rate carries none. It comes from Polar's sleep listing, whose night
+    start and end times carry the offset, and from the ``zone_offset`` stored on Polar workouts.
+    Held for one ingest and stored nowhere (R-2026-10-21-c). ``uncorrected`` counts the samples
+    that had no offset within ``_OFFSET_SEARCH_DAYS`` and were stored as before 2.96.8.
+    """
+
+    def __init__(self, by_date: dict[date, timedelta]) -> None:
+        self._by_date = by_date
+        self.uncorrected = 0
+
+    def for_date(self, day: date) -> timedelta | None:
+        for distance in range(_OFFSET_SEARCH_DAYS + 1):
+            for candidate in (day - timedelta(days=distance), day + timedelta(days=distance)):
+                if candidate in self._by_date:
+                    return self._by_date[candidate]
+        return None
+
 
 # FORK (2.96.6.1, spec Q5): nothing whose date is more than this many days back is fetched.
 POLAR_WINDOW_DAYS = 90
@@ -216,7 +247,7 @@ class Polar247Data(Base247DataTemplate):
     # -------------------------------------------------------------------------
 
     def _get_available_sleep_dates(self, db: DbSession, user_id: UUID) -> set[date]:
-        response = self._make_api_request(db, user_id, "/v3/users/sleep/available")
+        response = self._make_api_request(db, user_id, _SLEEP_LISTING)
         nights = (response or {}).get("available", [])
         return {date.fromisoformat(night["date"]) for night in nights if night.get("date")}
 
@@ -454,7 +485,12 @@ class Polar247Data(Base247DataTemplate):
         self,
         raw_items: list[dict[str, Any]],
         user_id: UUID,
+        offsets: _ContinuousHrOffsets,
     ) -> list[TimeSeriesSampleCreate]:
+        """FORK (2.96.8, spec v1.1 P1, AC1): Polar sends a bare local date and local ``HH:MM`` times,
+        so the true instant is local minus the offset in force that day (``offsets``). These used
+        to be stored as if they were UTC: one offset late. A date Polar sends with a zone is
+        converted as given. A date with no offset is stored as before and counted (P3)."""
         samples: list[TimeSeriesSampleCreate] = []
         for raw in raw_items:
             if (parsed := self._parse(raw, ContinuousHeartRateJSON, user_id, "continuous_hr")) is None:
@@ -463,19 +499,115 @@ class Polar247Data(Base247DataTemplate):
                 continue
             anchor = datetime.fromisoformat(parsed.date)
             samples_dict = {s.sample_time: s.heart_rate for s in parsed.heart_rate_samples if s.sample_time}
+            if anchor.tzinfo is None:
+                offset = offsets.for_date(anchor.date())
+                if offset is None:
+                    offsets.uncorrected += len(samples_dict)
+                anchor = anchor.replace(tzinfo=timezone(offset) if offset is not None else timezone.utc)
             samples.extend(
                 TimeSeriesSampleCreate(
                     id=uuid4(),
                     user_id=user_id,
                     provider=ProviderName.POLAR,
                     source=ProviderName.POLAR,
-                    recorded_at=dt,
+                    recorded_at=dt.astimezone(timezone.utc),
                     value=bpm,
                     series_type=SeriesType.heart_rate,
                 )
                 for dt, bpm in self._hhmm_to_datetimes(samples_dict, anchor)
             )
         return samples
+
+    def _continuous_hr_offsets(
+        self, db: DbSession, user_id: UUID, listing: Any, raw_items: list[dict[str, Any]]
+    ) -> _ContinuousHrOffsets:
+        """The offsets ``normalize_continuous_hr`` reads (P1): the sleep listing first, a night's end
+        setting its date over another night's start, then the member's stored Polar workouts."""
+        by_date: dict[date, timedelta] = {}
+        entries = [e for e in (listing or {}).get("available", []) if isinstance(e, dict)]
+        for key in ("start_time", "end_time"):
+            for entry in entries:
+                try:
+                    moment = datetime.fromisoformat(entry[key])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if (offset := moment.utcoffset()) is not None:
+                    by_date[moment.date()] = offset
+        days = []
+        for raw in raw_items:
+            try:
+                days.append(date.fromisoformat(str(raw.get("date"))[:10]))
+            except (AttributeError, ValueError):
+                continue
+        if days:
+            margin = timedelta(days=_OFFSET_SEARCH_DAYS + 1)
+            workouts = (
+                db.query(EventRecord.start_datetime, EventRecord.zone_offset)
+                .join(DataSource, EventRecord.data_source_id == DataSource.id)
+                .filter(
+                    DataSource.user_id == user_id,
+                    DataSource.provider == ProviderName.POLAR,
+                    EventRecord.category == "workout",
+                    EventRecord.zone_offset.isnot(None),
+                    EventRecord.start_datetime >= datetime.combine(min(days) - margin, time(), tzinfo=timezone.utc),
+                    EventRecord.start_datetime < datetime.combine(max(days) + margin, time(), tzinfo=timezone.utc),
+                )
+                .order_by(EventRecord.start_datetime)
+                .all()
+            )
+            for start, zone_offset in workouts:
+                if (match := _ZONE_OFFSET.match(zone_offset or "")) is None:
+                    continue
+                sign = -1 if match.group(1) == "-" else 1
+                offset = sign * timedelta(hours=int(match.group(2)), minutes=int(match.group(3)))
+                by_date.setdefault(start.astimezone(timezone(offset)).date(), offset)
+        return _ContinuousHrOffsets(by_date)
+
+    def _report_uncorrected(self, offsets: _ContinuousHrOffsets, user_id: UUID) -> None:
+        """P3: the samples stored without an offset, as a count the build reports from."""
+        if offsets.uncorrected:
+            log_structured(
+                self.logger,
+                "info",
+                "Polar continuous heart rate stored without an offset",
+                provider="polar",
+                action="polar_continuous_hr_uncorrected",
+                user_id=str(user_id),
+                count=offsets.uncorrected,
+            )
+
+    def _save_continuous_hr(self, db: DbSession, user_id: UUID, listing: Any, raw_items: list[dict[str, Any]]) -> int:
+        offsets = self._continuous_hr_offsets(db, user_id, listing, raw_items)
+        saved = self._save_timeseries_in_batches(
+            db, raw_items, lambda items, uid: self.normalize_continuous_hr(items, uid, offsets), user_id
+        )
+        self._report_uncorrected(offsets, user_id)
+        return saved
+
+    def _save_continuous_hr_from_webhook(self, db: DbSession, user_id: UUID, path: str) -> dict[str, int]:
+        """FORK (2.96.8, P1, P7): the same offsets as the pull, so the webhook and the full fetch
+        store a sample at one instant (AC7). That costs one more call, the sleep listing, and the
+        webhooks that call Polar are capped a day. A refused one calls nothing and stores nothing:
+        the day is the next full fetch's. A listing that fails stores nothing either."""
+        if (refused := claim_continuous_hr_webhook(user_id, datetime.now(timezone.utc))) is not None:
+            log_structured(
+                self.logger,
+                "info",
+                "Polar continuous heart-rate webhook left to the next full fetch",
+                provider="polar",
+                action="polar_continuous_hr_webhook_deferred",
+                user_id=str(user_id),
+                reason=refused,
+            )
+            return {"continuous_hr": 0}
+        raw = self._make_api_request(db, user_id, path)
+        if not raw:
+            return {}
+        items = raw.get("heart_rates", [])
+        offsets = self._continuous_hr_offsets(db, user_id, self._make_api_request(db, user_id, _SLEEP_LISTING), items)
+        saved = self._save_timeseries(db, self.normalize_continuous_hr(items, user_id, offsets))
+        self._report_uncorrected(offsets, user_id)
+        return {"continuous_hr": saved}
 
     # -------------------------------------------------------------------------
     # Cardio Load - GET /v3/users/cardio-load/{date}
@@ -1016,6 +1148,8 @@ class Polar247Data(Base247DataTemplate):
         path: str,
     ) -> dict[str, int]:
         """Fetch a single entity from the webhook URL path and save it. Used by webhook handler."""
+        if event_type == PolarWebhookEventType.CONTINUOUS_HEART_RATE:
+            return self._save_continuous_hr_from_webhook(db, user_id, path)
         raw = self._make_api_request(db, user_id, path)
         if not raw:
             return {}
@@ -1027,13 +1161,6 @@ class Polar247Data(Base247DataTemplate):
 
             case PolarWebhookEventType.ACTIVITY_SUMMARY:
                 return {"daily_activity": self._save_timeseries(db, self.normalize_daily_activity([raw], user_id))}
-
-            case PolarWebhookEventType.CONTINUOUS_HEART_RATE:
-                return {
-                    "continuous_hr": self._save_timeseries(
-                        db, self.normalize_continuous_hr(raw.get("heart_rates", []), user_id)
-                    )
-                }
 
             case PolarWebhookEventType.SLEEP_WISE_ALERTNESS:
                 return {"alertness": self._save_scores(db, self.normalize_alertness([raw], user_id))}
@@ -1051,7 +1178,13 @@ class Polar247Data(Base247DataTemplate):
                 return {}
 
     def _save_missing_sleep(
-        self, db: DbSession, user_id: UUID, now: datetime, *, latest_only: bool = False
+        self,
+        db: DbSession,
+        user_id: UUID,
+        now: datetime,
+        *,
+        latest_only: bool = False,
+        listing: Callable[[], Any] | None = None,
     ) -> int | DataTypeFailure:
         """Fetch and store every night Polar lists that is inside the window and not yet stored.
 
@@ -1072,9 +1205,12 @@ class Polar247Data(Base247DataTemplate):
         cannot stop the valid nights being fetched (the newest valid one, in the short form);
         the type is then reported failed with ``POLAR_SLEEP_LISTING_MALFORMED``, unless a night's
         own failure gives an earlier code (a 429 above all, which ends the pull).
+
+        ``listing`` (2.96.8): where the pull's one read of the listing comes from, so continuous
+        heart rate reads its offsets from the same answer without another call.
         """
         oldest = (now - timedelta(days=POLAR_WINDOW_DAYS)).date()
-        response = self._make_api_request(db, user_id, "/v3/users/sleep/available")
+        response = listing() if listing is not None else self._make_api_request(db, user_id, _SLEEP_LISTING)
         listed, malformed = self._readable_available_nights(response, user_id)
         if latest_only and listed:
             listed = [max(listed, key=lambda listed_night: listed_night[0])]
@@ -1235,17 +1371,32 @@ class Polar247Data(Base247DataTemplate):
             else frozenset(_FULL_FORM_TYPES)
         )
 
+        # FORK (2.96.8, P7): the sleep listing is read once a pull, by the sleep task, which runs
+        # first; continuous heart rate reads its offsets from that answer. A listing that failed
+        # fails continuous heart rate too, without asking again.
+        listed: list[Any] = []
+
+        def sleep_listing() -> Any:
+            if not listed:
+                try:
+                    listed.append(self._make_api_request(db, user_id, _SLEEP_LISTING))
+                except Exception as e:
+                    listed.append(e)
+            if isinstance(listed[0], Exception):
+                raise listed[0]
+            return listed[0]
+
         def daily_activity(start: datetime) -> Callable[[], Any]:
             return lambda: self._save_timeseries_in_batches(
                 db, self.get_daily_activity_statistics(db, user_id, start, now), self.normalize_daily_activity, user_id
             )
 
         full_only: dict[str, Callable[[], Any]] = {
-            "continuous_hr": lambda: self._save_timeseries_in_batches(
+            "continuous_hr": lambda: self._save_continuous_hr(
                 db,
-                self.get_continuous_hr_data(db, user_id, since("continuous_hr"), now),
-                self.normalize_continuous_hr,
                 user_id,
+                sleep_listing(),
+                self.get_continuous_hr_data(db, user_id, since("continuous_hr"), now),
             ),
             "cardio_load": lambda: self._save_scores(
                 db,
@@ -1283,9 +1434,11 @@ class Polar247Data(Base247DataTemplate):
         # Sleep first: last night is what the morning needs, and a 429 ends the pull.
         tasks: dict[str, Callable[[], Any]] = {}
         if "sleep" in due:
-            tasks["sleep"] = lambda: self._save_missing_sleep(db, user_id, now)
+            tasks["sleep"] = lambda: self._save_missing_sleep(db, user_id, now, listing=sleep_listing)
         else:
-            tasks[_SHORT_FORM_KEYS["sleep"]] = lambda: self._save_missing_sleep(db, user_id, now, latest_only=True)
+            tasks[_SHORT_FORM_KEYS["sleep"]] = lambda: self._save_missing_sleep(
+                db, user_id, now, latest_only=True, listing=sleep_listing
+            )
         tasks["nightly_recharge"] = lambda: self._save_nightly_recharge(
             db,
             *self.normalize_nightly_recharge(self.get_nightly_recharge_data(db, user_id, now, now), user_id),

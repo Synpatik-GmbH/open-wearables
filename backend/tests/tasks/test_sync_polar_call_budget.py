@@ -25,10 +25,11 @@ from sqlalchemy.orm import Session
 from app.integrations.celery.tasks.sync_vendor_data_task import PULL_INTERVAL_SKIP, sync_vendor_data
 from app.models import PolarRegistration, SyncRun, SyncRunDataType, UserConnection
 from app.schemas.auth import ConnectionStatus
+from app.schemas.providers.polar import PolarWebhookEventType
 from app.schemas.sync_status import SyncStatus
 from app.services.providers.polar.data_247 import Polar247Data
 from app.services.providers.polar.last_night import ask_polar_for_last_night
-from app.services.providers.polar.pull_budget import PULL_INTERVAL, RATE_LIMITED
+from app.services.providers.polar.pull_budget import PULL_INTERVAL, RATE_LIMITED, WEBHOOK_HR_DAILY_CAP
 from app.services.providers.polar.strategy import PolarStrategy
 from app.services.sync_coordination import release_primary, try_become_primary
 from app.services.sync_error_code import PULL_CLAIM_FAILED
@@ -275,6 +276,40 @@ def test_a_worst_case_day_with_the_app_opened_all_morning_stays_inside_the_limit
 
     assert sum(1 for c in ask_calls if c > 0) == 12, "the daily cap, and nothing called on a refused ask"
     assert sum(ask_calls) <= 12 * 3
+    assert calls <= POLAR_DAILY_CALLS_PER_MEMBER_AT_50, calls
+
+
+@pytest.mark.usefixtures("mock_celery_app")
+def test_a_worst_case_day_with_continuous_heart_rate_webhooks_all_day_stays_inside_the_limit(
+    db: Session, member: UUID, polar_api: FakePolar
+) -> None:
+    # 2.96.8 (P7, AC11): the day above, and Polar also announces new continuous heart rate every
+    # five minutes all day. Each webhook that calls Polar costs two calls (the day, the sleep
+    # listing for its offsets), and only WEBHOOK_HR_DAILY_CAP of them call Polar in 24 hours.
+    ask_calls: list[int] = []
+    hook_calls: list[int] = []
+
+    def ask(member: UUID, at: datetime) -> None:
+        before = len(polar_api.calls)
+        with freeze_time(at):
+            ask_polar_for_last_night(db, _polar_data(), member, logging.getLogger("test"))
+        ask_calls.append(len(polar_api.calls) - before)
+
+    def hook(member: UUID, at: datetime) -> None:
+        before = len(polar_api.calls)
+        with freeze_time(at):
+            _polar_data().fetch_and_save_from_webhook(
+                db, member, PolarWebhookEventType.CONTINUOUS_HEART_RATE, f"/v3/users/continuous-heart-rate/{DAY}"
+            )
+        hook_calls.append(len(polar_api.calls) - before)
+
+    asks = [(_at(4) + timedelta(minutes=5 * n), ask) for n in range(97)]
+    hooks = [(_at(0, 2) + timedelta(minutes=5 * n), hook) for n in range(288)]
+
+    calls = _worst_case_day(member, polar_api, hourly_minute=7, more=asks + hooks)
+
+    assert sum(1 for c in hook_calls if c > 0) == WEBHOOK_HR_DAILY_CAP
+    assert sum(hook_calls) == 2 * WEBHOOK_HR_DAILY_CAP == 18
     assert calls <= POLAR_DAILY_CALLS_PER_MEMBER_AT_50, calls
 
 
