@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import Date, and_, cast, func, or_, select
 from sqlalchemy.orm import Query, Session
 
 from app.models import DataPointSeries, DataSource, EventRecord
@@ -29,7 +29,11 @@ class WearableHistoryReadRepository:
         if not self.sources:
             return None
         # Restrict before count/cursor/limit; held duplicate nights cannot crowd out inputs.
-        night = func.wh_night_day(EventRecord.start_datetime, EventRecord.end_datetime, EventRecord.zone_offset)
+        # A sleep that is no recorded night is dated by its Berlin calendar day, as on ingress.
+        night = func.coalesce(
+            func.wh_night_day(EventRecord.start_datetime, EventRecord.end_datetime, EventRecord.zone_offset),
+            cast(func.timezone("Europe/Berlin", EventRecord.start_datetime), Date),
+        )
         return (
             self.db.query(EventRecord.id)
             .join(DataSource)
@@ -49,8 +53,11 @@ class WearableHistoryReadRepository:
         if source is None:
             raise WearableHistoryMetadataUnavailableError("Baseline data source unavailable")
         first = self.cutoff(source)
-        day = recorded_night_date(record.start_datetime, record.end_datetime, record.zone_offset)
-        return first is None or (day is not None and day >= first)
+        day = (
+            recorded_night_date(record.start_datetime, record.end_datetime, record.zone_offset)
+            or record.start_datetime.astimezone(BERLIN).date()
+        )
+        return first is None or day >= first
 
     def filter_series(
         self, rows: list[tuple[DataPointSeries, DataSource]], start: datetime, end: datetime, *, weight: bool

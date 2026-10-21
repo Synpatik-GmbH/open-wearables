@@ -30,6 +30,7 @@ from app.repositories.data_point_series_repository import DataPointSeriesReposit
 from app.repositories.event_record_detail_repository import EventRecordDetailRepository
 from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
+from app.repositories.wearable_history_read_repository import WearableHistoryReadRepository
 from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.schemas.enums import SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import EventRecordDetailCreate, TimeSeriesSampleCreate
@@ -830,3 +831,50 @@ def test_missing_source_metadata_is_retried_while_weight_remains_exempt(db: Sess
     weight = sample.model_copy(update={"id": uuid4(), "series_type": SeriesType.weight})
     assert repository.bulk_create(db, [weight]).inserted == 1
     assert db.get(DataPointSeries, weight.id) is not None
+
+
+def test_baseline_reads_date_a_daytime_sleep_by_its_calendar_day_like_ingress(db: Session) -> None:
+    """A sleep starting 06:00-18:00 is no recorded night; its day is its Berlin calendar day (wh_read_event)."""
+
+    member = UserFactory()
+    connected = datetime.now(UTC) + timedelta(days=2)  # Provisional whatever the test clock reads.
+    source = WearableHistoryRepository().begin_source(db, member.id, "apple", connected)
+    source.start_date = source.connection_day - timedelta(days=5)
+    data_source = DataSourceFactory(user=member, provider="apple")
+    db.flush()
+
+    def berlin(day: date, hour: int) -> datetime:
+        return datetime.combine(day, datetime.min.time(), BERLIN).replace(hour=hour).astimezone(UTC)
+
+    after = EventRecordFactory(
+        data_source=data_source,
+        category="sleep",
+        start_datetime=berlin(source.start_date + timedelta(days=1), 9),
+        end_datetime=berlin(source.start_date + timedelta(days=1), 15),
+    )
+    before = EventRecordFactory(
+        data_source=data_source,
+        category="sleep",
+        start_datetime=berlin(source.start_date - timedelta(days=1), 9),
+        end_datetime=berlin(source.start_date - timedelta(days=1), 15),
+    )
+    night = EventRecordFactory(
+        data_source=data_source,
+        category="sleep",
+        start_datetime=berlin(source.start_date - timedelta(days=1), 23),
+        end_datetime=berlin(source.start_date, 7),
+    )
+    db.flush()
+
+    history = WearableHistoryReadRepository(db, member.id)
+    assert [history.event_eligible(r) for r in (after, before, night)] == [True, False, True]
+    eligible = {row.id for row in history.sleep_record_ids().all()}
+    assert eligible == {after.id, night.id}
+    read_event = [
+        db.scalar(
+            text("SELECT wh_read_event(:s, 'sleep', :a, :b, :z)"),
+            dict(s=data_source.id, a=r.start_datetime, b=r.end_datetime, z=r.zone_offset),
+        )
+        for r in (after, before, night)
+    ]
+    assert read_event == [True, False, True]  # The SQL read rule these readers must agree with.
