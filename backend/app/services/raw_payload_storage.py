@@ -157,19 +157,30 @@ COPY_RETENTION = timedelta(days=7)
 def sweep_expired_copies(now: datetime | None = None) -> int:
     """Delete every stored copy last modified more than ``COPY_RETENTION`` ago.
 
-    Raises on a failed deletion, so the scheduled run is retried and nothing is reported done
-    while a copy outlives the bound. A deployment without object storage stores no copies.
+    A failed deletion is logged and the sweep goes on; at the end it raises, so the
+    scheduled run shows as failed and the next one retries. A deployment without object
+    storage stores no copies.
     """
     if _s3_client is None or _s3_bucket is None:
         return 0
     cutoff = (now or datetime.now(UTC)) - COPY_RETENTION
     deleted = 0
+    failed = 0
     for prefix in (f"{_s3_prefix}/", "fit-files/"):
         for page in _s3_client.get_paginator("list_objects_v2").paginate(Bucket=_s3_bucket, Prefix=prefix):
             for item in page.get("Contents", []):
-                if item["LastModified"] < cutoff:
+                if item["LastModified"] >= cutoff:
+                    continue
+                try:
                     _s3_client.delete_object(Bucket=_s3_bucket, Key=item["Key"])
                     deleted += 1
+                except Exception as exc:
+                    failed += 1
+                    log_structured(
+                        logger, "error", "Expired copy deletion failed", key=item["Key"], error=type(exc).__name__
+                    )
+    if failed:
+        raise RuntimeError(f"{failed} of {deleted + failed} expired copies could not be deleted; retrying next run")
     return deleted
 
 

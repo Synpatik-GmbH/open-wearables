@@ -38,14 +38,27 @@ def test_sweep_deletes_only_copies_older_than_seven_days_under_every_copy_prefix
     assert deleted == ["fit-files/garmin/2026-11-02/u/1.fit", "raw-payloads/polar/webhook/2026-11-03/_unknown/a.json"]
 
 
-def test_sweep_raises_when_a_deletion_fails_so_the_next_run_retries() -> None:
-    client = client_with({"raw-payloads/": [("raw-payloads/x.json", NOW - timedelta(days=8))]})
-    client.delete_object.side_effect = RuntimeError("denied")
+def test_a_failed_deletion_is_logged_and_raised_after_the_others_are_deleted(capsys: pytest.CaptureFixture) -> None:
+    old = NOW - timedelta(days=8)
+    client = client_with({"raw-payloads/": [("raw-payloads/x.json", old), ("raw-payloads/y.json", old)]})
+
+    def delete(**kwargs: str) -> None:
+        if kwargs["Key"].endswith("x.json"):
+            raise RuntimeError("denied")
+
+    client.delete_object.side_effect = delete
     with (
         patch.multiple(raw_payload_storage, _s3_client=client, _s3_bucket="bucket", _s3_prefix="raw-payloads"),
-        pytest.raises(RuntimeError, match="denied"),
+        pytest.raises(RuntimeError, match="1 of 2 expired copies"),
     ):
         raw_payload_storage.sweep_expired_copies(NOW)
+    assert [c.kwargs["Key"] for c in client.delete_object.call_args_list] == [
+        "raw-payloads/x.json",
+        "raw-payloads/y.json",
+    ]
+    logged = capsys.readouterr().out
+    assert logged.count("Expired copy deletion failed") == 1
+    assert "raw-payloads/x.json" in logged
 
 
 def test_sweep_is_a_no_op_without_object_storage() -> None:
