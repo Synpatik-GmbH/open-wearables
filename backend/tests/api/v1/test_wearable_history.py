@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import WearableHistorySource
+from app.repositories.wearable_history_repository import WearableHistoryRepository
 from tests.factories import ApiKeyFactory, ApplicationFactory, UserFactory
 from tests.utils import api_key_headers
 
@@ -25,8 +26,6 @@ def test_apple_token_begins_history_before_first_upload_and_retries_preserve_it(
 
 
 def test_source_metadata_is_api_key_only_and_is_scoped_to_the_member(client: TestClient, db: Session) -> None:
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-
     member, other = UserFactory(), UserFactory()
     WearableHistoryRepository().begin_source(db, member.id, "polar")
     WearableHistoryRepository().begin_source(db, other.id, "apple")
@@ -49,8 +48,6 @@ def test_source_metadata_is_api_key_only_and_is_scoped_to_the_member(client: Tes
 def test_first_sdk_upload_establishes_its_own_source_before_dispatch(
     client: TestClient, db: Session, provider: str
 ) -> None:
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-
     member = UserFactory()
     WearableHistoryRepository().begin_source(db, member.id, "apple")
     key = ApiKeyFactory()

@@ -5,9 +5,11 @@ from unittest.mock import MagicMock, patch
 from uuid import UUID
 
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
 
+from app.models.wearable_history_source import WearableHistorySource
 from app.services import user_service
 from app.services.sdk_token_service import create_sdk_user_token
 from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
@@ -76,10 +78,6 @@ class TestSDKSyncWithSDKToken:
     def test_api_key_sync_for_an_unknown_member_is_not_found_and_starts_no_history(
         self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
     ) -> None:
-        from sqlalchemy import func, select
-
-        from app.models.wearable_history_source import WearableHistorySource
-
         api_key = ApiKeyFactory()
         user_id = "123e4567-e89b-12d3-a456-426614174999"
 

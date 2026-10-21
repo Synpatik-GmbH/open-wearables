@@ -47,6 +47,7 @@ from app.repositories.repositories import (
     utc_bucket_start,
 )
 from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
+from app.repositories.wearable_history_read_repository import WearableHistoryReadRepository
 from app.schemas.enums import (
     BUCKET_SIZES,
     AggregationMethod,
@@ -1610,8 +1611,6 @@ class DataPointSeriesRepository(
             .order_by(self.model.recorded_at, self.model.id)
             .all()
         )
-        from app.repositories.wearable_history_read_repository import WearableHistoryReadRepository
-        from app.schemas.enums import get_series_type_from_id
 
         return WearableHistoryReadRepository(db_session, user_id).filter_series(
             [(sample, source) for sample, source in results],

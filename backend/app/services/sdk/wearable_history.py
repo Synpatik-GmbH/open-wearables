@@ -11,6 +11,7 @@ from app.constants.series_types.sdk import get_apple_sleep_phase, get_series_typ
 from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.providers.mobile_sdk import SLEEP_START_STATES, SleepStateStage
 from app.services.sdk.sleep_stages import normalized_sleep_window, ordered_sleep_stages
+from app.services.sdk.sync_request_parser import parse_sync_request
 from app.utils.sleep_interval import interval_gap
 from app.utils.structured_logging import log_structured
 
@@ -35,9 +36,7 @@ def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None
     source = gate.source((member, provider))
     if source is None or gate.now < source.freeze_at:
         return raw
-    from app.services.sdk.import_service import _parse_sync_request
-
-    request, dropped = _parse_sync_request(raw)
+    request, dropped = parse_sync_request(raw)
     if dropped:
         # The frozen transport cannot retain invalid raw items for worker diagnostics.
         # Report their locations/count here; an already-cleaned worker delivery is quiet.

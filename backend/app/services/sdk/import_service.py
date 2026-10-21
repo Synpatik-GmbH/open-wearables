@@ -34,12 +34,6 @@ from app.schemas.providers.mobile_sdk import (
 from app.schemas.providers.mobile_sdk import (
     WorkoutStatistic,
 )
-from app.schemas.providers.mobile_sdk.sync_request import (
-    MetricRecord,
-    SleepRecord,
-    SyncRequestData,
-    Workout,
-)
 from app.schemas.responses.upload import UploadDataResponse
 from app.services.event_record_service import event_record_service
 from app.services.sync_error_code import error_code
@@ -48,23 +42,13 @@ from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
 from .device_resolution import extract_device_info
-from .sleep_service import handle_sleep_data
+from .sleep_service import handle_sleep_data, load_sleep_state
+from .sync_request_parser import InvalidRecord, parse_sync_request
+from .wearable_history import sanitize_sdk_payload
 
 # Health Connect's own mg/dL converter uses exactly 18.0, so values written to HC
 # in mg/dL round-trip with a ~0.1% offset under this factor.
 MMOL_L_TO_MG_DL = Decimal("18.0182")
-
-_SDK_ITEM_MODELS = (("records", MetricRecord), ("sleep", SleepRecord), ("workouts", Workout))
-
-
-class InvalidRecord(TypedDict):
-    """A single record dropped by per-record validation (PII-free — only the location, no values)."""
-
-    collection: str  # "records" | "sleep" | "workouts"
-    index: int
-    loc: str
-    msg: str | None
-    type: str | None
 
 
 class LoadDataResult(TypedDict):
@@ -76,52 +60,6 @@ class LoadDataResult(TypedDict):
     sleep_saved: int
     dropped: list[InvalidRecord]
     validation_ms: float
-
-
-def _parse_sync_request(raw: dict) -> tuple[SDKSyncRequest, list[InvalidRecord]]:
-    """Parse a raw payload into a SyncRequest, salvaging valid records when items fail.
-
-    Fast path validates in one shot. On failure, valid records are kept and the per-item
-    failures returned (PII-free: loc/msg/type). Raises ValidationError when the envelope or
-    a container shape is invalid — nothing salvageable, so the batch is rejected (400).
-    """
-    try:
-        return SDKSyncRequest(**raw), []
-    except ValidationError:
-        pass  # fall through to per-item validation
-
-    # Only individual records are salvageable. A malformed container shape (data not a dict,
-    # or a collection not a list) is not — re-validate to re-raise the real ValidationError.
-    data = raw.get("data")
-    if not isinstance(data, dict) or any(not isinstance(data.get(key, []), list) for key, _ in _SDK_ITEM_MODELS):
-        return SDKSyncRequest(**raw), []
-
-    kept: dict[str, list] = {}
-    dropped: list[InvalidRecord] = []
-    for key, model in _SDK_ITEM_MODELS:
-        good: list = []
-        for idx, item in enumerate(data.get(key, [])):
-            try:
-                good.append(model.model_validate(item))
-            except ValidationError as exc:
-                err = (exc.errors() or [{}])[0]
-                dropped.append(
-                    {
-                        "collection": key,
-                        "index": idx,
-                        "loc": ".".join(str(x) for x in err.get("loc", [])),
-                        "msg": err.get("msg"),
-                        "type": err.get("type"),
-                    }
-                )
-        kept[key] = good
-
-    # Reconstruct via model_validate so Pydantic still rejects a bad envelope; `data` now
-    # carries only the kept records.
-    request = SDKSyncRequest.model_validate(
-        {**raw, "data": SyncRequestData(records=kept["records"], sleep=kept["sleep"], workouts=kept["workouts"])}
-    )
-    return request, dropped
 
 
 class ImportService:
@@ -361,11 +299,8 @@ class ImportService:
         # validation_ms measures the parse/per-record pass so we can watch the cost of a
         # malformed payload in the logs.
         started = time.perf_counter()
-        from app.services.sdk.sleep_service import load_sleep_state
-        from app.services.sdk.wearable_history import sanitize_sdk_payload
-
         raw = sanitize_sdk_payload(db_session, UUID(user_id), raw, load_sleep_state(user_id))
-        request, dropped = _parse_sync_request(raw)
+        request, dropped = parse_sync_request(raw)
         validation_ms = round((time.perf_counter() - started) * 1000, 1)
         workouts_saved = 0
         records_saved = 0
@@ -558,7 +493,7 @@ class ImportService:
 
         except ValidationError as e:
             # Reached ONLY when the envelope itself is invalid (provider/sdkVersion/
-            # syncTimestamp/data shape) — _parse_sync_request re-raised because nothing was
+            # syncTimestamp/data shape) — parse_sync_request re-raised because nothing was
             # salvageable. Per-record failures never reach here: they are collected inside
             # load_data and handled above as a partial success. Report + 400 the whole batch.
             errors = e.errors()

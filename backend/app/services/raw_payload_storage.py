@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
+from app.database import SessionLocal
+from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.services.s3_client import create_s3_client
 from app.utils.structured_logging import json_serial, log_structured
 
@@ -33,9 +35,6 @@ _fit_files_enabled: bool = False
 
 
 def _history_allows_archive(provider: str, user_id: str | None) -> bool:
-    from app.database import SessionLocal
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-
     try:
         with SessionLocal() as db:
             member = UUID(user_id) if user_id else None

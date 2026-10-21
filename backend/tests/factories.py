@@ -33,6 +33,7 @@ from app.models import (
     UserConnection,
     WorkoutDetails,
 )
+from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.utils.security import get_password_hash, hash_api_key
@@ -379,7 +380,6 @@ class DataSourceFactory(BaseFactory):
                 kwargs["provider"] = ProviderName.UNKNOWN
 
         data_source = super()._create(model_class, *args, **kwargs)
-        from app.repositories.wearable_history_repository import WearableHistoryRepository
 
         repository = WearableHistoryRepository()
         session = cls._meta.sqlalchemy_session
@@ -430,7 +430,6 @@ class UserConnectionFactory(BaseFactory):
         connection = super()._create(model_class, *args, **kwargs)
         # A connected fixture must satisfy the same independent source contract as OAuth/SDK.
         # The old provider regressions assume a complete imported history window.
-        from app.repositories.wearable_history_repository import WearableHistoryRepository
 
         repository = WearableHistoryRepository()
         session = cls._meta.sqlalchemy_session

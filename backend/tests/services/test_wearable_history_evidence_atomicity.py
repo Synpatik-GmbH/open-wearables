@@ -1,18 +1,29 @@
 """Night evidence counts only for a sleep that was actually stored (Codex P1 on #46 at 0100f1f1)."""
 
 from datetime import UTC, datetime, timedelta
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
 from sqlalchemy.orm import Session
 
-from app.models import EventRecord, User
+from app.models import DataPointSeries, EventRecord, User, UserConnection
+from app.models.wearable_history_source import WearableHistorySource
+from app.repositories.data_point_series_repository import DataPointSeriesRepository
 from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository as Gate
 from app.repositories.wearable_history_repository import WearableHistoryRepository
-from app.schemas.model_crud.activities import EventRecordCreate
-from tests.factories import DataSourceFactory, UserFactory
+from app.schemas.enums import SeriesType
+from app.schemas.model_crud.activities import EventRecordCreate, TimeSeriesSampleCreate
+from app.schemas.sync_status import DataTypeFailure
+from app.services.providers.oura.data_247 import Oura247Data
+from app.utils.wearable_history_ingress import (
+    FirstNightAssociationUnavailableError,
+    WearableHistoryMetadataUnavailableError,
+)
+from tests.factories import DataSourceFactory, UserConnectionFactory, UserFactory
 
 
 def provisional_source(db: Session) -> tuple:
@@ -85,12 +96,6 @@ def test_failed_bulk_sleep_insert_leaves_no_night_evidence(db: Session) -> None:
 
 def test_connection_without_history_row_begins_its_source_from_the_connection_clock(db: Session) -> None:
     """Codex P2 on #46: a failed history write after the OAuth commit must not strand the connection."""
-    from app.models import DataPointSeries, UserConnection
-    from app.models.wearable_history_source import WearableHistorySource
-    from app.repositories.data_point_series_repository import DataPointSeriesRepository
-    from app.schemas.enums import SeriesType
-    from app.schemas.model_crud.activities import TimeSeriesSampleCreate
-    from tests.factories import UserConnectionFactory
 
     member = UserFactory()
     WearableHistoryRepository().begin_source(db, member.id, "apple")  # Another source has authority.
@@ -121,9 +126,6 @@ def test_connection_without_history_row_begins_its_source_from_the_connection_cl
 
 def test_xml_importer_alias_is_judged_by_the_apple_source() -> None:
     """Codex P1 on #46: XML sleep names its provider "apple_health_xml"."""
-    from types import SimpleNamespace
-
-    from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository as Gate
 
     member = uuid4()
     gate = Gate.__new__(Gate)
@@ -132,8 +134,6 @@ def test_xml_importer_alias_is_judged_by_the_apple_source() -> None:
 
 
 def test_xml_sleep_with_an_apple_source_is_admitted_instead_of_raising(db: Session) -> None:
-    from types import SimpleNamespace
-
     member = UserFactory()
     connected = datetime.now(UTC) + timedelta(days=2)
     WearableHistoryRepository().begin_source(db, member.id, "apple", connected)
@@ -153,14 +153,6 @@ def test_xml_sleep_with_an_apple_source_is_admitted_instead_of_raising(db: Sessi
 @pytest.mark.parametrize("failure", ["first_night", "metadata"])
 def test_oura_retriable_history_error_holds_the_pull_cursor(failure: str) -> None:
     """Codex P1 on #46: a swallowed retry error let the cursor pass an acknowledged sample."""
-    from unittest.mock import MagicMock
-
-    from app.schemas.sync_status import DataTypeFailure
-    from app.services.providers.oura.data_247 import Oura247Data
-    from app.utils.wearable_history_ingress import (
-        FirstNightAssociationUnavailableError,
-        WearableHistoryMetadataUnavailableError,
-    )
 
     error = (
         FirstNightAssociationUnavailableError("first night")
@@ -199,14 +191,6 @@ class _BoundaryRejectionError(Exception):
 @pytest.mark.parametrize("failure", ["first_night", "metadata", "sql_boundary"])
 def test_oura_sleep_history_error_inside_save_reaches_the_cursor_classifier(failure: str) -> None:
     """Codex P1 on #46 at 8546b1ae: save_sleep_data's own catch swallowed the retriable error."""
-    from unittest.mock import MagicMock
-
-    from app.schemas.sync_status import DataTypeFailure
-    from app.services.providers.oura.data_247 import Oura247Data
-    from app.utils.wearable_history_ingress import (
-        FirstNightAssociationUnavailableError,
-        WearableHistoryMetadataUnavailableError,
-    )
 
     error = {
         "first_night": FirstNightAssociationUnavailableError("first night"),

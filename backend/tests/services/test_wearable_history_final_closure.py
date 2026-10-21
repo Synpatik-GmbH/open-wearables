@@ -297,6 +297,8 @@ def test_sdk_first_night_uses_the_importers_cleaned_window(
     assert len(stored["data"]["sleep"]) == (1 if existing else 2)
     assert len(stored["data"]["records"]) == 2
     with (
+        # import_service reads the state for the history gate; sleep_service reads it to merge.
+        patch("app.services.sdk.import_service.load_sleep_state", return_value=state),
         patch("app.services.sdk.sleep_service.load_sleep_state", return_value=state),
         patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps.delay"),
     ):

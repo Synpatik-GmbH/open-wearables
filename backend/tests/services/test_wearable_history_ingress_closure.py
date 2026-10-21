@@ -10,11 +10,16 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.api.routes.v1.sdk_sync import sync_sdk_data
+from app.config import settings
 from app.models import DataPointSeries, DataSource, User, WearableHistorySource
 from app.repositories.data_point_series_repository import DataPointSeriesRepository
 from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.schemas.enums import SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import TimeSeriesSampleCreate
+from app.services import raw_payload_storage
+from app.services.sdk.import_service import import_service
+from app.services.sdk.wearable_history import sanitize_sdk_payload
 from tests.factories import DataPointSeriesFactory, DataSourceFactory, EventRecordFactory, UserFactory
 
 
@@ -29,12 +34,12 @@ def frozen_source(db: Session, provider: str = "apple") -> tuple[User, WearableH
 @pytest.mark.parametrize("offload", [False, True])
 @pytest.mark.parametrize("metric", ["STEP_COUNT", "HEART_RATE", "HEART_RATE_VARIABILITY"])
 def test_frozen_sdk_transport_uses_persisted_start_timestamp_and_strips_sleep_values(
-    db: Session, offload: bool, metric: str, capsys: pytest.CaptureFixture[str]
+    db: Session,
+    offload: bool,
+    metric: str,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from app.api.routes.v1.sdk_sync import sync_sdk_data
-    from app.config import settings
-    from app.services import raw_payload_storage
-
     member, source = frozen_source(db)
     day = datetime.combine(source.start_date, datetime.min.time(), UTC)
     old = day - timedelta(hours=12)
@@ -87,7 +92,7 @@ def test_frozen_sdk_transport_uses_persisted_start_timestamp_and_strips_sleep_va
 
     s3 = MagicMock()
     with (
-        patch("app.database.SessionLocal", archive_session),
+        patch.object(raw_payload_storage, "SessionLocal", archive_session),
         patch.object(settings, "sdk_payload_s3_offload", offload),
         patch.object(raw_payload_storage, "_storage_backend", "log"),
         patch.object(raw_payload_storage, "_s3_client", s3),
@@ -108,6 +113,8 @@ def test_frozen_sdk_transport_uses_persisted_start_timestamp_and_strips_sleep_va
     assert [r["id"] for r in stored["data"]["records"]] == ["admitted", "exempt-weight"]
     assert len(stored["data"]["sleep"]) == 1
     assert stored["data"]["sleep"][0]["values"] is None
+    # Archive denied by the frozen source, not by the fail-closed fallback for an unreadable source.
+    assert "source admission unavailable" not in caplog.text
 
 
 @pytest.mark.parametrize("provider", ["apple", "polar"])
@@ -164,8 +171,6 @@ def test_frozen_daytime_nap_samples_use_calendar_date_and_persist(
 
 
 def test_frozen_validation_salvage_reports_safe_diagnostics_before_transport(db: Session) -> None:
-    from app.services.sdk.wearable_history import sanitize_sdk_payload
-
     member, source = frozen_source(db)
     instant = datetime.combine(source.start_date, datetime.min.time(), UTC) + timedelta(hours=12)
     raw = {
@@ -209,9 +214,6 @@ def test_frozen_validation_salvage_reports_safe_diagnostics_before_transport(db:
 
 @pytest.mark.parametrize("metric", ["HEART_RATE", "HEART_RATE_VARIABILITY"])
 def test_frozen_sdk_daytime_nap_samples_survive_worker_transport_and_persist(db: Session, metric: str) -> None:
-    from app.services.sdk.import_service import import_service
-    from app.services.sdk.wearable_history import sanitize_sdk_payload
-
     member, source = frozen_source(db)
     start = datetime.combine(source.start_date, datetime.min.time(), UTC) + timedelta(hours=11)
     instant = start + timedelta(minutes=30)
@@ -252,8 +254,6 @@ def test_frozen_sdk_daytime_nap_samples_survive_worker_transport_and_persist(db:
 
 
 def test_provisional_sdk_payload_keeps_opaque_extensions_and_worker_validation_path(db: Session) -> None:
-    from app.services.sdk.wearable_history import sanitize_sdk_payload
-
     member, source = frozen_source(db)
     source.freeze_at = datetime.now(UTC) + timedelta(days=1)
     db.flush()

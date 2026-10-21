@@ -1,15 +1,52 @@
 import importlib.util
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import text
+from sqlalchemy import insert, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
+from app.integrations.celery.tasks.finalize_stale_sleep_task import finalize_stale_sleeps
+from app.models import (
+    DataPointSeries,
+    DataPointSeriesArchive,
+    DataSource,
+    EventRecord,
+    HealthScore,
+    SleepDetails,
+    WorkoutDetails,
+)
+from app.models.wearable_history_source import WearableHistorySource
+from app.repositories.archival_repository import DataPointSeriesArchiveRepository
+from app.repositories.data_point_series_repository import DataPointSeriesRepository
+from app.repositories.event_record_detail_repository import EventRecordDetailRepository
+from app.repositories.event_record_repository import EventRecordRepository
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
+from app.repositories.wearable_history_repository import WearableHistoryRepository
+from app.schemas.enums import SeriesType, get_series_type_id
+from app.schemas.model_crud.activities import EventRecordDetailCreate, TimeSeriesSampleCreate
+from app.services import raw_payload_storage
+from app.services.providers.polar.strategy import PolarStrategy
+from app.services.scores.sleep_service import sleep_score_service
+from app.services.sdk.import_service import import_service
+from app.services.sdk.wearable_history import sanitize_sdk_payload
 from app.utils.wearable_history_clock import BERLIN, candidate_start, freeze_at, recorded_night_date
+from app.utils.wearable_history_ingress import PreStartDataRejectedError, WearableHistoryMetadataUnavailableError
+from tests.factories import (
+    DataPointSeriesFactory,
+    DataSourceFactory,
+    EventRecordFactory,
+    SleepDetailsFactory,
+    UserFactory,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -111,9 +148,6 @@ def test_night_acceptance_reuses_adapter_rule(
 
 
 def test_ac3_ac4_ac11_source_store_promotes_only_earlier_and_survives_reconnect(db: Session) -> None:
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import UserFactory
-
     member = UserFactory()
     repository = WearableHistoryRepository()
     connected = datetime(2026, 10, 13, 10, tzinfo=UTC)
@@ -131,9 +165,6 @@ def test_ac3_ac4_ac11_source_store_promotes_only_earlier_and_survives_reconnect(
 
 
 def test_ac10_exact_freeze_stops_evidence_and_ac12_sources_and_members_are_independent(db: Session) -> None:
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import UserFactory
-
     member, other = UserFactory(), UserFactory()
     repository = WearableHistoryRepository()
     connected = datetime(2026, 10, 13, 10, tzinfo=UTC)
@@ -148,12 +179,6 @@ def test_ac10_exact_freeze_stops_evidence_and_ac12_sources_and_members_are_indep
 
 
 def test_ac19_member_erasure_cascades_source_store(db: Session) -> None:
-    from sqlalchemy import select
-
-    from app.models.wearable_history_source import WearableHistorySource
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import UserFactory
-
     member = UserFactory()
     email = member.email
     source = WearableHistoryRepository().begin_source(db, member.id, "apple", datetime.now(UTC))
@@ -177,9 +202,6 @@ def test_ac19_member_erasure_cascades_source_store(db: Session) -> None:
 
 
 def test_ac13_andrei_fixture_starts_polar_on_13_october(db: Session) -> None:
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import UserFactory
-
     member = UserFactory()
     repository = WearableHistoryRepository()
     connected = datetime(2026, 10, 13, 8, tzinfo=UTC)  # 10:00 Berlin on the account's first day
@@ -196,9 +218,6 @@ def test_ac13_andrei_fixture_starts_polar_on_13_october(db: Session) -> None:
 
 
 def test_arriving_sleep_updates_source_before_provider_selection_and_is_retained(db: Session) -> None:
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import DataSourceFactory, EventRecordFactory, UserFactory
-
     member = UserFactory()
     repository = WearableHistoryRepository()
     source = repository.begin_source(db, member.id, "polar")
@@ -225,12 +244,6 @@ def test_arriving_sleep_updates_source_before_provider_selection_and_is_retained
 
 @pytest.mark.parametrize("path", ["orm", "bulk"])
 def test_night_evidence_preserves_p6_clock_rule_when_provider_nap_flag_disagrees(db: Session, path: str) -> None:
-    from app.models import SleepDetails
-    from app.repositories.event_record_detail_repository import EventRecordDetailRepository
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.schemas.model_crud.activities import EventRecordDetailCreate
-    from tests.factories import DataSourceFactory, EventRecordFactory, SleepDetailsFactory, UserFactory
-
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "polar")
     data_source = DataSourceFactory(user=member, provider="polar")
@@ -262,16 +275,6 @@ def test_night_evidence_preserves_p6_clock_rule_when_provider_nap_flag_disagrees
 def test_frozen_sdk_first_night_and_its_samples_import_in_one_batch_without_a_preexisting_event(
     db: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from unittest.mock import MagicMock
-
-    from sqlalchemy import select
-
-    from app.integrations.celery.tasks.finalize_stale_sleep_task import finalize_stale_sleeps
-    from app.models import DataPointSeries, DataSource, EventRecord
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.services.sdk.import_service import import_service
-    from tests.factories import UserFactory
-
     monkeypatch.setattr(finalize_stale_sleeps, "delay", MagicMock())
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple")
@@ -303,17 +306,6 @@ def test_frozen_sdk_first_night_and_its_samples_import_in_one_batch_without_a_pr
 
 
 def test_ac12_divergent_source_cutoffs_filter_ingress_and_reads_independently(db: Session) -> None:
-    from uuid import uuid4
-
-    from sqlalchemy import select
-
-    from app.models import DataPointSeries
-    from app.repositories.data_point_series_repository import DataPointSeriesRepository
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.schemas.enums import SeriesType, get_series_type_id
-    from app.schemas.model_crud.activities import TimeSeriesSampleCreate
-    from tests.factories import UserFactory
-
     member = UserFactory()
     history = WearableHistoryRepository()
     apple = history.begin_source(db, member.id, "apple")
@@ -360,15 +352,6 @@ def test_ac12_divergent_source_cutoffs_filter_ingress_and_reads_independently(db
 def test_frozen_polar_first_night_keeps_hr_and_score_atomic_and_retryable(
     db: Session, failure_phase: str | None
 ) -> None:
-    from unittest.mock import patch
-
-    from sqlalchemy import select
-
-    from app.models import DataPointSeries, DataSource, EventRecord, HealthScore
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.services.providers.polar.strategy import PolarStrategy
-    from tests.factories import UserFactory
-
     member = UserFactory()
     member_id = member.id
     source = WearableHistoryRepository().begin_source(db, member_id, "polar")
@@ -413,16 +396,12 @@ def test_frozen_polar_first_night_keeps_hr_and_score_atomic_and_retryable(
 
 @pytest.mark.parametrize("sink", ["raw-log", "raw-s3", "fit"])
 def test_frozen_raw_archive_denial_reaches_each_storage_sink(
-    db: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, sink: str
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    caplog: pytest.LogCaptureFixture,
+    sink: str,
 ) -> None:
-    from contextlib import contextmanager
-    from unittest.mock import MagicMock
-
-    import app.database
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.services import raw_payload_storage
-    from tests.factories import UserFactory
-
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple")
     source.freeze_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -433,7 +412,7 @@ def test_frozen_raw_archive_denial_reaches_each_storage_sink(
         yield db
 
     client = MagicMock()
-    monkeypatch.setattr(app.database, "SessionLocal", archive_session)
+    monkeypatch.setattr(raw_payload_storage, "SessionLocal", archive_session)
     monkeypatch.setattr(raw_payload_storage, "_storage_backend", "log" if sink == "raw-log" else "s3")
     monkeypatch.setattr(raw_payload_storage, "_s3_client", client)
     monkeypatch.setattr(raw_payload_storage, "_s3_bucket", "test-bucket")
@@ -448,13 +427,11 @@ def test_frozen_raw_archive_denial_reaches_each_storage_sink(
         )
     assert capsys.readouterr().out == ""
     client.put_object.assert_not_called()
+    # Denied by the frozen source, not by the fail-closed fallback for an unreadable source.
+    assert "source admission unavailable" not in caplog.text
 
 
 def test_ac7_frozen_orm_ingress_rejects_prestart_samples_and_preserves_weight(db: Session) -> None:
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.utils.wearable_history_ingress import PreStartDataRejectedError
-    from tests.factories import DataPointSeriesFactory, DataSourceFactory, UserFactory
-
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple")
     source.freeze_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -465,17 +442,6 @@ def test_ac7_frozen_orm_ingress_rejects_prestart_samples_and_preserves_weight(db
 
 
 def test_ac7_bulk_ingress_keeps_first_night_endpoints_and_weight_but_rejects_older_samples(db: Session) -> None:
-    from uuid import uuid4
-
-    from sqlalchemy import select
-
-    from app.models import DataPointSeries
-    from app.repositories.data_point_series_repository import DataPointSeriesRepository
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.schemas.enums import SeriesType
-    from app.schemas.model_crud.activities import TimeSeriesSampleCreate
-    from tests.factories import DataSourceFactory, EventRecordFactory, UserFactory
-
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple")
     data_source = DataSourceFactory(user=member, provider="apple")
@@ -510,10 +476,6 @@ def test_ac7_bulk_ingress_keeps_first_night_endpoints_and_weight_but_rejects_old
 
 
 def test_frozen_sdk_payload_is_sanitized_before_queue_and_keeps_first_night_samples(db: Session) -> None:
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.services.sdk.wearable_history import sanitize_sdk_payload
-    from tests.factories import UserFactory
-
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple")
     source.freeze_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -561,12 +523,6 @@ def test_frozen_sdk_payload_is_sanitized_before_queue_and_keeps_first_night_samp
 
 
 def test_first_calendar_day_sample_inside_an_older_night_is_rejected_by_night_date(db: Session) -> None:
-    from types import SimpleNamespace
-
-    from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import DataSourceFactory, EventRecordFactory, UserFactory
-
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple")
     data_source = DataSourceFactory(user=member, provider="apple")
@@ -588,9 +544,6 @@ def test_first_calendar_day_sample_inside_an_older_night_is_rejected_by_night_da
 def test_raw_archive_admission_skips_frozen_and_unattributed_payloads_without_affecting_other_member(
     db: Session,
 ) -> None:
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import UserFactory
-
     repository = WearableHistoryRepository()
     member, other = UserFactory(), UserFactory()
     source = repository.begin_source(db, member.id, "apple")
@@ -603,13 +556,6 @@ def test_raw_archive_admission_skips_frozen_and_unattributed_payloads_without_af
 
 
 def test_archival_does_not_create_a_mixed_prestart_aggregate_or_delete_its_contributors(db: Session) -> None:
-    from sqlalchemy import select
-
-    from app.models import DataPointSeries, DataPointSeriesArchive
-    from app.repositories.archival_repository import DataPointSeriesArchiveRepository
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import DataPointSeriesFactory, DataSourceFactory, UserFactory
-
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple")
     data_source = DataSourceFactory(user=member, provider="apple")
@@ -624,15 +570,6 @@ def test_archival_does_not_create_a_mixed_prestart_aggregate_or_delete_its_contr
 
 
 def test_frozen_database_constraint_catches_core_insert_bypassing_repository_and_orm(db: Session) -> None:
-    from uuid import uuid4
-
-    from sqlalchemy import insert
-    from sqlalchemy.exc import DBAPIError
-
-    from app.models import EventRecord
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import DataSourceFactory, UserFactory
-
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple", datetime.now(UTC) - timedelta(days=10))
     data_source = DataSourceFactory(user=member, provider="apple")
@@ -652,15 +589,6 @@ def test_frozen_database_constraint_catches_core_insert_bypassing_repository_and
 
 @pytest.mark.parametrize("kind", ["sample", "sleep_details", "workout_details", "provider_score"])
 def test_deferred_database_constraints_reject_prestart_core_writes_at_commit_boundary(db: Session, kind: str) -> None:
-    from uuid import uuid4
-
-    from sqlalchemy import insert
-    from sqlalchemy.exc import DBAPIError
-
-    from app.models import DataPointSeries, HealthScore, SleepDetails, WorkoutDetails
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import DataSourceFactory, EventRecordFactory, UserFactory
-
     member = UserFactory()
     data_source = DataSourceFactory(user=member, provider="apple")
     old = datetime.now(UTC) - timedelta(days=15)
@@ -696,14 +624,6 @@ def test_deferred_database_constraints_reject_prestart_core_writes_at_commit_bou
 
 
 def test_frozen_first_night_and_both_endpoint_samples_commit_together(db: Session) -> None:
-    from uuid import uuid4
-
-    from sqlalchemy import insert, select
-
-    from app.models import DataPointSeries, EventRecord
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import DataSourceFactory, UserFactory
-
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple", datetime.now(UTC) - timedelta(days=10))
     data_source = DataSourceFactory(user=member, provider="apple")
@@ -733,13 +653,6 @@ def test_frozen_first_night_and_both_endpoint_samples_commit_together(db: Sessio
 
 
 def test_provisional_baseline_reads_exclude_held_sources_and_keep_first_night_samples(db: Session) -> None:
-    from app.models import DataPointSeries, EventRecord
-    from app.repositories.data_point_series_repository import DataPointSeriesRepository
-    from app.repositories.event_record_repository import EventRecordRepository
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.schemas.enums import SeriesType, get_series_type_id
-    from tests.factories import DataPointSeriesFactory, DataSourceFactory, EventRecordFactory, UserFactory
-
     member = UserFactory()
     history = WearableHistoryRepository()
     source = history.begin_source(db, member.id, "apple")
@@ -770,14 +683,6 @@ def test_provisional_baseline_reads_exclude_held_sources_and_keep_first_night_sa
 
 
 def test_internal_score_without_a_source_is_not_mistaken_for_a_new_wearable_connection(db: Session) -> None:
-    from uuid import uuid4
-
-    from sqlalchemy import select
-
-    from app.models import HealthScore
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import UserFactory
-
     member = UserFactory()
     WearableHistoryRepository().begin_source(db, member.id, "apple", datetime.now(UTC) - timedelta(days=10))
     score = HealthScore(
@@ -795,10 +700,6 @@ def test_internal_score_without_a_source_is_not_mistaken_for_a_new_wearable_conn
 
 
 def test_provisional_sleep_score_does_not_score_a_held_record(db: Session) -> None:
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.services.scores.sleep_service import sleep_score_service
-    from tests.factories import DataSourceFactory, EventRecordFactory, SleepDetailsFactory, UserFactory
-
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple")
     data_source = DataSourceFactory(user=member, provider="apple")
@@ -813,10 +714,6 @@ def test_provisional_sleep_score_does_not_score_a_held_record(db: Session) -> No
 
 
 def test_held_sleep_records_do_not_consume_the_score_reader_limit(db: Session) -> None:
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.services.scores.sleep_service import sleep_score_service
-    from tests.factories import DataSourceFactory, EventRecordFactory, SleepDetailsFactory, UserFactory
-
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple")
     data_source = DataSourceFactory(user=member, provider="apple")
@@ -852,15 +749,6 @@ def test_held_sleep_records_do_not_consume_the_score_reader_limit(db: Session) -
     ],
 )
 def test_every_wearable_metric_rejects_frozen_prestart_bulk_ingress(db: Session, metric: str) -> None:
-    from uuid import uuid4
-
-    from app.models import DataPointSeries
-    from app.repositories.data_point_series_repository import DataPointSeriesRepository
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.schemas.enums import SeriesType
-    from app.schemas.model_crud.activities import TimeSeriesSampleCreate
-    from tests.factories import UserFactory
-
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple")
     source.freeze_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -880,9 +768,6 @@ def test_every_wearable_metric_rejects_frozen_prestart_bulk_ingress(db: Session,
 
 
 def test_locked_source_refreshes_previously_loaded_state_before_merging_evidence(db: Session) -> None:
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import UserFactory
-
     member = UserFactory()
     repo = WearableHistoryRepository()
     source = repo.begin_source(db, member.id, "apple")
@@ -900,11 +785,6 @@ def test_locked_source_refreshes_previously_loaded_state_before_merging_evidence
 
 
 def test_evidence_uses_database_clock_after_lock_even_if_ingress_cached_a_prefreeze_clock(db: Session) -> None:
-    from app.models import EventRecord
-    from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from tests.factories import DataSourceFactory, UserFactory
-
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple")
     data_source = DataSourceFactory(user=member, provider="apple")
@@ -932,16 +812,6 @@ def test_evidence_uses_database_clock_after_lock_even_if_ingress_cached_a_prefre
 
 
 def test_missing_source_metadata_is_retried_while_weight_remains_exempt(db: Session) -> None:
-    from uuid import uuid4
-
-    from app.models import DataPointSeries
-    from app.repositories.data_point_series_repository import DataPointSeriesRepository
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.schemas.enums import SeriesType
-    from app.schemas.model_crud.activities import TimeSeriesSampleCreate
-    from app.utils.wearable_history_ingress import WearableHistoryMetadataUnavailableError
-    from tests.factories import UserFactory
-
     member = UserFactory()
     WearableHistoryRepository().begin_source(db, member.id, "apple")
     sample = TimeSeriesSampleCreate(

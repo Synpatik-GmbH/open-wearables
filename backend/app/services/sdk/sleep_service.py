@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from logging import getLogger
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 from app.config import settings
@@ -13,6 +14,7 @@ from app.constants.series_types.sdk import (
 from app.constants.sleep import SleepStageType
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -31,6 +33,7 @@ from app.services.sdk.sleep_stages import _calculate_final_metrics, normalized_s
 from app.utils.exceptions import SleepLockBusyError
 from app.utils.sleep_interval import interval_gap
 from app.utils.structured_logging import log_structured
+from app.utils.wearable_history_ingress import PreStartDataRejectedError
 
 logger = getLogger(__name__)
 
@@ -274,11 +277,6 @@ def handle_sleep_data(
 
         # Persist the accumulated state to Redis only once after processing the entire batch
         if current_state:
-            from types import SimpleNamespace
-
-            from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
-            from app.utils.wearable_history_ingress import PreStartDataRejectedError
-
             gate = WearableHistoryIngressRepository(db_session)
             normalized_start, normalized_end = normalized_sleep_window(
                 current_state.stages, current_state.start_time, current_state.end_time
@@ -313,7 +311,8 @@ def handle_sleep_data(
             lock.release()
 
     # import not at module level in order to avoid circular import
-    from app.integrations.celery.tasks.finalize_stale_sleep_task import finalize_stale_sleeps
+    # Import cycle: finalize_stale_sleep_task imports this module at load.
+    from app.integrations.celery.tasks.finalize_stale_sleep_task import finalize_stale_sleeps  # noqa: PLC0415
 
     # Dispatch the stale-sleep task so sessions that have gone quiet (including
     # other users' sessions) are finalised promptly without waiting for the next beat.
