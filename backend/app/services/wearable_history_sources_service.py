@@ -1,3 +1,4 @@
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -11,9 +12,9 @@ class WearableHistorySourcesService:
     def __init__(self) -> None:
         self.repository = WearableHistoryRepository()
 
-    def begin_source(self, db: Session, user_id: UUID, provider: str) -> None:
+    def begin_source(self, db: Session, user_id: UUID, provider: str, connected_at: datetime | None = None) -> None:
         user_service.get(db, user_id, raise_404=True)
-        self.repository.begin_source(db, user_id, provider)
+        self.repository.begin_source(db, user_id, provider, connected_at)
 
     def list_sources(self, db: Session, user_id: UUID) -> list[WearableHistorySourceRead]:
         user_service.get(db, user_id, raise_404=True)

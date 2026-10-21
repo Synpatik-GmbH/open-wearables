@@ -694,6 +694,13 @@ class EventRecordRepository(
             .outerjoin(SleepDetails, SleepDetails.record_id == EventRecord.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_event(
+                    EventRecord.data_source_id,
+                    EventRecord.category,
+                    EventRecord.start_datetime,
+                    EventRecord.end_datetime,
+                    EventRecord.zone_offset,
+                ),
                 EventRecord.category == "sleep",
                 EventRecord.end_datetime >= start_date - timedelta(days=1),
                 local_sleep_date >= cast(start_date, Date),
@@ -737,6 +744,11 @@ class EventRecordRepository(
             .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
             .where(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    DataPointSeries.data_source_id,
+                    DataPointSeries.series_type_definition_id,
+                    DataPointSeries.recorded_at,
+                ),
                 DataPointSeries.series_type_definition_id.in_([hr_id, sdnn_id, rmssd_id, resp_id, spo2_id]),
                 DataPointSeries.recorded_at >= subquery.c.min_start_time,
                 DataPointSeries.recorded_at < subquery.c.max_end_time,
@@ -888,6 +900,13 @@ class EventRecordRepository(
             .outerjoin(SleepDetails, SleepDetails.record_id == EventRecord.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_event(
+                    EventRecord.data_source_id,
+                    EventRecord.category,
+                    EventRecord.start_datetime,
+                    EventRecord.end_datetime,
+                    EventRecord.zone_offset,
+                ),
                 EventRecord.category == "sleep",
                 EventRecord.end_datetime >= start_date - timedelta(days=1),
                 local_sleep_date >= cast(start_date, Date),
@@ -948,6 +967,13 @@ class EventRecordRepository(
             .outerjoin(WorkoutDetails, self.model.id == WorkoutDetails.record_id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_event(
+                    self.model.data_source_id,
+                    self.model.category,
+                    self.model.start_datetime,
+                    self.model.end_datetime,
+                    self.model.zone_offset,
+                ),
                 self.model.category == "workout",
                 self.model.end_datetime >= start_date - timedelta(days=1),
                 local_workout_date >= cast(start_date, Date),

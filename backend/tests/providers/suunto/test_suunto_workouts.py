@@ -347,7 +347,7 @@ class TestSuuntoWorkouts:
         assert result["workoutKey"] == workout_key
 
     @patch.object(SuuntoWorkouts, "_make_api_request")
-    @patch("app.services.event_record_service.event_record_service.create")
+    @patch("app.services.event_record_service.event_record_service.create_if_admitted")
     @patch("app.services.event_record_service.event_record_service.create_detail")
     @patch("app.repositories.data_source_repository.DataSourceRepository.ensure_data_source")
     def test_load_data_creates_records(
@@ -377,7 +377,7 @@ class TestSuuntoWorkouts:
         # Verify data source creation was attempted
         mock_ensure_data_source.assert_called_once()
 
-    @patch("app.services.event_record_service.event_record_service.create")
+    @patch("app.services.event_record_service.event_record_service.create_if_admitted")
     @patch("app.services.event_record_service.event_record_service.create_detail")
     @patch("app.repositories.data_source_repository.DataSourceRepository.ensure_data_source")
     def test_process_push_activity_creates_record_and_detail(

@@ -5,7 +5,7 @@ import uuid
 from datetime import date, datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, Date, Subquery, case, cast, func, text
+from sqlalchemy import ColumnElement, Date, Subquery, case, cast, func, select, text, tuple_
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
@@ -13,7 +13,6 @@ from app.models import DataPointSeries, DataPointSeriesArchive, DataSource
 from app.models.archival_setting import ArchivalSetting
 from app.models.series_type_definition import SeriesTypeDefinition
 from app.repositories.repositories import timeline_key_column, utc_bucket_start
-from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.enums import (
     AGGREGATION_METHOD_BY_TYPE,
     AggregationMethod,
@@ -24,7 +23,6 @@ from app.schemas.enums import (
     get_series_type_from_id,
     get_series_type_id,
 )
-from app.utils.wearable_history_ingress import PreStartDataRejectedError
 
 # ---------------------------------------------------------------------------
 # Archival Settings repository
@@ -166,32 +164,40 @@ class DataPointSeriesArchiveRepository:
             if elapsed >= MAX_SECONDS_PER_RUN:
                 break
 
-            # Step 1: Find data_source_ids with archivable data (batch by source)
-            source_ids = (
-                db.query(DataPointSeries.data_source_id)
+            # Compact whole UTC buckets only. A mixed bucket stays raw until S12 removes
+            # its held contributors, preserving the first night's admitted evening samples.
+            ready_buckets = (
+                db.query(
+                    DataPointSeries.data_source_id.label("source_id"),
+                    DataPointSeries.series_type_definition_id.label("type_id"),
+                    cast(DataPointSeries.recorded_at, Date).label("day"),
+                )
                 .filter(cast(DataPointSeries.recorded_at, Date) < cutoff_date)
-                .distinct()
-                .limit(10)
-                .all()
+                .group_by(
+                    DataPointSeries.data_source_id,
+                    DataPointSeries.series_type_definition_id,
+                    cast(DataPointSeries.recorded_at, Date),
+                )
+                .having(
+                    func.bool_and(
+                        func.wh_archive_ready(
+                            DataPointSeries.data_source_id,
+                            DataPointSeries.series_type_definition_id,
+                            DataPointSeries.recorded_at,
+                        )
+                    )
+                )
+                .subquery()
             )
-
+            source_ids = db.query(ready_buckets.c.source_id).distinct().limit(10).all()
             if not source_ids:
                 break
-
             source_id_list = [s[0] for s in source_ids]
-
-            gate = WearableHistoryIngressRepository(db)
-            contributors = (
-                db.query(DataPointSeries)
-                .filter(
-                    DataPointSeries.data_source_id.in_(source_id_list),
-                    cast(DataPointSeries.recorded_at, Date) < cutoff_date,
-                )
-                .yield_per(1000)
-            )
-            for sample in contributors:
-                if not gate.sample_admitted(sample):
-                    raise PreStartDataRejectedError("Archive contains a frozen pre-start contributor")
+            ready_bucket = tuple_(
+                DataPointSeries.data_source_id,
+                DataPointSeries.series_type_definition_id,
+                cast(DataPointSeries.recorded_at, Date),
+            ).in_(select(ready_buckets))
 
             # Step 2: Group by (source, type, date) and compute all aggregates
             # We'll post-process to select the correct one per type
@@ -216,6 +222,7 @@ class DataPointSeriesArchiveRepository:
                 )
                 .filter(
                     DataPointSeries.data_source_id.in_(source_id_list),
+                    ready_bucket,
                     cast(DataPointSeries.recorded_at, Date) < cutoff_date,
                 )
                 .group_by(
@@ -284,6 +291,7 @@ class DataPointSeriesArchiveRepository:
                 db.query(DataPointSeries)
                 .filter(
                     DataPointSeries.data_source_id.in_(source_id_list),
+                    ready_bucket,
                     cast(DataPointSeries.recorded_at, Date) < cutoff_date,
                 )
                 .delete(synchronize_session=False)
@@ -430,7 +438,16 @@ class DataPointSeriesArchiveRepository:
                 func.max(DataPointSeriesArchive.sample_count).label("sample_count"),
             )
             .join(DataSource, DataPointSeriesArchive.data_source_id == DataSource.id)
-            .filter(DataSource.user_id == user_id, *range_filters)
+            .filter(
+                DataSource.user_id == user_id,
+                func.wh_read_archive(
+                    DataPointSeriesArchive.data_source_id,
+                    DataPointSeriesArchive.series_type_definition_id,
+                    DataPointSeriesArchive.bucket_start_at,
+                    DataPointSeriesArchive.history_start_date,
+                ),
+                *range_filters,
+            )
             .group_by(
                 DataPointSeriesArchive.data_source_id,
                 DataPointSeriesArchive.series_type_definition_id,
@@ -534,6 +551,12 @@ class DataPointSeriesArchiveRepository:
             .join(DataSource, DataPointSeriesArchive.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_archive(
+                    DataPointSeriesArchive.data_source_id,
+                    DataPointSeriesArchive.series_type_definition_id,
+                    DataPointSeriesArchive.bucket_start_at,
+                    DataPointSeriesArchive.history_start_date,
+                ),
                 DataPointSeriesArchive.bucket_start_at >= start_ts,
                 DataPointSeriesArchive.bucket_start_at < end_ts,
                 DataPointSeriesArchive.series_type_definition_id.in_(series_type_ids),

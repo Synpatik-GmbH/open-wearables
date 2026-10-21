@@ -103,7 +103,10 @@ def oauth_callback(
 
     assert strategy.oauth
     oauth_state = strategy.oauth.handle_callback(db, code, state)
-    wearable_history_sources_service.begin_source(db, oauth_state.user_id, provider_name.value)
+    connection = user_connection_service.get_connection(db, oauth_state.user_id, provider_name.value)
+    if connection is None:
+        raise HTTPException(status_code=503, detail="Wearable connection unavailable; retry")
+    wearable_history_sources_service.begin_source(db, oauth_state.user_id, provider_name.value, connection.created_at)
 
     # Stamp last_synced_at=now so the first periodic sync uses the connection
     # timestamp as its live-sync cursor and won't attempt to pull all history.

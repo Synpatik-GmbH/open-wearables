@@ -161,10 +161,10 @@ class TestSensorBio247SaveSleepData:
             "sensorbio_sleep_id": "sleep-abc",
         }
         with patch("app.services.providers.sensorbio.data_247.event_record_service") as mock_svc:
-            mock_svc.create.return_value = MagicMock(id=normalized["id"])
+            mock_svc.create_if_admitted.return_value = MagicMock(id=normalized["id"])
             result = data_247.save_sleep_data(db, USER_ID, normalized)
         assert result is True
-        mock_svc.create.assert_called_once()
+        mock_svc.create_if_admitted.assert_called_once()
         mock_svc.create_detail.assert_called_once()
 
 

@@ -149,7 +149,9 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
             if workout.score_state != "SCORED" and workout.score is None:
                 return 0
             record, detail, health_score = self._normalize_workout(workout, user_id)
-            created = event_record_service.create(db, record)
+            created = event_record_service.create_if_admitted(db, record)
+            if created is None:
+                return 0
             detail_for_record = detail.model_copy(update={"record_id": created.id})
             event_record_service.create_detail(db, detail_for_record)
             if health_score:
@@ -441,7 +443,9 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         for raw_workout in all_workouts:
             if raw_workout.score_state == "SCORED" or raw_workout.score is not None:
                 record, details, strain_score = self._normalize_workout(raw_workout, user_id)
-                created_record = event_record_service.create(db, record)
+                created_record = event_record_service.create_if_admitted(db, record)
+                if created_record is None:
+                    continue
                 detail_for_record = details.model_copy(update={"record_id": created_record.id})
                 event_record_service.create_detail(db, detail_for_record)
                 count += 1

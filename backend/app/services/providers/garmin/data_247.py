@@ -1084,7 +1084,9 @@ class Garmin247Data(Base247DataTemplate):
 
         record, detail = result
         try:
-            created_record = event_record_service.create(db, record)
+            created_record = event_record_service.create_if_admitted(db, record)
+            if created_record is None:
+                return 0
             detail.record_id = created_record.id
             event_record_service.create_detail(db, detail, detail_type="workout")
             return 1
@@ -1738,8 +1740,7 @@ class Garmin247Data(Base247DataTemplate):
             return 0
 
         try:
-            event_record_service.create(db, record)
-            return 1
+            return int(event_record_service.create_if_admitted(db, record) is not None)
         except Exception as e:
             self.logger.debug(f"Move IQ record may already exist: {e}")
             return 0

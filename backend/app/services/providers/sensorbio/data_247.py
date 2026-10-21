@@ -245,7 +245,9 @@ class SensorBio247Data(Base247DataTemplate):
         )
 
         try:
-            created_record = event_record_service.create(db, record)
+            created_record = event_record_service.create_if_admitted(db, record)
+            if created_record is None:
+                return False
             detail.record_id = created_record.id
             event_record_service.create_detail(db, detail, detail_type="sleep")
             return True

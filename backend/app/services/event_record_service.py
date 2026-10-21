@@ -29,6 +29,7 @@ from app.repositories import (
     HealthScoreRepository,
 )
 from app.repositories.user_repository import UserRepository
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.enums import HealthScoreCategory
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -98,6 +99,12 @@ class EventRecordService(
         if user and user.personal_record:
             return user.personal_record.birth_date
         return None
+
+    def create_if_admitted(self, db_session: DbSession, creator: EventRecordCreate) -> EventRecord | None:
+        """Provider loops skip permanent rejections while metadata/write failures remain retryable."""
+        return WearableHistoryIngressRepository(db_session).persist_event(
+            creator, lambda: self.create(db_session, creator)
+        )
 
     def _workout_hr_zone_fields(
         self,

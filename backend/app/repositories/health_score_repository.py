@@ -2,7 +2,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_, asc, desc, tuple_
+from sqlalchemy import String, and_, asc, desc, func, tuple_
+from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
@@ -70,7 +71,17 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         """Return the most recent health score for a given category and user."""
         return (
             db_session.query(HealthScore)
-            .filter(HealthScore.user_id == user_id, HealthScore.category == category)
+            .filter(
+                func.wh_read_score(
+                    HealthScore.user_id,
+                    HealthScore.data_source_id,
+                    sql_cast(HealthScore.provider, String),
+                    HealthScore.event_record_id,
+                    HealthScore.recorded_at,
+                ),
+                HealthScore.user_id == user_id,
+                HealthScore.category == category,
+            )
             .order_by(desc(HealthScore.recorded_at))
             .first()
         )
@@ -124,6 +135,13 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
             db_session.query(HealthScore, DataSource)
             .outerjoin(DataSource, HealthScore.data_source_id == DataSource.id)
             .filter(
+                func.wh_read_score(
+                    HealthScore.user_id,
+                    HealthScore.data_source_id,
+                    sql_cast(HealthScore.provider, String),
+                    HealthScore.event_record_id,
+                    HealthScore.recorded_at,
+                ),
                 HealthScore.user_id == user_id,
                 HealthScore.category == HealthScoreCategory.RECOVERY,
                 HealthScore.recorded_at >= start_date,
@@ -174,7 +192,16 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         """
         return (
             db_session.query(HealthScore)
-            .filter(HealthScore.user_id == user_id)
+            .filter(
+                func.wh_read_score(
+                    HealthScore.user_id,
+                    HealthScore.data_source_id,
+                    sql_cast(HealthScore.provider, String),
+                    HealthScore.event_record_id,
+                    HealthScore.recorded_at,
+                ),
+                HealthScore.user_id == user_id,
+            )
             .distinct(HealthScore.category)
             .order_by(HealthScore.category, desc(HealthScore.recorded_at))
             .all()

@@ -85,6 +85,9 @@ def engine(_postgres_url: str) -> Any:
     migration_spec.loader.exec_module(migration)
     with test_engine.begin() as connection, Operations.context(MigrationContext.configure(connection)):
         Operations(MigrationContext.configure(connection)).drop_table("wearable_history_sources")
+        Operations(MigrationContext.configure(connection)).drop_column(
+            "data_point_series_archive", "history_start_date"
+        )
         migration.upgrade()
 
     # Seed series type definitions (these need to exist for foreign key constraints)
@@ -104,8 +107,15 @@ def engine(_postgres_url: str) -> Any:
         )
         session.commit()
 
-    yield test_engine
-    BaseDbModel.metadata.drop_all(bind=test_engine)
+    try:
+        yield test_engine
+    finally:
+        # Operational functions/triggers survive metadata.drop_all. Remove them while
+        # their tables still exist so a second TEST_DATABASE_URL invocation can start.
+        with test_engine.begin() as connection, Operations.context(MigrationContext.configure(connection)):
+            migration.downgrade()
+        BaseDbModel.metadata.drop_all(bind=test_engine)
+        test_engine.dispose()
 
 
 @pytest.fixture(scope="session")

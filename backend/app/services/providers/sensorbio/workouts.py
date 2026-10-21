@@ -243,7 +243,9 @@ class SensorBioWorkouts(BaseWorkoutsTemplate):
         all_workouts = self.get_workouts(db, user_id, start_dt, end_dt)
         count = 0
         for record, details in self._build_bundles(all_workouts, user_id):
-            created_record = event_record_service.create(db, record)
+            created_record = event_record_service.create_if_admitted(db, record)
+            if created_record is None:
+                continue
             detail_for_record = details.model_copy(update={"record_id": created_record.id})
             event_record_service.create_detail(db, detail_for_record)
             count += 1

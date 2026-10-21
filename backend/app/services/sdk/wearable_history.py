@@ -1,6 +1,6 @@
 from logging import getLogger
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import sentry_sdk
@@ -10,10 +10,20 @@ from app.config import settings
 from app.constants.series_types.sdk import get_apple_sleep_phase, get_series_type_from_metric_type
 from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.providers.mobile_sdk import SLEEP_START_STATES
+from app.services.sdk.sleep_stages import ordered_sleep_stages
 from app.utils.sleep_interval import interval_gap
 from app.utils.structured_logging import log_structured
 
+if TYPE_CHECKING:
+    from sentry_sdk._types import Event, Hint
+
 logger = getLogger(__name__)
+
+
+def _without_sdk_request(event: "Event", _hint: "Hint") -> "Event":
+    # FastAPI attaches the original unsanitized body before scope-local processors run.
+    event.pop("request", None)
+    return event
 
 
 def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None) -> dict:
@@ -33,6 +43,7 @@ def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None
         # Report their locations/count here; an already-cleaned worker delivery is quiet.
         errors = [{key: item[key] for key in ("collection", "index", "loc", "type")} for item in dropped[:20]]
         with sentry_sdk.push_scope() as scope:
+            scope.add_event_processor(_without_sdk_request)
             scope.set_level("warning")
             scope.set_context(
                 "dropped_records", {"provider": provider, "dropped_count": len(dropped), "errors": errors}
@@ -58,7 +69,7 @@ def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None
                 zone_offset=state.zone_offset,
             )
         )
-    stages = sorted(request.data.sleep, key=lambda s: s.startDate)
+    stages = ordered_sleep_stages(request.data.sleep)
     for item in stages:
         phase = get_apple_sleep_phase(item.stage)
         if phase is None or item.endDate <= item.startDate:
@@ -75,6 +86,8 @@ def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None
         if near is not None:
             near.start_datetime = min(near.start_datetime, item.startDate)
             near.end_datetime = max(near.end_datetime, item.endDate)
+            if item.zoneOffset and not near.zone_offset:
+                near.zone_offset = item.zoneOffset
         elif phase in SLEEP_START_STATES:
             intervals.append(
                 SimpleNamespace(
@@ -112,14 +125,18 @@ def sanitize_sdk_payload(db: Session, member: UUID, raw: dict, state: Any = None
         workout.samples = workout.route = workout.segments = workout.laps = workout.metadata = None
     for sleep in request.data.sleep:
         sleep.values = sleep.metadata = None
-    kept = []
+    candidates = []
     for item in request.data.records:
         metric = get_series_type_from_metric_type(item.type or "")
         if metric is None:
             continue
         sample = SimpleNamespace(user_id=member, provider=provider, series_type=metric, recorded_at=item.startDate)
+        candidates.append((item, sample))
+    gate.prime_samples([sample for _, sample in candidates])
+    kept = []
+    for item, sample in candidates:
         if gate.sample_admitted(sample, intervals):
-            if getattr(metric, "value", metric) != "weight":
+            if getattr(sample.series_type, "value", sample.series_type) != "weight":
                 item.metadata = None
             kept.append(item)
     request.data.records = kept

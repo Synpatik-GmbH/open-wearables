@@ -27,6 +27,10 @@ def installed_history_migration(db: Session) -> None:
         INSERT INTO event_record(id,data_source_id,category,source_name,start_datetime,end_datetime) VALUES
         ('11111111-1111-1111-1111-111111111113','11111111-1111-1111-1111-111111111112','sleep','legacy',
          '2026-09-01 20:00+00','2026-09-02 04:00+00');
+        INSERT INTO data_point_series_archive(id,data_source_id,series_type_definition_id,bucket_start_at,
+            aggregation_type,value,sample_count) SELECT
+            '11111111-1111-1111-1111-111111111114','11111111-1111-1111-1111-111111111112',id,
+            '2026-09-01 00:00+00','avg',70,1 FROM series_type_definition WHERE code='heart_rate';
         """)
     )
     context = MigrationContext.configure(db.connection())
@@ -47,6 +51,14 @@ def test_migration_keeps_previous_member_and_does_not_backfill_a_source(db: Sess
         db.scalar(text("SELECT source_name FROM event_record WHERE id='11111111-1111-1111-1111-111111111113'"))
         == "legacy"
     )
+    row = db.execute(
+        text(
+            "SELECT value,history_start_date FROM data_point_series_archive "
+            "WHERE id='11111111-1111-1111-1111-111111111114'"
+        )
+    ).one()
+    assert float(row.value) == 70
+    assert row.history_start_date is None
 
 
 CONNECTION = date(2026, 10, 13)
@@ -321,8 +333,10 @@ def test_ac12_divergent_source_cutoffs_filter_ingress_and_reads_independently(db
     ) == [(instant, 60.0)]
 
 
-@pytest.mark.parametrize("fail_first", [False, True])
-def test_frozen_polar_first_night_keeps_hr_and_score_atomic_and_retryable(db: Session, fail_first: bool) -> None:
+@pytest.mark.parametrize("failure_phase", [None, "series", "score"])
+def test_frozen_polar_first_night_keeps_hr_and_score_atomic_and_retryable(
+    db: Session, failure_phase: str | None
+) -> None:
     from unittest.mock import patch
 
     from sqlalchemy import select
@@ -348,15 +362,20 @@ def test_frozen_polar_first_night_keeps_hr_and_score_atomic_and_retryable(db: Se
         "heart_rate_samples": {"20:00": 60, "04:00": 58},
     }
     service = PolarStrategy().data_247
-    if fail_first:
+    if failure_phase:
         with (
-            patch.object(service, "_save_timeseries", side_effect=RuntimeError("sample write unavailable")),
-            pytest.raises(RuntimeError, match="sample write unavailable"),
+            patch.object(
+                service,
+                "_save_timeseries" if failure_phase == "series" else "_save_scores",
+                side_effect=RuntimeError("contributor write unavailable"),
+            ),
+            pytest.raises(RuntimeError, match="contributor write unavailable"),
         ):
             service._save_sleep_items(db, member_id, [raw])
         db.rollback()
         assert not list(db.scalars(select(EventRecord).join(DataSource).where(DataSource.user_id == member_id)))
         assert not list(db.scalars(select(HealthScore).where(HealthScore.user_id == member_id)))
+        assert not list(db.scalars(select(DataPointSeries).join(DataSource).where(DataSource.user_id == member_id)))
     assert service._save_sleep_items(db, member_id, [raw]) == 1
     db.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
     sleeps = list(db.scalars(select(EventRecord).join(DataSource).where(DataSource.user_id == member_id)))
@@ -461,6 +480,7 @@ def test_ac7_bulk_ingress_keeps_first_night_endpoints_and_weight_but_rejects_old
     ]
     counts = DataPointSeriesRepository(DataPointSeries).bulk_create(db, creators)
     db.flush()
+    db.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
     stored = set(db.scalars(select(DataPointSeries.id).where(DataPointSeries.id.in_([c.id for c in creators]))))
     assert stored == {creators[0].id, creators[1].id, creators[3].id}
     assert counts.inserted == 3
@@ -565,7 +585,6 @@ def test_archival_does_not_create_a_mixed_prestart_aggregate_or_delete_its_contr
     from app.models import DataPointSeries, DataPointSeriesArchive
     from app.repositories.archival_repository import DataPointSeriesArchiveRepository
     from app.repositories.wearable_history_repository import WearableHistoryRepository
-    from app.utils.wearable_history_ingress import PreStartDataRejectedError
     from tests.factories import DataPointSeriesFactory, DataSourceFactory, UserFactory
 
     member = UserFactory()
@@ -574,8 +593,7 @@ def test_archival_does_not_create_a_mixed_prestart_aggregate_or_delete_its_contr
     sample = DataPointSeriesFactory(data_source=data_source, recorded_at=datetime.now(UTC) - timedelta(days=5))
     source.freeze_at = datetime.now(UTC) - timedelta(seconds=1)
     db.flush()
-    with pytest.raises(PreStartDataRejectedError):
-        DataPointSeriesArchiveRepository().archive_data_before(db, date.today())
+    assert DataPointSeriesArchiveRepository().archive_data_before(db, date.today()) == 0
     assert db.get(DataPointSeries, sample.id) is not None
     assert not list(
         db.scalars(select(DataPointSeriesArchive).where(DataPointSeriesArchive.data_source_id == data_source.id))

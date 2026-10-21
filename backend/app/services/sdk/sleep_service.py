@@ -28,6 +28,7 @@ from app.schemas.providers.mobile_sdk import (
 )
 from app.services.event_record_service import event_record_service
 from app.services.sdk.device_resolution import extract_device_info
+from app.services.sdk.sleep_stages import ordered_sleep_stages
 from app.utils.exceptions import SleepLockBusyError
 from app.utils.sleep_interval import interval_gap
 from app.utils.structured_logging import log_structured
@@ -243,24 +244,7 @@ def handle_sleep_data(
         current_state = load_sleep_state(user_id)
         provider = request.provider
 
-        # Deduplicate and sort
-        seen = set()
-        unique_data = []
-
-        # Sort first by startDate to ensure chronological processing
-        sorted_raw = sorted(request.data.sleep, key=lambda x: x.startDate)
-
-        for item in sorted_raw:
-            # Create a unique key for deduplication
-            # SourceInfo is not hashable, use JSON dump
-            source_key = item.source.model_dump_json() if item.source else None
-            key_tuple = (item.startDate, item.endDate, item.stage, source_key)
-
-            if key_tuple not in seen:
-                seen.add(key_tuple)
-                unique_data.append(item)
-
-        for sjson in unique_data:
+        for sjson in ordered_sleep_stages(request.data.sleep):
             # Extract device info
             device_model, software_version, original_source_name = extract_device_info(sjson.source)
 

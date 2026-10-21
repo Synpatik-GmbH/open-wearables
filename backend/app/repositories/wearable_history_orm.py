@@ -13,6 +13,7 @@ def enforce_wearable_history(session: Session, _context: Any, _instances: Any) -
     events = [record for record in observations if isinstance(record, EventRecord)]
     gate = WearableHistoryIngressRepository(session)
     gate.observe_events(events, flush=False)
+    gate.prime_samples([sample for sample in observations if isinstance(sample, DataPointSeries)])
     for observation in observations:
         if isinstance(observation, EventRecord):
             admitted = gate.event_admitted(observation)

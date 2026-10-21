@@ -1095,6 +1095,9 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
                 self.model.recorded_at >= start_date - timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
@@ -1182,6 +1185,9 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
                 self.model.recorded_at >= start_date - timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
@@ -1285,6 +1291,9 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
                 self.model.recorded_at >= start_date - timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
@@ -1394,6 +1403,9 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
                 self.model.recorded_at < before_date,
                 self.model.series_type_definition_id.in_(type_ids),
             )
@@ -1425,7 +1437,12 @@ class DataPointSeriesRepository(
                 (self.model.series_type_definition_id == latest_subq.c.series_type_definition_id)
                 & (self.model.recorded_at == latest_subq.c.max_recorded_at),
             )
-            .filter(DataSource.user_id == user_id)
+            .filter(
+                DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
+            )
             # DISTINCT ON (PostgreSQL) ensures exactly one result per series type
             # Order by priorities (lower number = higher priority), then id desc as tiebreaker
             .distinct(self.model.series_type_definition_id)
@@ -1481,6 +1498,9 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
                 self.model.recorded_at >= start_date,
                 self.model.recorded_at < end_date,
                 self.model.series_type_definition_id.in_(type_ids),
@@ -1544,6 +1564,9 @@ class DataPointSeriesRepository(
             )
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
                 self.model.series_type_definition_id == type_id,
                 self.model.recorded_at >= window_start,
                 self.model.recorded_at <= window_end,

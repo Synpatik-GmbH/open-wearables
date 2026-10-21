@@ -1,8 +1,10 @@
+from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import DataSource, EventRecord, SeriesTypeDefinition, UserConnection
@@ -11,25 +13,62 @@ from app.schemas.enums import ProviderName
 from app.utils.wearable_history_clock import BERLIN, night_placement, recorded_night_date
 from app.utils.wearable_history_ingress import (
     FirstNightAssociationUnavailableError,
+    PreStartDataRejectedError,
     WearableHistoryMetadataUnavailableError,
+)
+
+_NIGHT_PHYSIOLOGY = frozenset(
+    (
+        "heart_rate",
+        "heart_rate_variability_sdnn",
+        "heart_rate_variability_rmssd",
+        "skin_temperature",
+        "body_temperature",
+        "resting_heart_rate",
+        "respiratory_rate",
+        "oxygen_saturation",
+    )
 )
 
 
 class WearableHistoryIngressRepository:
     """One source lock and current cutoff for each ingestion operation."""
 
+    def persist_event(self, record: Any, write: Callable[[], EventRecord]) -> EventRecord | None:
+        """Skip a permanently rejected item; preserve the caller's commit/flush boundary."""
+        if not self.filter_events([record]):
+            return None
+        try:
+            return write()
+        except Exception as exc:
+            # Decorated repositories wrap SQL errors in HTTPException; inspect its cause.
+            if not isinstance(exc, (PreStartDataRejectedError, IntegrityError)) and not isinstance(
+                exc.__cause__, IntegrityError
+            ):
+                raise
+            self.db.rollback()
+            if not WearableHistoryIngressRepository(self.db).filter_events([record]):
+                return None
+            raise
+
     def __init__(self, db: Session) -> None:
         self.db = db
         self.history = WearableHistoryRepository()
         self.sources: dict[tuple[UUID, str], Any] = {}
+        self.data_sources: dict[UUID, DataSource] = {}
+        self.series_codes: dict[int, str | None] = {}
+        self.sleep_ranges: dict[tuple[UUID, str], tuple[datetime, datetime, list[EventRecord]]] = {}
         self.now: datetime | None = None
 
     def identity(self, observation: Any) -> tuple[UUID, str] | None:
         source_id = getattr(observation, "data_source_id", None)
         if source_id:
-            source = self.db.get(DataSource, source_id)
+            source = self.data_sources.get(source_id)
+            if source is None:
+                source = self.db.get(DataSource, source_id)
             if source is None:
                 raise WearableHistoryMetadataUnavailableError("Data source is unavailable")
+            self.data_sources[source_id] = source
             member = getattr(observation, "user_id", source.user_id)
             if member != source.user_id:
                 raise WearableHistoryMetadataUnavailableError("Data source does not belong to member")
@@ -98,12 +137,59 @@ class WearableHistoryIngressRepository:
             return True
         return self.admits_date(self.identity(record), self.event_date(record))
 
-    def sample_admitted(self, sample: Any, intervals: list[Any] | None = None) -> bool:
+    def series_code(self, sample: Any) -> str | None:
         series = getattr(sample, "series_type", None)
         if series is None:
-            definition = self.db.get(SeriesTypeDefinition, sample.series_type_definition_id)
-            series = definition.code if definition else None
-        if getattr(series, "value", series) == "weight":
+            definition_id = sample.series_type_definition_id
+            if definition_id not in self.series_codes:
+                definition = self.db.get(SeriesTypeDefinition, definition_id)
+                self.series_codes[definition_id] = definition.code if definition else None
+            return self.series_codes[definition_id]
+        return getattr(series, "value", series)
+
+    def _sleep_intervals(self, identity: tuple[UUID, str], start: datetime, end: datetime) -> list[EventRecord]:
+        cached = self.sleep_ranges.get(identity)
+        if cached is not None:
+            if cached[0] <= start and end <= cached[1]:
+                return cached[2]
+            start, end = min(start, cached[0]), max(end, cached[1])
+        sleeps = list(
+            self.db.scalars(
+                select(EventRecord)
+                .join(DataSource)
+                .where(
+                    DataSource.user_id == identity[0],
+                    DataSource.provider == identity[1],
+                    EventRecord.category == "sleep",
+                    EventRecord.start_datetime <= end,
+                    EventRecord.end_datetime >= start,
+                )
+            )
+        )
+        self.sleep_ranges[identity] = (start, end, sleeps)
+        return sleeps
+
+    def prime_samples(self, samples: list[Any]) -> None:
+        """Fetch containing intervals once per frozen source and batch, before per-sample admission."""
+        ranges: dict[tuple[UUID, str], tuple[datetime, datetime]] = {}
+        for sample in samples:
+            if self.series_code(sample) not in _NIGHT_PHYSIOLOGY:
+                continue
+            identity = self.identity(sample)
+            if identity is None:
+                continue
+            source = self.source(identity)
+            if source is None or self.now < source.freeze_at:
+                continue
+            instant = sample.recorded_at
+            lower, upper = ranges.get(identity, (instant, instant))
+            ranges[identity] = (min(lower, instant), max(upper, instant))
+        for identity, (start, end) in ranges.items():
+            self._sleep_intervals(identity, start, end)
+
+    def sample_admitted(self, sample: Any, intervals: list[Any] | None = None) -> bool:
+        series = self.series_code(sample)
+        if series == "weight":
             return True
         identity = self.identity(sample)
         if identity is None:
@@ -113,29 +199,8 @@ class WearableHistoryIngressRepository:
             return True
         instant = sample.recorded_at
         calendar = instant.astimezone(BERLIN).date()
-        if getattr(series, "value", series) in (
-            "heart_rate",
-            "heart_rate_variability_sdnn",
-            "heart_rate_variability_rmssd",
-            "skin_temperature",
-            "resting_heart_rate",
-            "respiratory_rate",
-            "oxygen_saturation",
-        ):
-            sleeps = list(
-                self.db.scalars(
-                    select(EventRecord)
-                    .join(DataSource)
-                    .where(
-                        DataSource.user_id == identity[0],
-                        DataSource.provider == identity[1],
-                        EventRecord.category == "sleep",
-                        EventRecord.start_datetime <= instant,
-                        EventRecord.end_datetime >= instant,
-                    )
-                )
-            )
-            sleeps.extend(intervals or [])
+        if series in _NIGHT_PHYSIOLOGY:
+            sleeps = [*self._sleep_intervals(identity, instant, instant), *(intervals or [])]
             matching = [
                 r for r in sleeps if r.start_datetime <= instant <= r.end_datetime and self.identity(r) == identity
             ]
@@ -172,4 +237,5 @@ class WearableHistoryIngressRepository:
         return [record for record in records if self.event_admitted(record)]
 
     def filter_samples(self, samples: list[Any]) -> list[Any]:
+        self.prime_samples(samples)
         return [sample for sample in samples if self.sample_admitted(sample)]

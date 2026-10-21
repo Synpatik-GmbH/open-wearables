@@ -9,6 +9,7 @@ import isodate
 from app.constants.workout_types.polar import get_unified_workout_type
 from app.database import DbSession
 from app.models import DataSource, EventRecord, PolarWorkoutTrueTime
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -220,7 +221,11 @@ class PolarWorkouts(BaseWorkoutsTemplate):
             # as stored to every later pull and never be completed or announced. A worker killed
             # anywhere before the commit leaves nothing, so the next pull stores the exercise whole.
             try:
-                created = self.workout_repo.create_and_flush(db, record)
+                created = WearableHistoryIngressRepository(db).persist_event(
+                    record, lambda: self.workout_repo.create_and_flush(db, record)
+                )
+                if created is None:
+                    continue
                 if created.id != record.id:
                     # Another record already holds this (data source, start, end): not ours to touch.
                     db.rollback()
