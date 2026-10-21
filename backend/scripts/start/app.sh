@@ -56,6 +56,13 @@ echo 'Reducing stored sync errors to codes...'
 uv run python scripts/data_migrations/reduce_sync_run_errors_to_codes.py \
     || echo "Warning: reducing stored sync errors failed — will retry on next startup."
 
+# FORK (2.96.8, spec v1.1 AC9): stores the Polar heart rate of the one account
+# POLAR_HR_RETIME_USER_ID names again at its true instants, once. The variable is set on dev
+# only; unset, the step prints not_configured and does nothing. Remove with the variable.
+echo 'Re-storing Polar heart rate at its true instants (dev account only)...'
+uv run python scripts/data_migrations/retime_polar_continuous_hr.py \
+    || echo "Warning: Polar heart-rate retime failed or stopped — will retry on next startup."
+
 # Initialize archival settings
 echo 'Initializing archival settings...'
 uv run python scripts/init/seed_archival_settings.py
