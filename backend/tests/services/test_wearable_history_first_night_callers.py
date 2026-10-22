@@ -112,11 +112,17 @@ def test_garmin_first_night_score_uses_the_actual_inserted_or_deduplicated_paren
     assert {s.event_record_id for s in scores} == {r.id for r in records}
 
 
-@pytest.mark.parametrize("combined", [False, True])
+@pytest.mark.parametrize("night_stored", [False, True])
 @pytest.mark.parametrize("scored", [False, True])
-def test_garmin_unresolved_sample_is_dropped_without_a_task_retry_and_kept_after_its_night(
-    db: Session, combined: bool, scored: bool
+def test_garmin_first_night_sample_is_kept_only_inside_its_stored_night_and_never_retried(
+    db: Session, night_stored: bool, scored: bool
 ) -> None:
+    """One re-delivery after the freeze carries the first night's sleep and its evening epoch.
+
+    After the freeze the first night is normally already stored (it is at least 7 days old),
+    so the epoch is kept. If it is not, Garmin handles epochs before sleeps, so the epoch is
+    dropped (the accepted cost, FORK-DELTA 22 Oct) and the delivery still never retries.
+    """
     member = connected(db, "garmin")
     service = Garmin247Data("garmin", "https://provider.test", MagicMock())
     handler = GarminWebhookHandler(MagicMock(), service)
@@ -136,8 +142,10 @@ def test_garmin_unresolved_sample_is_dropped_without_a_task_retry_and_kept_after
     probe = service._build_epochs_samples(member.id, service.normalize_epochs(payload["epochs"], member.id))
     assert len(probe) == 1
     assert WearableHistoryIngressRepository(db).sample_admitted(probe[0]) is False
-    if combined:
-        payload["sleeps"] = [sleep]
+    payload["sleeps"] = [sleep]
+    if night_stored:
+        assert service.process_items_batch(db, member.id, "sleeps", [sleep]) == 1
+        db.commit()
 
     @contextmanager
     def session() -> Iterator[Session]:
@@ -159,20 +167,14 @@ def test_garmin_unresolved_sample_is_dropped_without_a_task_retry_and_kept_after
             process_webhook_push, "retry", side_effect=WearableHistoryMetadataUnavailableError("task retry")
         ) as retry,
     ):
-        # A pre-start sample with no stored night is dropped; the delivery never retries.
-        process_webhook_push.run("garmin", payload, "first-night-test")
-        source_ids = select(DataSource.id).where(DataSource.user_id == member.id)
-        if not combined:
-            assert list(db.scalars(select(DataPointSeries).where(DataPointSeries.data_source_id.in_(source_ids)))) == []
-            assert service.process_items_batch(db, member.id, "sleeps", [sleep]) == 1
-        # Once its own night is stored, the same sample is kept.
-        process_webhook_push.run("garmin", payload, "first-night-redelivery")
+        process_webhook_push.run("garmin", payload, "first-night-delivery")
         assert retry.call_count == 0
     db.commit()
+    source_ids = select(DataSource.id).where(DataSource.user_id == member.id)
     assert [
         row[0]
         for row in db.execute(select(DataPointSeries.value).where(DataPointSeries.data_source_id.in_(source_ids)))
-    ] == [61]
+    ] == ([61] if night_stored else [])
 
 
 @pytest.mark.parametrize("field", ["member", "provider", "writer", "device", "category", "start", "end"])
