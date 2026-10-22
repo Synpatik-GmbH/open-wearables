@@ -54,7 +54,7 @@ Amends, where they differ: 2.97.1 U8 (history at connect), U22 and AC 26 (day wi
 
 - History from before the provisional start date is held only to work out the date.
 - Every reading, baseline, warm-up count, card and prompt uses only data on or after the source's current provisional date. When the date moves, readings follow it.
-- The first night counts whole, with its in-sleep samples, under the night rule (R2).
+- The first night counts whole, with its in-sleep samples, under the night rule (R2, with its exception for a first night that reaches Open Wearables after the freeze).
 
 ### 3.3 At and after the freeze (S12, S5)
 
