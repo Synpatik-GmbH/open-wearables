@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import event as sa_event
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -330,6 +331,8 @@ def test_a_rolled_back_item_leaves_no_after_commit_callback(db: Session, outcome
         if outcome == "failed":
             raise IntegrityError("INSERT INTO sleep_details", {}, Exception("null value in column"))
 
+    # An item committed earlier in the same transaction: its webhook must survive the failure.
+    sa_event.listen(db, "after_commit", lambda _session: fired.append("earlier"), once=True)
     gate = WearableHistoryIngressRepository(db)
     if outcome == "rejected_after_write":
         with patch.object(gate, "filter_events", side_effect=lambda records: records):
@@ -340,4 +343,18 @@ def test_a_rolled_back_item_leaves_no_after_commit_callback(db: Session, outcome
     else:
         gate.persist_event(record, write)
     db.commit()  # A provider that carries on after the item still commits.
-    assert fired == (["webhook"] if outcome == "admitted" else [])
+    assert fired == (["earlier", "webhook"] if outcome == "admitted" else ["earlier"])
+
+
+def test_a_rolled_back_transaction_leaves_no_after_commit_callback(db: Session) -> None:
+    """A provider that rolls back and carries on (or a failed final commit) must not announce
+    the rolled-back rows on its next commit; the callbacks of the next work still fire."""
+
+    fired: list[str] = []
+    db.execute(text("SELECT 1"))
+    sa_event.listen(db, "after_commit", lambda _session: fired.append("rolled back"), once=True)
+    db.rollback()
+    db.execute(text("SELECT 1"))
+    sa_event.listen(db, "after_commit", lambda _session: fired.append("next item"), once=True)
+    db.commit()
+    assert fired == ["next item"]
