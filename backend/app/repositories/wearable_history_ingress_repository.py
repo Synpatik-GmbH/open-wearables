@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from typing import Any
 from uuid import UUID
 
@@ -10,9 +10,8 @@ from sqlalchemy.orm import Session
 from app.models import DataSource, EventRecord, SeriesTypeDefinition, UserConnection
 from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.schemas.enums import ProviderName
-from app.utils.wearable_history_clock import BERLIN, night_placement, recorded_night_date
+from app.utils.wearable_history_clock import BERLIN, recorded_night_date
 from app.utils.wearable_history_ingress import (
-    FirstNightAssociationUnavailableError,
     PreStartDataRejectedError,
     WearableHistoryMetadataUnavailableError,
 )
@@ -242,12 +241,9 @@ class WearableHistoryIngressRepository:
                 return True
             if nights:
                 return False
-            if (
-                not nights
-                and calendar == source.start_date - timedelta(days=1)
-                and night_placement(instant, getattr(sample, "zone_offset", None)) == (True, source.start_date)
-            ):
-                raise FirstNightAssociationUnavailableError("First-night sleep interval has not arrived; retry")
+            # A sample from the evening before the start date that no stored sleep contains is
+            # pre-start: rejected, never retried. A retry could wait forever (nothing will ever
+            # contain it), and an SDK upload answered 503 stops the member's whole sync.
         return calendar >= source.start_date
 
     def score_admitted(self, score: Any) -> bool:

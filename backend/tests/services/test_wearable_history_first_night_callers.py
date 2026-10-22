@@ -115,7 +115,7 @@ def test_garmin_first_night_score_uses_the_actual_inserted_or_deduplicated_paren
 
 @pytest.mark.parametrize("combined", [False, True])
 @pytest.mark.parametrize("scored", [False, True])
-def test_garmin_unresolved_sample_retries_the_actual_task_and_recovers_after_its_night(
+def test_garmin_unresolved_sample_is_dropped_without_a_task_retry_and_kept_after_its_night(
     db: Session, combined: bool, scored: bool
 ) -> None:
     member = connected(db, "garmin")
@@ -136,8 +136,7 @@ def test_garmin_unresolved_sample_retries_the_actual_task_and_recovers_after_its
     }
     probe = service._build_epochs_samples(member.id, service.normalize_epochs(payload["epochs"], member.id))
     assert len(probe) == 1
-    with pytest.raises(FirstNightAssociationUnavailableError):
-        WearableHistoryIngressRepository(db).sample_admitted(probe[0])
+    assert WearableHistoryIngressRepository(db).sample_admitted(probe[0]) is False
     if combined:
         payload["sleeps"] = [sleep]
 
@@ -161,17 +160,15 @@ def test_garmin_unresolved_sample_retries_the_actual_task_and_recovers_after_its
             process_webhook_push, "retry", side_effect=FirstNightAssociationUnavailableError("task retry")
         ) as retry,
     ):
-        with pytest.raises(FirstNightAssociationUnavailableError, match="task retry"):
-            process_webhook_push.run("garmin", payload, "first-night-test")
-        assert retry.call_count == 1
-        assert isinstance(retry.call_args.kwargs["exc"], FirstNightAssociationUnavailableError)
+        # A pre-start sample with no stored night is dropped; the delivery never retries.
+        process_webhook_push.run("garmin", payload, "first-night-test")
         source_ids = select(DataSource.id).where(DataSource.user_id == member.id)
-        assert list(db.scalars(select(DataPointSeries).where(DataPointSeries.data_source_id.in_(source_ids)))) == []
         if not combined:
+            assert list(db.scalars(select(DataPointSeries).where(DataPointSeries.data_source_id.in_(source_ids)))) == []
             assert service.process_items_batch(db, member.id, "sleeps", [sleep]) == 1
-        result = process_webhook_push.run("garmin", payload, "first-night-redelivery")
-        assert result["wellness"]["epochs"]["saved"] == 1
-        assert retry.call_count == 1
+        # Once its own night is stored, the same sample is kept.
+        process_webhook_push.run("garmin", payload, "first-night-redelivery")
+        assert retry.call_count == 0
     db.commit()
     assert [
         row[0]
@@ -280,7 +277,7 @@ def test_oura_failed_sleep_never_writes_orphaned_companions(db: Session) -> None
     assert list(db.scalars(select(DataPointSeries).where(DataPointSeries.data_source_id.in_(source_ids)))) == []
 
 
-@pytest.mark.parametrize("failure", [FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError])
+@pytest.mark.parametrize("failure", [WearableHistoryMetadataUnavailableError])
 @pytest.mark.parametrize("failed_first", [False, True])
 def test_garmin_history_retry_preserves_other_members_of_the_same_provider_account(
     db: Session, failure: type[RuntimeError], failed_first: bool

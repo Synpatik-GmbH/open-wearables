@@ -201,10 +201,6 @@ def upgrade() -> None:
                     END IF;
                 END LOOP;
                 IF found_interval THEN RETURN admitted_interval; END IF;
-                IF calendar=boundary.start_date-1
-                    AND wh_night_day(instant,instant+interval '1 microsecond',sample_zone)=boundary.start_date THEN
-                    RAISE EXCEPTION 'First-night association unavailable' USING ERRCODE='23514';
-                END IF;
             END IF;
             RETURN calendar >= boundary.start_date;
         END $$;

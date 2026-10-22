@@ -1,4 +1,7 @@
-"""Source-local first-night samples retry until their own interval arrives."""
+"""After the freeze, a first-night sample is kept only inside its own source's stored night.
+
+Otherwise it is dropped, never retried.
+"""
 
 import json
 from datetime import UTC, datetime
@@ -7,7 +10,6 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
-from fastapi import HTTPException
 from sqlalchemy import insert, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -19,7 +21,6 @@ from app.repositories.wearable_history_ingress_repository import WearableHistory
 from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.schemas.enums import SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import TimeSeriesSampleCreate
-from app.utils.wearable_history_ingress import FirstNightAssociationUnavailableError
 from tests.factories import DataSourceFactory, EventRecordFactory, UserFactory
 from tests.services.test_wearable_history_review_closure import envelope
 
@@ -69,7 +70,7 @@ def own_night(db: Session, source: DataSource, offset: str) -> EventRecord:
 @pytest.mark.parametrize("metric", METRICS)
 @pytest.mark.parametrize("offset", ["+04:00", "+14:00"])
 @pytest.mark.parametrize("path", ["repository", "sql"])
-def test_first_night_sample_offset_requires_retry_then_own_proof(
+def test_first_night_sample_offset_is_rejected_until_its_own_night_is_stored(
     db: Session, metric: SeriesType, offset: str, path: str
 ) -> None:
     member, source = source_setup(db)
@@ -84,8 +85,7 @@ def test_first_night_sample_offset_requires_retry_then_own_proof(
         series_type=metric,
     )
     if path == "repository":
-        with pytest.raises(FirstNightAssociationUnavailableError):
-            WearableHistoryIngressRepository(db).sample_admitted(sample)
+        assert WearableHistoryIngressRepository(db).sample_admitted(sample) is False
     else:
 
         def insert_without_proof() -> None:
@@ -104,7 +104,7 @@ def test_first_night_sample_offset_requires_retry_then_own_proof(
 
         with pytest.raises(IntegrityError) as rejected:
             insert_without_proof()
-        assert rejected.value.orig.diag.message_primary == "First-night association unavailable"
+        assert rejected.value.orig.diag.message_primary == "Frozen source rejects pre-start data"
     assert db.get(DataPointSeries, sample.id) is None
     own_night(db, source, offset)
     db.commit()
@@ -126,7 +126,7 @@ def test_first_night_sample_offset_requires_retry_then_own_proof(
 @pytest.mark.parametrize("metric", SDK_METRICS)
 @pytest.mark.parametrize("offset", ["+04:00", "+14:00"])
 @pytest.mark.parametrize("offload", [False, True])
-def test_sdk_sample_offset_retries_before_transport_then_queues_after_proof(
+def test_sdk_sample_offset_is_dropped_before_transport_then_queued_after_proof(
     db: Session, metric: str, offset: str, offload: bool
 ) -> None:
     member, source = source_setup(db)
@@ -148,16 +148,15 @@ def test_sdk_sample_offset_retries_before_transport_then_queues_after_proof(
     with (
         patch.object(settings, "sdk_payload_s3_offload", offload),
         patch("app.api.routes.v1.sdk_sync.load_sleep_state", return_value=None),
-        patch("app.api.routes.v1.sdk_sync.store_raw_payload") as archive,
+        patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
         patch("app.api.routes.v1.sdk_sync.put_payload_to_s3", return_value="s3://test-bucket/payload") as s3,
         patch("app.api.routes.v1.sdk_sync.process_sdk_upload.delay") as queue,
     ):
-        with pytest.raises(HTTPException) as rejected:
-            sync_sdk_data(str(member.id), body, SimpleNamespace(auth_type="api_key"), db)
-        assert rejected.value.status_code == 503
-        archive.assert_not_called()
-        s3.assert_not_called()
-        queue.assert_not_called()
+        # Dropped, not retried: the upload succeeds without it, so the app's sync moves on.
+        response = sync_sdk_data(str(member.id), json.loads(json.dumps(body)), SimpleNamespace(auth_type="api_key"), db)
+        assert response.status_code == 202
+        payload = json.loads(s3.call_args.kwargs["payload"] if offload else queue.call_args.kwargs["content"])
+        assert payload["data"]["records"] == []
         own_night(db, source, offset)
         db.commit()
         response = sync_sdk_data(str(member.id), body, SimpleNamespace(auth_type="api_key"), db)
@@ -202,5 +201,4 @@ def test_source_local_first_night_proof_cannot_come_from_another_provider(db: Se
         recorded_at=INSTANT,
         zone_offset="+04:00",
     )
-    with pytest.raises(FirstNightAssociationUnavailableError):
-        WearableHistoryIngressRepository(db).sample_admitted(sample)
+    assert WearableHistoryIngressRepository(db).sample_admitted(sample) is False

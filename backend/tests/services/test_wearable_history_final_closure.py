@@ -462,13 +462,11 @@ def test_sdk_evening_wrapper_cannot_prove_an_evening_sample_for_a_morning_nap(
     with (
         patch.object(settings, "sdk_payload_s3_offload", offload),
         patch("app.api.routes.v1.sdk_sync.load_sleep_state", return_value=None),
-        patch("app.api.routes.v1.sdk_sync.store_raw_payload") as archive,
-        patch("app.api.routes.v1.sdk_sync.put_payload_to_s3") as s3,
+        patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
+        patch("app.api.routes.v1.sdk_sync.put_payload_to_s3", return_value="s3://test-bucket/payload") as s3,
         patch("app.api.routes.v1.sdk_sync.process_sdk_upload.delay") as queue,
     ):
-        with pytest.raises(HTTPException) as failure:
-            sync_sdk_data(str(member.id), raw, SimpleNamespace(auth_type="api_key"), db)
-        assert failure.value.status_code == 503
-    archive.assert_not_called()
-    s3.assert_not_called()
-    queue.assert_not_called()
+        # The evening sample is pre-start, so it is dropped (not retried) and the upload succeeds.
+        assert sync_sdk_data(str(member.id), raw, SimpleNamespace(auth_type="api_key"), db).status_code == 202
+    stored = json.loads(s3.call_args.kwargs["payload"] if offload else queue.call_args.kwargs["content"])
+    assert stored["data"]["records"] == []

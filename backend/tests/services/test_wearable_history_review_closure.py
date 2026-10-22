@@ -37,7 +37,6 @@ from app.services.sdk.import_service import import_service
 from app.services.sdk.sleep_service import _apply_transition, _create_new_sleep_state
 from app.services.sdk.wearable_history import sanitize_sdk_payload
 from app.services.timeseries_service import TimeSeriesService
-from app.utils.wearable_history_ingress import FirstNightAssociationUnavailableError
 from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectionFactory, UserFactory
 from tests.services.test_wearable_history_ingress_closure import frozen_source
 
@@ -454,7 +453,9 @@ def test_prefetch_range_expands_for_an_unprimed_persisted_first_night(db: Sessio
         "HKQuantityTypeIdentifierAppleSleepingWristTemperature",
     ],
 )
-def test_unresolved_first_night_sdk_retries_without_transport_then_keeps_whole_night(db: Session, metric: str) -> None:
+def test_unresolved_first_night_sdk_sample_is_dropped_then_kept_once_its_night_is_stored(
+    db: Session, metric: str
+) -> None:
     member, source = frozen_source(db)
     start = datetime.combine(source.start_date - timedelta(days=1), datetime.min.time(), UTC) + timedelta(hours=20)
     end = start + timedelta(hours=8)
@@ -473,18 +474,15 @@ def test_unresolved_first_night_sdk_retries_without_transport_then_keeps_whole_n
     )
     with (
         patch("app.api.routes.v1.sdk_sync.load_sleep_state", return_value=None),
-        patch("app.api.routes.v1.sdk_sync.store_raw_payload") as archive,
-        patch("app.api.routes.v1.sdk_sync.put_payload_to_s3") as s3,
+        patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
+        patch("app.api.routes.v1.sdk_sync.put_payload_to_s3"),
         patch("app.api.routes.v1.sdk_sync.process_sdk_upload.delay") as queue,
         patch.object(settings, "sdk_payload_s3_offload", False),
     ):
-        with pytest.raises(HTTPException) as error:
-            sync_sdk_data(str(member.id), raw, SimpleNamespace(auth_type="api_key"), db)
-        assert error.value.status_code == 503
-        assert isinstance(error.value.__cause__, FirstNightAssociationUnavailableError)
-        archive.assert_not_called()
-        s3.assert_not_called()
-        queue.assert_not_called()
+        # Dropped, not retried: the upload succeeds without it, so the app's sync moves on.
+        response = sync_sdk_data(str(member.id), json.loads(json.dumps(raw)), SimpleNamespace(auth_type="api_key"), db)
+        assert response.status_code == 202
+        assert json.loads(queue.call_args.kwargs["content"])["data"]["records"] == []
         ds = DataSourceFactory(user=member, provider="apple")
         EventRecordFactory(data_source=ds, category="sleep", start_datetime=start, end_datetime=end)
         response = sync_sdk_data(str(member.id), raw, SimpleNamespace(auth_type="api_key"), db)
@@ -513,7 +511,7 @@ def test_unresolved_first_night_sdk_retries_without_transport_then_keeps_whole_n
         "oxygen_saturation",
     ],
 )
-def test_every_physiology_family_requires_first_night_proof_and_keeps_inclusive_endpoints(
+def test_every_physiology_family_needs_its_stored_first_night_and_keeps_inclusive_endpoints(
     db: Session, metric: str
 ) -> None:
     member, source = frozen_source(db)
@@ -521,8 +519,7 @@ def test_every_physiology_family_requires_first_night_proof_and_keeps_inclusive_
     end = start + timedelta(hours=8)
     gate = WearableHistoryIngressRepository(db)
     sample = SimpleNamespace(user_id=member.id, provider="apple", series_type=metric, recorded_at=start)
-    with pytest.raises(FirstNightAssociationUnavailableError):
-        gate.sample_admitted(sample)
+    assert gate.sample_admitted(sample) is False
     ds = DataSourceFactory(user=member, provider="apple")
     EventRecordFactory(data_source=ds, category="sleep", start_datetime=start, end_datetime=end)
     creators = [

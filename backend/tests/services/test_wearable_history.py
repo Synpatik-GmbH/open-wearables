@@ -278,7 +278,10 @@ def test_frozen_sdk_first_night_and_its_samples_import_in_one_batch_without_a_pr
 ) -> None:
     monkeypatch.setattr(finalize_stale_sleeps, "delay", MagicMock())
     member = UserFactory()
-    source = WearableHistoryRepository().begin_source(db, member.id, "apple")
+    # Connected 10 days ago: the first night has ended, so the importer stores it before its
+    # samples (a night still in progress waits in Redis, which made this test clock-dependent).
+    connected = datetime.now(UTC) - timedelta(days=10)
+    source = WearableHistoryRepository().begin_source(db, member.id, "apple", connected)
     source.freeze_at = datetime.now(UTC) - timedelta(seconds=1)
     db.flush()
     start = datetime.combine(source.start_date - timedelta(days=1), datetime.min.time(), UTC) + timedelta(hours=20)

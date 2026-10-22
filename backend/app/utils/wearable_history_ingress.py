@@ -19,7 +19,6 @@ class FirstNightAssociationUnavailableError(RuntimeError):
 HISTORY_BOUNDARY_MESSAGES = frozenset(
     {
         "Wearable source history unavailable",
-        "First-night association unavailable",
         "Provisional wearable samples must remain raw",
         "Archive contains pre-start data",
         "Frozen source rejects pre-start data",
