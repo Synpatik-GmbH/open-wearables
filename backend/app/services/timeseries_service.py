@@ -6,8 +6,6 @@ from logging import Logger, getLogger
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import event as sa_event
-
 from app.database import DbSession
 from app.models import DataPointSeries, DataSource
 from app.repositories import DataPointSeriesRepository
@@ -37,6 +35,7 @@ from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.events import on_timeseries_batch_saved
 from app.services.priority_service import priority_service
 from app.services.services import AppService
+from app.utils.after_outer_commit import run_after_outer_commit
 from app.utils.exceptions import handle_exceptions
 from app.utils.pagination import encode_bucket_cursor, encode_cursor
 
@@ -151,14 +150,14 @@ class TimeSeriesService(
         else:
             samples_copy = list(samples)
 
-        # FORK: SQLAlchemy keeps a ``once`` listener attached to the session after it fires, so
-        # its closure lives as long as the session. The batch sits in a box the listener empties,
-        # or a pull that saves many batches in one session would hold every one until it ends.
+        # FORK: queued on the current transaction, not an ``after_commit`` listener: that also
+        # fired on a savepoint release and survived a rollback, announcing rolled-back samples
+        # (Codex P1 on #46). The batch sits in a box the callback empties, so a queue that is
+        # dropped does not keep it alive.
         pending = [samples_copy]
         del samples_copy
 
-        @sa_event.listens_for(db_session, "after_commit", once=True)
-        def _start_webhook_thread(session: DbSession) -> None:  # noqa: ARG001
+        def _start_webhook_thread() -> None:
             batch = pending.pop()
             if not svix_service.is_enabled():
                 return
@@ -171,6 +170,7 @@ class TimeSeriesService(
                 daemon=True,
             ).start()
 
+        run_after_outer_commit(db_session, _start_webhook_thread)
         return counts
 
     @staticmethod

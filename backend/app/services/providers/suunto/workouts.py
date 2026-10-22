@@ -292,7 +292,7 @@ class SuuntoWorkouts(BaseWorkoutsTemplate):
 
         Mirrors the load_data backfill path: builds the record + detail bundle
         and inserts both via event_record_service. create_detail schedules the
-        after_commit listener that fires the outgoing webhook (workout.created),
+        after-outer-commit callback that fires the outgoing webhook (workout.created),
         so consumers subscribed via Svix receive the new workout.
 
         Returns the created event_record id, or None when the bundle was empty.

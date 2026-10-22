@@ -7,7 +7,6 @@ from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import event as sa_event
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -23,6 +22,8 @@ from app.schemas.enums import SeriesType
 from app.schemas.model_crud.activities import EventRecordCreate, TimeSeriesSampleCreate
 from app.schemas.sync_status import DataTypeFailure
 from app.services.providers.oura.data_247 import Oura247Data
+from app.services.timeseries_service import timeseries_service
+from app.utils.after_outer_commit import run_after_outer_commit
 from app.utils.wearable_history_ingress import (
     PreStartDataRejectedError,
     WearableHistoryMetadataUnavailableError,
@@ -300,8 +301,8 @@ def frozen_garmin_record(db: Session) -> EventRecord:
 def test_a_rolled_back_item_leaves_no_after_commit_callback(db: Session, outcome: str) -> None:
     """Codex P1 on #46 at 37cb004c: webhooks registered by a rolled-back item fired on a later commit.
 
-    A savepoint rollback does not remove an after_commit listener, so the gate drops the
-    listeners an item registered whenever that item's savepoint rolls back.
+    Callbacks queued by a write run only after the outermost commit; a rolled-back savepoint
+    drops its own, and an earlier item's callback survives.
     """
 
     if outcome in ("admitted", "failed"):
@@ -324,7 +325,7 @@ def test_a_rolled_back_item_leaves_no_after_commit_callback(db: Session, outcome
     fired: list[str] = []
 
     def write() -> None:
-        sa_event.listen(db, "after_commit", lambda _session: fired.append("webhook"), once=True)
+        run_after_outer_commit(db, lambda: fired.append("webhook"))
         if outcome == "rejected_after_write":
             # The freeze crossed after the gate admitted the item: the deferred check rejects it.
             raise PreStartDataRejectedError("Frozen source rejects pre-start data")
@@ -332,7 +333,7 @@ def test_a_rolled_back_item_leaves_no_after_commit_callback(db: Session, outcome
             raise IntegrityError("INSERT INTO sleep_details", {}, Exception("null value in column"))
 
     # An item committed earlier in the same transaction: its webhook must survive the failure.
-    sa_event.listen(db, "after_commit", lambda _session: fired.append("earlier"), once=True)
+    run_after_outer_commit(db, lambda: fired.append("earlier"))
     gate = WearableHistoryIngressRepository(db)
     if outcome == "rejected_after_write":
         with patch.object(gate, "filter_events", side_effect=lambda records: records):
@@ -342,19 +343,57 @@ def test_a_rolled_back_item_leaves_no_after_commit_callback(db: Session, outcome
             gate.persist_event(record, write)
     else:
         gate.persist_event(record, write)
+    # The item's savepoint was released or rolled back: nothing is announced before the commit.
+    assert fired == []
     db.commit()  # A provider that carries on after the item still commits.
     assert fired == (["earlier", "webhook"] if outcome == "admitted" else ["earlier"])
 
 
-def test_a_rolled_back_transaction_leaves_no_after_commit_callback(db: Session) -> None:
+@pytest.mark.parametrize("released_savepoint", [False, True])
+def test_a_rolled_back_transaction_leaves_no_after_commit_callback(db: Session, released_savepoint: bool) -> None:
     """A provider that rolls back and carries on (or a failed final commit) must not announce
-    the rolled-back rows on its next commit; the callbacks of the next work still fire."""
+    the rolled-back rows, even when a savepoint was released before the rollback; the callbacks
+    of the next work still run."""
 
     fired: list[str] = []
     db.execute(text("SELECT 1"))
-    sa_event.listen(db, "after_commit", lambda _session: fired.append("rolled back"), once=True)
+    run_after_outer_commit(db, lambda: fired.append("rolled back"))
+    if released_savepoint:
+        with db.begin_nested():
+            run_after_outer_commit(db, lambda: fired.append("released, then rolled back"))
+        assert fired == []  # A savepoint release is not the outer commit.
     db.rollback()
     db.execute(text("SELECT 1"))
-    sa_event.listen(db, "after_commit", lambda _session: fired.append("next item"), once=True)
+    run_after_outer_commit(db, lambda: fired.append("next item"))
     db.commit()
     assert fired == ["next item"]
+
+
+@pytest.mark.parametrize("rolled_back", [False, True])
+def test_a_real_timeseries_write_in_a_rolled_back_savepoint_emits_no_webhook(db: Session, rolled_back: bool) -> None:
+    """The producer path itself (timeseries_service), not a hand-written listener."""
+
+    member, _, connection_day = provisional_source(db)
+    sample = TimeSeriesSampleCreate(
+        id=uuid4(),
+        user_id=member.id,
+        provider="garmin",
+        source="garmin",
+        recorded_at=datetime.combine(connection_day, datetime.min.time(), UTC) + timedelta(hours=12),
+        series_type=SeriesType.heart_rate,
+        value=61,
+    )
+    with (
+        patch("app.services.timeseries_service.svix_service.is_enabled", return_value=True),
+        patch.object(timeseries_service, "_emit_timeseries_webhooks") as emitted,
+    ):
+        try:
+            with db.begin_nested():
+                timeseries_service.bulk_create_samples(db, [sample], emit_inline=True)
+                if rolled_back:
+                    raise RuntimeError("item failed")
+        except RuntimeError:
+            pass
+        emitted.assert_not_called()  # Not on the savepoint release.
+        db.commit()
+    assert emitted.call_count == (0 if rolled_back else 1)

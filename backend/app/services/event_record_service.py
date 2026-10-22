@@ -4,7 +4,6 @@ from decimal import Decimal
 from logging import Logger, getLogger
 from uuid import UUID, uuid4
 
-from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Query
 
 from app.config import settings
@@ -62,6 +61,7 @@ from app.services.outgoing_webhooks.events import on_menstrual_cycle_created, on
 from app.services.priority_service import priority_service
 from app.services.scores.sleep_service import sleep_score_service
 from app.services.services import AppService
+from app.utils.after_outer_commit import run_after_outer_commit
 from app.utils.conversion import as_dict_list, as_float, as_model, minutes_to_seconds
 from app.utils.exceptions import handle_exceptions
 from app.utils.heart_rate import estimate_max_hr
@@ -872,11 +872,12 @@ class EventRecordService(
             # detail FK guarantees the EventRecord exists, and deferring to after_commit
             # avoids racing the task against uncommitted rows. No live zone compute needed
             # here (the task computes zones later from the settled HR trace).
-            @sa_event.listens_for(db_session, "after_commit", once=True)
-            def _schedule_workout_finalizers(session: DbSession) -> None:  # noqa: ARG001
+            def _schedule_workout_finalizers() -> None:
                 for record_id in record_ids:
                     self._schedule_workout_finalize(record_id)
 
+            # After the OUTERMOST commit only, never for a rolled-back savepoint (Codex P1 on #46).
+            run_after_outer_commit(db_session, _schedule_workout_finalizers)
             return
 
         records = db_session.query(EventRecord).filter(EventRecord.id.in_(record_ids)).all()
@@ -909,10 +910,12 @@ class EventRecordService(
         for data_source in data_sources:
             db_session.expunge(data_source)
 
-        @sa_event.listens_for(db_session, "after_commit", once=True)
-        def _dispatch_bulk_webhooks(session: DbSession) -> None:  # noqa: ARG001
+        def _dispatch_bulk_webhooks() -> None:
             for record, data_source, detail in dispatches:
                 self._emit_event_record_webhook(record, data_source, detail)
+
+        # After the OUTERMOST commit only, never for a rolled-back savepoint (Codex P1 on #46).
+        run_after_outer_commit(db_session, _dispatch_bulk_webhooks)
 
     @handle_exceptions
     def _get_records_with_filters(
