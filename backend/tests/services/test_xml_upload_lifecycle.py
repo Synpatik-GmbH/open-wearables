@@ -180,6 +180,9 @@ def test_processed_files_of_frozen_members_are_deleted_and_a_failure_stays(
     for key, state in [("imp", "imported"), ("fail", "failed"), ("pend", "pending_import"), ("broken", "imported")]:
         add(db, frozen, key, state)
     add(db, provisional, "later", "imported")
+    # Another provider's freeze is not the Apple source's: its member's files stay.
+    WearableHistoryRepository().begin_source(db, provisional, "polar", datetime(2026, 10, 1, 8, tzinfo=UTC))
+    db.commit()
     s3 = FakeS3(broken={"broken"})
 
     assert delete_processed_files(db, s3) == (2, 1)

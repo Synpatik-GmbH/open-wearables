@@ -3,7 +3,7 @@
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import text
@@ -93,6 +93,9 @@ def test_frozen_skipper_keeps_only_start_date_records_and_weight(db: Session) ->
 
 def test_provisional_source_skips_nothing(db: Session) -> None:
     user_id = frozen_member(db, frozen=False)
+    # Only the Apple source's freeze counts; another provider's frozen source does not.
+    WearableHistoryRepository().begin_source(db, UUID(user_id), "polar", datetime(2026, 10, 1, 8, tzinfo=UTC))
+    db.commit()
     skipper = PrestartSkipper.for_member(db, user_id)
     samples, workouts, request = chunk(user_id)
     assert skipper.samples(samples) == samples
