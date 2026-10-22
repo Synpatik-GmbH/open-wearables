@@ -155,7 +155,7 @@ From the Sol build plan relayed 21 Oct 2026 (adapter `ebcbf036`, Open Wearables 
 | S11 | Before the freeze | Readings, baselines, warm-up counts, cards and prompts use only data on or after the current provisional date; older history held only to work out the date | ratified 21 Oct 2026 |
 | S12 | At and after the freeze | Everything from the source dated before its start date deleted from both stores, temporary files included; later pre-start data not stored | ratified 21 Oct 2026 |
 | R1 | Window ending in a gap | Treated as S7: start date = connection day | ratified 21 Oct 2026 |
-| R2 | First night | Counts whole, with its in-sleep samples, by the night rule | ratified 21 Oct 2026 |
+| R2 | First night | Counts whole, with its in-sleep samples, by the night rule. Exception: if the first night reaches Open Wearables only after the freeze, its samples checked before it is stored and dated (Berlin day) before the start date are not kept (no retry; one reading could otherwise block a member's sync) | ratified 21 Oct 2026; exception 22 Oct 2026 (Dragan) |
 | R3 | Weight | Outside the cutoff, as today | ratified 21 Oct 2026 |
 | R4 | Export | Start dates in Part 2 (computed values) | ratified 21 Oct 2026 |
 | R5 | Nutrition | Records and rules unchanged; results may shift through wearable inputs | ratified 21 Oct 2026 |
