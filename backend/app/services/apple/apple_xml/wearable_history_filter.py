@@ -12,7 +12,6 @@ from datetime import date, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.repositories.wearable_history_repository import WearableHistoryRepository
@@ -45,12 +44,7 @@ class PrestartSkipper:
     def refresh(self, db: Session) -> None:
         if self.start_date is not None or self.user_id is None:
             return
-        source = WearableHistoryRepository().get(db, UUID(self.user_id), "apple")
-        if source is None:
-            return
-        now = db.scalar(select(func.clock_timestamp()))
-        if now is not None and now >= source.freeze_at:
-            self.start_date = source.start_date
+        self.start_date = WearableHistoryRepository().frozen_start_date(db, UUID(self.user_id), "apple")
 
     def _prestart(self, day: date) -> bool:
         if self.start_date is None or day >= self.start_date:

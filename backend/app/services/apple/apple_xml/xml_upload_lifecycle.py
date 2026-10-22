@@ -11,18 +11,17 @@ from logging import getLogger
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, literal, select, update
-from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import User, XmlUpload
-from app.models.wearable_history_source import WearableHistorySource
+from app.repositories.xml_upload_repository import XmlUploadRepository
 from app.utils.structured_logging import log_structured
 
 logger = getLogger(__name__)
 
 STALE_AFTER = timedelta(hours=24)
+
+uploads = XmlUploadRepository()
 
 
 def _member(user_id: str) -> UUID | None:
@@ -37,35 +36,19 @@ def record_completed_upload(db: Session, bucket: str, object_key: str, user_id: 
     member = _member(user_id)
     if member is None:
         return
-    db.execute(
-        insert(XmlUpload)
-        .from_select(
-            ["id", "user_id", "bucket", "object_key"],
-            select(func.gen_random_uuid(), User.id, literal(bucket), literal(object_key)).where(User.id == member),
-        )
-        .on_conflict_do_nothing(constraint="uq_xml_uploads_object")
-    )
+    uploads.record_completed(db, bucket, object_key, member)
     db.commit()
 
 
 def mark_import(db: Session, bucket: str, object_key: str, state: str) -> None:
     """Record an import's outcome on a row still waiting for it."""
-    db.execute(
-        update(XmlUpload)
-        .where(XmlUpload.bucket == bucket, XmlUpload.object_key == object_key, XmlUpload.state == "pending_import")
-        .values(state=state, updated_at=func.now())
-    )
+    uploads.mark_import(db, bucket, object_key, state)
     db.commit()
 
 
 def fail_stale_imports(db: Session) -> int:
     """A row still pending a day after it was written never got its import's outcome."""
-    rows = db.execute(
-        update(XmlUpload)
-        .where(XmlUpload.state == "pending_import", XmlUpload.created_at < func.now() - STALE_AFTER)
-        .values(state="failed", updated_at=func.now())
-        .returning(XmlUpload.user_id, XmlUpload.object_key)
-    ).all()
+    rows = uploads.fail_pending_older_than(db, STALE_AFTER)
     db.commit()
     for row in rows:
         log_structured(
@@ -81,17 +64,7 @@ def fail_stale_imports(db: Session) -> int:
 
 def delete_processed_files(db: Session, s3: Any) -> tuple[int, int]:
     """Delete the file of every processed upload whose member's Apple source is frozen."""
-    rows = db.execute(
-        select(XmlUpload.id, XmlUpload.user_id, XmlUpload.bucket, XmlUpload.object_key)
-        .join(
-            WearableHistorySource,
-            (WearableHistorySource.user_id == XmlUpload.user_id) & (WearableHistorySource.provider == "apple"),
-        )
-        .where(
-            XmlUpload.state.in_(("imported", "failed")),
-            WearableHistorySource.freeze_at <= func.clock_timestamp(),
-        )
-    ).all()
+    rows = uploads.processed_of_frozen_members(db)
     deleted = failed = 0
     for row in rows:
         try:
@@ -109,7 +82,7 @@ def delete_processed_files(db: Session, s3: Any) -> tuple[int, int]:
                 error=type(error).__name__,
             )
             continue
-        db.execute(update(XmlUpload).where(XmlUpload.id == row.id).values(state="deleted", updated_at=func.now()))
+        uploads.mark_deleted(db, row.id)
         db.commit()
         deleted += 1
     return deleted, failed
