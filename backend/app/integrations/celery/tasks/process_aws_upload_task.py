@@ -411,6 +411,6 @@ def _import_xml_data(db: Session, xml_source: str | Path | BinaryIO, user_id: st
             try:
                 handle_sleep_data(db, sync_request, user_id)
             except PreStartDataRejectedError:
-                if not skipper.rejected_sleep_batch(len(sync_request.data.sleep)):
+                if not skipper.rejected_sleep_batch(db, len(sync_request.data.sleep)):
                     raise
     return skipper.skipped

@@ -73,8 +73,10 @@ class PrestartSkipper:
         ]
         return sync_request.model_copy(update={"data": sync_request.data.model_copy(update={"sleep": kept})})
 
-    def rejected_sleep_batch(self, batch_size: int) -> bool:
-        """The sleep handler's own pre-start rejection, counted as skipped once frozen."""
+    def rejected_sleep_batch(self, db: Session, batch_size: int) -> bool:
+        """The sleep handler's own pre-start rejection, counted as skipped once frozen; the
+        freeze can pass inside the chunk, after its ``refresh``."""
+        self.refresh(db)
         if self.start_date is None:
             return False
         self.skipped += batch_size

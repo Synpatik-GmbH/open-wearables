@@ -99,10 +99,10 @@ class WearableHistoryPurgeService:
             try:
                 self.stamp_records_purged(db, source_id)
                 db.commit()
+                db.refresh(source)
             except Exception as error:
                 self._fail(db, member, provider, "records", error)
                 return "failed"
-            db.refresh(source)
 
         failed = False
         waiting = False
@@ -121,8 +121,12 @@ class WearableHistoryPurgeService:
             # Waiting is not a failure and records nothing (D-03).
             db.rollback()
             return "failed" if failed else "waiting"
-        self.repository.mark_completed(db, member, provider)
-        db.commit()
+        try:
+            self.repository.mark_completed(db, member, provider)
+            db.commit()
+        except Exception as error:
+            self._fail(db, member, provider, "complete", error)
+            return "failed"
         return "completed"
 
     def run(self, db: Session) -> PurgeRun:

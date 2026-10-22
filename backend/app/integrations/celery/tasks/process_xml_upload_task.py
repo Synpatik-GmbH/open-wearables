@@ -228,7 +228,7 @@ def _import_xml_data(db: Session, xml_path: str, user_id: str) -> XMLParseStats:
             try:
                 handle_sleep_data(db, sync_request, user_id)
             except PreStartDataRejectedError:
-                if not skipper.rejected_sleep_batch(len(sync_request.data.sleep)):
+                if not skipper.rejected_sleep_batch(db, len(sync_request.data.sleep)):
                     raise
 
     xml_service.stats.skipped_prestart = skipper.skipped

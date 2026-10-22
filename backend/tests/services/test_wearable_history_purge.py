@@ -356,3 +356,28 @@ def test_a_failed_stamp_leaves_the_records_purged_and_is_stamped_next_run(db: Se
     assert (source.records_purged_at, source.purge_last_error) == (None, "records: ConnectionError")
     assert service.run(db).completed == 1
     assert history(db, member.id, "apple").records_purged_at is not None
+
+
+def test_a_failed_completion_is_recorded_and_the_other_due_sources_still_run(db: Session) -> None:
+    """D-03: within a run, one failed source never stops the others, the last step included."""
+    member, *_ = seed(db)
+    freeze(db, member.id, "garmin")
+    db.commit()
+    service = WearableHistoryPurgeService()
+    real = service.repository.mark_completed
+    calls: list[str] = []
+
+    def complete(db_: Session, member_: UUID, provider: str) -> None:
+        calls.append(provider)
+        if len(calls) == 1:
+            raise ConnectionError("lost")
+        real(db_, member_, provider)
+
+    with patch.object(service.repository, "mark_completed", side_effect=complete):
+        run = service.run(db)
+
+    assert (run.due, run.completed, run.failed) == (2, 1, 1)
+    failed = history(db, member.id, calls[0])
+    assert (failed.purge_completed_at, failed.purge_last_error) == (None, "complete: ConnectionError")
+    assert failed.records_purged_at is not None
+    assert history(db, member.id, calls[1]).purge_completed_at is not None

@@ -21,7 +21,7 @@ logger = getLogger(__name__)
 
 STALE_AFTER = timedelta(hours=24)
 
-uploads = XmlUploadRepository()
+_repository = XmlUploadRepository()
 
 
 def _member(user_id: str) -> UUID | None:
@@ -36,19 +36,19 @@ def record_completed_upload(db: Session, bucket: str, object_key: str, user_id: 
     member = _member(user_id)
     if member is None:
         return
-    uploads.record_completed(db, bucket, object_key, member)
+    _repository.record_completed(db, bucket, object_key, member)
     db.commit()
 
 
 def mark_import(db: Session, bucket: str, object_key: str, state: str) -> None:
     """Record an import's outcome on a row still waiting for it."""
-    uploads.mark_import(db, bucket, object_key, state)
+    _repository.mark_import(db, bucket, object_key, state)
     db.commit()
 
 
 def fail_stale_imports(db: Session) -> int:
     """A row still pending a day after it was written never got its import's outcome."""
-    rows = uploads.fail_pending_older_than(db, STALE_AFTER)
+    rows = _repository.fail_pending_older_than(db, STALE_AFTER)
     db.commit()
     for row in rows:
         log_structured(
@@ -64,7 +64,7 @@ def fail_stale_imports(db: Session) -> int:
 
 def delete_processed_files(db: Session, s3: Any) -> tuple[int, int]:
     """Delete the file of every processed upload whose member's Apple source is frozen."""
-    rows = uploads.processed_of_frozen_members(db)
+    rows = _repository.processed_of_frozen_members(db)
     deleted = failed = 0
     for row in rows:
         try:
@@ -82,7 +82,7 @@ def delete_processed_files(db: Session, s3: Any) -> tuple[int, int]:
                 error=type(error).__name__,
             )
             continue
-        uploads.mark_deleted(db, row.id)
+        _repository.mark_deleted(db, row.id)
         db.commit()
         deleted += 1
     return deleted, failed

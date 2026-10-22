@@ -171,3 +171,22 @@ def test_an_import_crossing_the_freeze_switches_at_its_next_chunk(db: Session, p
             skipped = process_xml_upload_task._import_xml_data(db, "/tmp/unused.xml", user_id).skipped_prestart
     assert written == [4, 2]
     assert skipped == 4
+
+
+def test_a_sleep_rejection_after_a_freeze_inside_the_chunk_counts_as_skipped(db: Session) -> None:
+    """The chunk began provisional and the freeze passed before its sleep was written."""
+    user_id = frozen_member(db, frozen=False)
+    skipper = PrestartSkipper.for_member(db, user_id)
+    assert skipper.start_date is None
+    db.execute(
+        text("UPDATE wearable_history_sources SET freeze_at=:f, start_date=:s WHERE user_id=:m"),
+        {"f": datetime(2026, 10, 8, tzinfo=UTC), "s": START, "m": user_id},
+    )
+    assert skipper.rejected_sleep_batch(db, 2)
+    assert skipper.skipped == 2
+
+
+def test_a_sleep_rejection_while_still_provisional_is_raised(db: Session) -> None:
+    skipper = PrestartSkipper.for_member(db, frozen_member(db, frozen=False))
+    assert not skipper.rejected_sleep_batch(db, 2)
+    assert skipper.skipped == 0
