@@ -10,10 +10,12 @@ from app.database import DbSession
 from app.models import (
     DETAIL_MODELS,
     DetailType,
+    EventRecord,
     EventRecordDetail,
     WorkoutDetails,
 )
 from app.repositories.repositories import CrudRepository
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.model_crud.activities import (
     EventRecordDetailCreate,
     EventRecordDetailUpdate,
@@ -99,6 +101,12 @@ class EventRecordDetailRepository(
         detail_type: DetailType = "workout",
     ) -> None:
         """Bulk create detail records using batch insert."""
+        gate = WearableHistoryIngressRepository(db_session)
+        creators = [
+            creator
+            for creator in creators
+            if (parent := db_session.get(EventRecord, creator.record_id)) is None or gate.event_admitted(parent)
+        ]
         if not creators:
             return
 

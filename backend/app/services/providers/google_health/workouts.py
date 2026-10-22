@@ -159,7 +159,9 @@ class GoogleHealthApiWorkouts(BaseWorkoutsTemplate):
         for point in self.get_workouts(db, user_id, start, end):
             try:
                 record, detail = self._normalize_workout(point, user_id)
-                created = event_record_service.create(db, record)
+                created = event_record_service.create_if_admitted(db, record)
+                if created is None:
+                    continue
                 event_record_service.create_detail(db, detail.model_copy(update={"record_id": created.id}))
             except Exception as e:
                 log_and_capture_error(

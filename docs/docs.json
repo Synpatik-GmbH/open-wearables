@@ -212,6 +212,7 @@
             "group": "Connections",
             "pages": [
               "GET /api/v1/users/{user_id}/connections",
+              "GET /api/v1/users/{user_id}/wearable-history-sources",
               "DELETE /api/v1/users/{user_id}/connections/{provider}",
               "DELETE /api/v1/users/{user_id}/connections/{provider}/data"
             ]

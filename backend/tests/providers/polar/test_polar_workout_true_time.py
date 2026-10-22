@@ -219,6 +219,7 @@ class TestPolarWorkoutSavePath:
     ) -> None:
         user = UserFactory()
         UserConnectionFactory(user=user, provider="polar")
+        db.commit()  # The member/connection predate this worker attempt in production.
         mock_request.return_value = [_exercise("EX-DETAIL", _now_local_iso(1), 120)]
         workouts = PolarStrategy().workouts
 
@@ -244,6 +245,7 @@ class TestPolarWorkoutSavePath:
         # and be skipped for good, never carrying a detail or a workout.created.
         user = UserFactory()
         UserConnectionFactory(user=user, provider="polar")
+        db.commit()  # The member/connection predate this worker attempt in production.
         mock_request.return_value = [_exercise("EX-KILLED", _now_local_iso(1), 120)]
         workouts = PolarStrategy().workouts
 

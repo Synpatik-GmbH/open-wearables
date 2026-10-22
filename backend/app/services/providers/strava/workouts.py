@@ -410,7 +410,9 @@ class StravaWorkouts(BaseWorkoutsTemplate):
         count = 0
         for activity in parsed_activities:
             record, detail = self._normalize_workout(activity, user_id)
-            created_record = event_record_service.create(db, record)
+            created_record = event_record_service.create_if_admitted(db, record)
+            if created_record is None:
+                continue
             detail_for_record = detail.model_copy(update={"record_id": created_record.id})
             event_record_service.create_detail(db, detail_for_record)
             count += 1
@@ -437,7 +439,9 @@ class StravaWorkouts(BaseWorkoutsTemplate):
         created_ids: list[UUID] = []
 
         record, detail = self._normalize_workout(activity, user_id)
-        created_record = event_record_service.create(db, record)
+        created_record = event_record_service.create_if_admitted(db, record)
+        if created_record is None:
+            return []
         detail_for_record = detail.model_copy(update={"record_id": created_record.id})
         event_record_service.create_detail(db, detail_for_record)
         created_ids.append(created_record.id)

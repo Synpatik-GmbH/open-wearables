@@ -7,6 +7,7 @@ from uuid import UUID
 from app.database import DbSession
 from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -141,7 +142,9 @@ class BaseWorkoutsTemplate(ABC):
     ) -> None:
         """Internal method to save the workout to the database."""
         # TODO: Add logic to check if workout already exists to avoid duplicates
-        self.workout_repo.create(db, record)
+        WearableHistoryIngressRepository(db).persist_event(
+            record, lambda: self.workout_repo.create_and_flush(db, record), commit=True
+        )
         # Detail saving is handled by services in load_data implementations
 
     def _make_api_request(

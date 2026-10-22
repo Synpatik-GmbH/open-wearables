@@ -2,12 +2,14 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_, asc, desc, tuple_
+from sqlalchemy import String, and_, asc, desc, func, tuple_
+from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
 from app.models import DataSource, HealthScore
 from app.repositories.repositories import CrudRepository
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.enums import HealthScoreCategory
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
 from app.utils.pagination import decode_cursor
@@ -49,6 +51,8 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
 
     def bulk_create(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> None:
         """Bulk insert health scores, doing nothing on conflict with the unique constraint."""
+        gate = WearableHistoryIngressRepository(db_session)
+        creators = [creator for creator in creators if gate.score_admitted(creator)]
         if not creators:
             return
 
@@ -67,7 +71,17 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         """Return the most recent health score for a given category and user."""
         return (
             db_session.query(HealthScore)
-            .filter(HealthScore.user_id == user_id, HealthScore.category == category)
+            .filter(
+                func.wh_read_score(
+                    HealthScore.user_id,
+                    HealthScore.data_source_id,
+                    sql_cast(HealthScore.provider, String),
+                    HealthScore.event_record_id,
+                    HealthScore.recorded_at,
+                ),
+                HealthScore.user_id == user_id,
+                HealthScore.category == category,
+            )
             .order_by(desc(HealthScore.recorded_at))
             .first()
         )
@@ -121,6 +135,13 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
             db_session.query(HealthScore, DataSource)
             .outerjoin(DataSource, HealthScore.data_source_id == DataSource.id)
             .filter(
+                func.wh_read_score(
+                    HealthScore.user_id,
+                    HealthScore.data_source_id,
+                    sql_cast(HealthScore.provider, String),
+                    HealthScore.event_record_id,
+                    HealthScore.recorded_at,
+                ),
                 HealthScore.user_id == user_id,
                 HealthScore.category == HealthScoreCategory.RECOVERY,
                 HealthScore.recorded_at >= start_date,
@@ -171,7 +192,16 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         """
         return (
             db_session.query(HealthScore)
-            .filter(HealthScore.user_id == user_id)
+            .filter(
+                func.wh_read_score(
+                    HealthScore.user_id,
+                    HealthScore.data_source_id,
+                    sql_cast(HealthScore.provider, String),
+                    HealthScore.event_record_id,
+                    HealthScore.recorded_at,
+                ),
+                HealthScore.user_id == user_id,
+            )
             .distinct(HealthScore.category)
             .order_by(HealthScore.category, desc(HealthScore.recorded_at))
             .all()

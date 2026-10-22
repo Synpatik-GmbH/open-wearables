@@ -126,7 +126,7 @@ class TestSuuntoImport:
             "provider": "suunto",
             "redirect_uri": None,
         }
-        import json
+        import json  # noqa: PLC0415
 
         # Create a mock redis client
         mock_redis = MagicMock()
@@ -177,7 +177,7 @@ class TestSuuntoImport:
             assert result["payload"][1]["activityId"] == 2  # Cycling
 
     @patch("app.services.providers.suunto.workouts.SuuntoWorkouts._make_api_request")
-    @patch("app.services.event_record_service.event_record_service.create")
+    @patch("app.repositories.event_record_repository.EventRecordRepository.create_and_flush")
     @patch("app.services.event_record_service.event_record_service.create_detail")
     @patch("app.repositories.data_source_repository.DataSourceRepository.ensure_data_source")
     def test_load_data_creates_event_records(
@@ -210,8 +210,8 @@ class TestSuuntoImport:
     def test_workout_type_mapping(self, suunto_strategy: SuuntoStrategy) -> None:
         """Should correctly map Suunto activity IDs to unified workout types."""
         # Arrange
-        from app.constants.workout_types.suunto import get_unified_workout_type
-        from app.schemas.enums import WorkoutType
+        from app.constants.workout_types.suunto import get_unified_workout_type  # noqa: PLC0415
+        from app.schemas.enums import WorkoutType  # noqa: PLC0415
 
         # Act & Assert
         assert get_unified_workout_type(1) == WorkoutType.RUNNING

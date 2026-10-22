@@ -260,7 +260,9 @@ class SuuntoWorkouts(BaseWorkoutsTemplate):
 
         count = 0
         for record, details in self._build_bundles(workouts, user_id):
-            created_record = event_record_service.create(db, record)
+            created_record = event_record_service.create_if_admitted(db, record)
+            if created_record is None:
+                continue
             detail_for_record = details.model_copy(update={"record_id": created_record.id})
             event_record_service.create_detail(db, detail_for_record)
             count += 1
@@ -290,7 +292,7 @@ class SuuntoWorkouts(BaseWorkoutsTemplate):
 
         Mirrors the load_data backfill path: builds the record + detail bundle
         and inserts both via event_record_service. create_detail schedules the
-        after_commit listener that fires the outgoing webhook (workout.created),
+        after-outer-commit callback that fires the outgoing webhook (workout.created),
         so consumers subscribed via Svix receive the new workout.
 
         Returns the created event_record id, or None when the bundle was empty.
@@ -311,7 +313,9 @@ class SuuntoWorkouts(BaseWorkoutsTemplate):
             )
 
         for record, detail in self._build_bundles([raw_workout], user_id):
-            created_record = event_record_service.create(db, record)
+            created_record = event_record_service.create_if_admitted(db, record)
+            if created_record is None:
+                continue
             detail_for_record = detail.model_copy(update={"record_id": created_record.id})
             event_record_service.create_detail(db, detail_for_record)
             return created_record.id

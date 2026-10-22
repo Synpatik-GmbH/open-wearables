@@ -3,6 +3,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from logging import getLogger
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 from app.config import settings
@@ -13,10 +14,10 @@ from app.constants.series_types.sdk import (
 from app.constants.sleep import SleepStageType
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
-    SleepStage,
 )
 from app.schemas.providers.mobile_sdk import (
     SLEEP_START_STATES,
@@ -28,18 +29,13 @@ from app.schemas.providers.mobile_sdk import (
 )
 from app.services.event_record_service import event_record_service
 from app.services.sdk.device_resolution import extract_device_info
+from app.services.sdk.sleep_stages import _calculate_final_metrics, normalized_sleep_window, ordered_sleep_stages
 from app.utils.exceptions import SleepLockBusyError
+from app.utils.sleep_interval import interval_gap
 from app.utils.structured_logging import log_structured
+from app.utils.wearable_history_ingress import PreStartDataRejectedError
 
 logger = getLogger(__name__)
-
-_STAGE_TO_METRIC: dict[str, str] = {
-    "awake": "awake_seconds",
-    "sleeping": "sleeping_seconds",
-    "light": "light_seconds",
-    "deep": "deep_seconds",
-    "rem": "rem_seconds",
-}
 
 
 def key(user_id: str) -> str:
@@ -132,15 +128,7 @@ def _apply_transition(
     # that arrive out of chronological order: a sample that chains directly onto an
     # earlier part of the night will have a near-zero distance to the session window
     # even if it was enqueued after a later-night payload was already processed.
-    if start_time <= state.end_time and end_time >= state.start_time:
-        # New sample overlaps with the current session window → same session.
-        delta_seconds = 0.0
-    elif end_time <= state.start_time:
-        # New sample is entirely before the session start.
-        delta_seconds = (state.start_time - end_time).total_seconds()
-    else:
-        # New sample is entirely after the session end.
-        delta_seconds = (start_time - state.end_time).total_seconds()
+    delta_seconds = interval_gap(start_time, end_time, state.start_time, state.end_time)
 
     if delta_seconds > settings.sleep_end_gap_minutes * 60:
         finish_sleep(db_session, user_id, state)
@@ -250,24 +238,7 @@ def handle_sleep_data(
         current_state = load_sleep_state(user_id)
         provider = request.provider
 
-        # Deduplicate and sort
-        seen = set()
-        unique_data = []
-
-        # Sort first by startDate to ensure chronological processing
-        sorted_raw = sorted(request.data.sleep, key=lambda x: x.startDate)
-
-        for item in sorted_raw:
-            # Create a unique key for deduplication
-            # SourceInfo is not hashable, use JSON dump
-            source_key = item.source.model_dump_json() if item.source else None
-            key_tuple = (item.startDate, item.endDate, item.stage, source_key)
-
-            if key_tuple not in seen:
-                seen.add(key_tuple)
-                unique_data.append(item)
-
-        for sjson in unique_data:
+        for sjson in ordered_sleep_stages(request.data.sleep):
             # Extract device info
             device_model, software_version, original_source_name = extract_device_info(sjson.source)
 
@@ -306,6 +277,21 @@ def handle_sleep_data(
 
         # Persist the accumulated state to Redis only once after processing the entire batch
         if current_state:
+            gate = WearableHistoryIngressRepository(db_session)
+            normalized_start, normalized_end = normalized_sleep_window(
+                current_state.stages, current_state.start_time, current_state.end_time
+            )
+            if not gate.event_admitted(
+                SimpleNamespace(
+                    category="sleep",
+                    user_id=UUID(user_id),
+                    provider=current_state.provider,
+                    start_datetime=normalized_start,
+                    end_datetime=normalized_end,
+                    zone_offset=current_state.zone_offset,
+                )
+            ):
+                raise PreStartDataRejectedError("Frozen source rejects pre-start sleep state")
             save_sleep_state(user_id, current_state)
 
         # Finalise synchronously if the session is already stale.  Historical
@@ -325,111 +311,11 @@ def handle_sleep_data(
             lock.release()
 
     # import not at module level in order to avoid circular import
-    from app.integrations.celery.tasks.finalize_stale_sleep_task import finalize_stale_sleeps
+    from app.integrations.celery.tasks.finalize_stale_sleep_task import finalize_stale_sleeps  # noqa: PLC0415
 
     # Dispatch the stale-sleep task so sessions that have gone quiet (including
     # other users' sessions) are finalised promptly without waiting for the next beat.
     finalize_stale_sleeps.delay()
-
-
-def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[SleepStage]]:
-    """
-    Recalculate metrics from stages, handling overlaps by prioritizing earlier segments.
-    Returns (metrics_dict, cleaned_stages_list).
-
-    Input stages are now list[SleepStateStage] Pydantic models with normalized stage values.
-    """
-    metrics = {
-        "in_bed_seconds": 0,
-        "awake_seconds": 0,
-        "sleeping_seconds": 0,
-        "light_seconds": 0,
-        "deep_seconds": 0,
-        "rem_seconds": 0,
-    }
-
-    # Determine processing strategy based on what stage types are present:
-    # - Only in_bed (no sleeping/light/deep/rem): treat in_bed as sleeping (legacy devices)
-    # - Detailed phases present (light/deep/rem): use only detailed + awake, drop sleeping wrapper
-    # - Only sleeping (no detailed): use sleeping + awake as-is
-    has_detailed = any(s.stage in ("light", "deep", "rem") for s in stages)
-    has_sleep_data = any(s.stage in ("sleeping", "light", "deep", "rem") for s in stages)
-
-    if not has_sleep_data:
-        processable = [
-            SleepStateStage(stage=SleepStageType.SLEEPING, start_time=s.start_time, end_time=s.end_time)
-            if s.stage == "in_bed"
-            else s
-            for s in stages
-            if s.stage != "unknown"
-        ]
-    elif has_detailed:
-        processable = [s for s in stages if s.stage not in ("in_bed", "sleeping", "unknown")]
-    else:
-        processable = [s for s in stages if s.stage not in ("in_bed", "unknown")]
-
-    sorted_processable = sorted(processable, key=lambda x: x.start_time)
-
-    cleaned_stages: list[SleepStage] = []
-    last_end = None
-
-    for stage in sorted_processable:
-        start = stage.start_time
-        end = stage.end_time
-
-        if last_end and start < last_end:
-            start = last_end
-
-        if start >= end:
-            continue
-
-        duration = (end - start).total_seconds()
-
-        # Safe to access .stage (Pydantic model)
-        phase_str = str(stage.stage)
-
-        metric_key = _STAGE_TO_METRIC.get(phase_str)
-        if metric_key:
-            metrics[metric_key] += duration
-
-        cleaned_stages.append(SleepStage(stage=SleepStageType(phase_str), start_time=start, end_time=end))
-        last_end = end
-
-    # 2. Process IN_BED duration separately (union of intervals)
-    in_bed_raw = [s for s in stages if s.stage == "in_bed"]
-    if in_bed_raw:
-        sorted_in_bed = sorted(in_bed_raw, key=lambda x: x.start_time)
-        current_start = None
-        current_end = None
-
-        for stage in sorted_in_bed:
-            start = stage.start_time
-            end = stage.end_time
-
-            if current_start is None:
-                current_start = start
-                current_end = end
-                continue
-
-            if start < current_end:  # ty:ignore[unsupported-operator]
-                current_end = max(current_end, end)  # ty:ignore[invalid-argument-type]
-            else:
-                metrics["in_bed_seconds"] += (current_end - current_start).total_seconds()  # ty:ignore[unsupported-operator]
-                current_start = start
-                current_end = end
-
-        if current_start and current_end:
-            metrics["in_bed_seconds"] += (current_end - current_start).total_seconds()
-    else:
-        metrics["in_bed_seconds"] = (
-            metrics["awake_seconds"]
-            + metrics["sleeping_seconds"]
-            + metrics["light_seconds"]
-            + metrics["deep_seconds"]
-            + metrics["rem_seconds"]
-        )
-
-    return metrics, cleaned_stages
 
 
 def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None:

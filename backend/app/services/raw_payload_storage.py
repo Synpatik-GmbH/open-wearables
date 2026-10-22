@@ -17,8 +17,10 @@ import logging
 import sys
 from datetime import UTC, datetime
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+from app.database import SessionLocal
+from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.services.s3_client import create_s3_client
 from app.utils.structured_logging import json_serial, log_structured
 
@@ -30,6 +32,16 @@ _s3_bucket: str | None = None
 _s3_prefix: str = "raw-payloads"
 _s3_client: Any = None
 _fit_files_enabled: bool = False
+
+
+def _history_allows_archive(provider: str, user_id: str | None) -> bool:
+    try:
+        with SessionLocal() as db:
+            member = UUID(user_id) if user_id else None
+            return WearableHistoryRepository().raw_archive_allowed(db, member, provider)
+    except Exception:
+        logger.warning("Raw archive skipped: source admission unavailable")
+        return False
 
 
 def configure(
@@ -88,6 +100,8 @@ def store_raw_payload(
         trace_id: Optional trace/batch ID for correlation with processed data
     """
     if _storage_backend == "disabled":
+        return
+    if not _history_allows_archive(provider, user_id):
         return
 
     payload_str = payload if isinstance(payload, str) else json.dumps(payload, default=json_serial)
@@ -240,6 +254,8 @@ def store_fit_file(
     Uses the same S3 client and bucket as raw payload storage.
     """
     if not _fit_files_enabled:
+        return
+    if not _history_allows_archive(provider, user_id):
         return
     if _s3_client is None or _s3_bucket is None:
         log_structured(logger, "warning", "Cannot store FIT file — S3 not configured")

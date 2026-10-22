@@ -7,15 +7,19 @@ Following patterns from know-how-tests.md:
 - Factory pattern for test data
 """
 
+import importlib.util
 import os
 import sys
 from collections.abc import Generator
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlparse
 
 import pytest
 import redis as redis_lib
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
@@ -69,6 +73,21 @@ def engine(_postgres_url: str) -> Any:
         max_overflow=10,
     )
     BaseDbModel.metadata.create_all(bind=test_engine)
+    # PostgreSQL functions/triggers are operational schema, absent from create_all.
+    # Install the actual new migration in this private Testcontainers database.
+
+    migration_path = (
+        Path(__file__).parents[1] / "migrations/versions/2026_10_21_0700-a29691004b01_wearable_history_sources.py"
+    )
+    migration_spec = importlib.util.spec_from_file_location("history_schema", migration_path)
+    migration = importlib.util.module_from_spec(migration_spec)
+    migration_spec.loader.exec_module(migration)
+    with test_engine.begin() as connection, Operations.context(MigrationContext.configure(connection)):
+        Operations(MigrationContext.configure(connection)).drop_table("wearable_history_sources")
+        Operations(MigrationContext.configure(connection)).drop_column(
+            "data_point_series_archive", "history_start_date"
+        )
+        migration.upgrade()
 
     # Seed series type definitions (these need to exist for foreign key constraints)
     with Session(bind=test_engine) as session:
@@ -87,8 +106,15 @@ def engine(_postgres_url: str) -> Any:
         )
         session.commit()
 
-    yield test_engine
-    BaseDbModel.metadata.drop_all(bind=test_engine)
+    try:
+        yield test_engine
+    finally:
+        # Operational functions/triggers survive metadata.drop_all. Remove them while
+        # their tables still exist so a second TEST_DATABASE_URL invocation can start.
+        with test_engine.begin() as connection, Operations.context(MigrationContext.configure(connection)):
+            migration.downgrade()
+        BaseDbModel.metadata.drop_all(bind=test_engine)
+        test_engine.dispose()
 
 
 @pytest.fixture(scope="session")

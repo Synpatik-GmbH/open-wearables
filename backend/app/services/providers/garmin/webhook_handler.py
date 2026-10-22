@@ -37,6 +37,9 @@ from app.services.providers.garmin.workouts import GarminWorkouts
 from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
 from app.services.raw_payload_storage import store_raw_payload
 from app.utils.structured_logging import log_structured
+from app.utils.wearable_history_ingress import (
+    WearableHistoryMetadataUnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +195,10 @@ class GarminWebhookHandler(BaseWebhookHandler):
 
         # --- data processing ---------------------------------------------
         act_result = self._process_activities(db, payload, errors, synced_user_ids, users_with_new_success, trace_id)
-        well_result = self._process_wellness(db, payload, errors, synced_user_ids, users_with_new_success, trace_id)
+        blocked_users: set[str] = set()
+        well_result, retry_error = self._process_wellness(
+            db, payload, errors, synced_user_ids, users_with_new_success, blocked_users, trace_id
+        )
 
         # --- commit + update last_synced_at ------------------------------
         db.commit()
@@ -212,6 +218,13 @@ class GarminWebhookHandler(BaseWebhookHandler):
             "wellness": well_result,
             "backfill_chained": [],
         }
+
+        if retry_error is not None:
+            # Admitted members are committed; chain only members with no blocked type, so
+            # a backfill cannot advance past data the retry has not restored yet.
+            # Lifecycle events wait for the delivery that succeeds, as before.
+            self._chain_backfills(users_with_new_success - blocked_users, trace_id)
+            raise retry_error
 
         self._process_lifecycle_events(db, payload, response, trace_id)
         response["backfill_chained"] = self._chain_backfills(users_with_new_success, trace_id)
@@ -265,9 +278,11 @@ class GarminWebhookHandler(BaseWebhookHandler):
         errors: list[str],
         synced_user_ids: set[UUID],
         users_with_new_success: set[str],
+        blocked_users: set[str],
         request_trace_id: str,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], WearableHistoryMetadataUnavailableError | None]:
         wellness_results: dict[str, Any] = {}
+        retry_error: WearableHistoryMetadataUnavailableError | None = None
 
         for data_type in WELLNESS_TYPES:
             if not payload.get(data_type):
@@ -285,15 +300,28 @@ class GarminWebhookHandler(BaseWebhookHandler):
             )
 
             result = process_wellness_items(
-                db, self.connection_repo, self.garmin_247, data_type, items, errors, synced_user_ids, request_trace_id
+                db,
+                self.connection_repo,
+                self.garmin_247,
+                data_type,
+                items,
+                errors,
+                synced_user_ids,
+                request_trace_id,
             )
+            # Finish sibling types before the existing task retry redelivers the blocked
+            # member's items.
+            retry_error = retry_error or result["retry_error"]
+            blocked_users.update(result["blocked_users"])
             wellness_results[data_type] = {"processed": result["processed"], "saved": result["saved"]}
 
+            # Mark members that succeeded even when another member of the account
+            # will retry: the mark fires once, so a retry would never chain them.
             for uid_str in result.get("succeeded_users", []):
                 if mark_type_success(uid_str, data_type):
                     users_with_new_success.add(uid_str)
 
-        return wellness_results
+        return wellness_results, retry_error
 
     def _process_lifecycle_events(
         self,

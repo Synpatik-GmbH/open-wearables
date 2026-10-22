@@ -32,7 +32,9 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from app.database import BaseDbModel
-from app.models import DataPointSeries, DataSource, EventRecord, User
+from app.models import DataPointSeries, DataSource, EventRecord, ProviderPriority, User
+from app.repositories.provider_priority_repository import ProviderPriorityRepository
+from app.schemas.enums import ProviderName
 from tests.tasks.sdk_upload_payload import night_payload
 
 _TASK = "app.integrations.celery.tasks.process_sdk_upload_task.process_sdk_upload"
@@ -74,6 +76,15 @@ def _wait_for(condition: Callable[[], bool], worker: subprocess.Popen, what: str
 
 @pytest.fixture
 def committed_user(engine: Engine) -> Iterator[UUID]:
+    original = _row_counts(engine)
+    # Provider priority is global policy, not a member row. Sleep-first processing can
+    # initialize it in a real worker; seed that prerequisite before the erasure snapshot.
+    with Session(bind=engine) as session:
+        repository = ProviderPriorityRepository()
+        existing = repository.get_by_provider(session, ProviderName.APPLE)
+        priority = repository.ensure_provider_exists(session, ProviderName.APPLE)
+        seeded_priority_id = priority.id if existing is None else None
+        session.commit()
     before = _row_counts(engine)
     user_id = uuid4()
     with Session(bind=engine) as session:
@@ -84,6 +95,11 @@ def committed_user(engine: Engine) -> Iterator[UUID]:
         session.execute(delete(User).where(User.id == user_id))
         session.commit()
     assert _row_counts(engine) == before, "the workers left rows behind"
+    if seeded_priority_id is not None:
+        with Session(bind=engine) as session:
+            session.execute(delete(ProviderPriority).where(ProviderPriority.id == seeded_priority_id))
+            session.commit()
+    assert _row_counts(engine) == original, "the fixture left global prerequisites behind"
 
 
 @pytest.fixture

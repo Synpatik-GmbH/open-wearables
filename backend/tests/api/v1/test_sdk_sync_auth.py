@@ -5,9 +5,11 @@ from unittest.mock import MagicMock, patch
 from uuid import UUID
 
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
 
+from app.models.wearable_history_source import WearableHistorySource
 from app.services import user_service
 from app.services.sdk_token_service import create_sdk_user_token
 from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
@@ -72,6 +74,22 @@ class TestSDKSyncWithSDKToken:
 
         # Should not be 401
         assert response.status_code != 401
+
+    def test_api_key_sync_for_an_unknown_member_is_not_found_and_starts_no_history(
+        self, client: TestClient, db: Session, api_v1_prefix: str, mock_celery_tasks: MagicMock
+    ) -> None:
+        api_key = ApiKeyFactory()
+        user_id = "123e4567-e89b-12d3-a456-426614174999"
+
+        response = client.post(
+            f"{api_v1_prefix}/sdk/users/{user_id}/sync/",
+            headers={"X-Open-Wearables-API-Key": api_key.plain_key},
+            json={"provider": "apple", "data": {"records": []}},
+        )
+
+        assert response.status_code == 404
+        assert db.scalar(select(func.count()).select_from(WearableHistorySource)) == 0
+        mock_celery_tasks.delay.assert_not_called()
 
     def test_no_auth_returns_401(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         """No authentication should return 401."""

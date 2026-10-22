@@ -1,5 +1,5 @@
+from datetime import date, datetime
 from uuid import UUID
-from datetime import datetime
 
 from sqlalchemy import UniqueConstraint
 from sqlalchemy.orm import Mapped
@@ -8,11 +8,12 @@ from app.database import BaseDbModel
 from app.mappings import (
     FKDataSource,
     FKSeriesTypeDefinition,
-    PrimaryKey,
     Indexed,
+    PrimaryKey,
     numeric_10_3,
 )
 from app.schemas.enums import AggregationMethod
+
 
 class DataPointSeriesArchive(BaseDbModel):
     """Daily-aggregated archive of time-series data points.
@@ -40,3 +41,5 @@ class DataPointSeriesArchive(BaseDbModel):
     aggregation_type: Mapped[AggregationMethod]
     value: Mapped[numeric_10_3]
     sample_count: Mapped[int]
+    # Set by the history trigger after it proves the raw contributors at a frozen cutoff.
+    history_start_date: Mapped[date | None]

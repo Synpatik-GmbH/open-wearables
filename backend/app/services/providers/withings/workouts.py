@@ -204,7 +204,9 @@ class WithingsWorkouts(BaseWorkoutsTemplate):
             try:
                 # create() dedups on the (source, start, end) window and returns the
                 # canonical record; the detail FK must point at its id, not ours.
-                created = event_record_service.create(db, record)
+                created = event_record_service.create_if_admitted(db, record)
+                if created is None:
+                    continue
                 event_record_service.create_detail(db, detail.model_copy(update={"record_id": created.id}))
                 processed += 1
             except Exception as e:

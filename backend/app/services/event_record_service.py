@@ -4,7 +4,6 @@ from decimal import Decimal
 from logging import Logger, getLogger
 from uuid import UUID, uuid4
 
-from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Query
 
 from app.config import settings
@@ -29,6 +28,7 @@ from app.repositories import (
     HealthScoreRepository,
 )
 from app.repositories.user_repository import UserRepository
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.enums import HealthScoreCategory
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -61,6 +61,7 @@ from app.services.outgoing_webhooks.events import on_menstrual_cycle_created, on
 from app.services.priority_service import priority_service
 from app.services.scores.sleep_service import sleep_score_service
 from app.services.services import AppService
+from app.utils.after_outer_commit import run_after_outer_commit
 from app.utils.conversion import as_dict_list, as_float, as_model, minutes_to_seconds
 from app.utils.exceptions import handle_exceptions
 from app.utils.heart_rate import estimate_max_hr
@@ -98,6 +99,12 @@ class EventRecordService(
         if user and user.personal_record:
             return user.personal_record.birth_date
         return None
+
+    def create_if_admitted(self, db_session: DbSession, creator: EventRecordCreate) -> EventRecord | None:
+        """Provider loops skip permanent rejections while metadata/write failures remain retryable."""
+        return WearableHistoryIngressRepository(db_session).persist_event(
+            creator, lambda: self.crud.create_and_flush(db_session, creator), commit=True
+        )
 
     def _workout_hr_zone_fields(
         self,
@@ -333,7 +340,7 @@ class EventRecordService(
         detail: EventRecordDetailCreate,
         threshold_minutes: int,
         before_commit: Callable[[EventRecord], None] | None = None,
-    ) -> EventRecord:
+    ) -> EventRecord | None:
         """Create a sleep record, merging with any adjacent session within threshold_minutes.
 
         When an adjacent session already exists in the database within the gap threshold,
@@ -349,12 +356,17 @@ class EventRecordService(
         commit, so a caller can write rows that must exist whenever the night does (a provider's
         sleep score, which points at the record). If it raises, nothing is committed.
         """
-        result, inserted, final_detail = self._create_or_merge_sleep_inner(
-            db_session, user_id, record, detail, threshold_minutes
-        )
-        if before_commit is not None:
-            before_commit(result)
-        db_session.commit()
+
+        def write() -> tuple[EventRecord, bool, EventRecordDetailCreate]:
+            result = self._create_or_merge_sleep_inner(db_session, user_id, record, detail, threshold_minutes)
+            if before_commit is not None:
+                before_commit(result[0])
+            return result
+
+        written = WearableHistoryIngressRepository(db_session).persist_event(record, write, commit=True)
+        if written is None:
+            return None
+        result, inserted, final_detail = written
         if inserted:
             eff = final_detail.sleep_efficiency_score
             has_stages = any(
@@ -816,7 +828,7 @@ class EventRecordService(
         ``event_record_service`` singleton at load time. ``on_workout_created`` keys Svix
         idempotency on the record id, so even a duplicate schedule collapses to one delivery.
         """
-        from app.integrations.celery.tasks.finalize_workout_zones_task import finalize_workout_zones
+        from app.integrations.celery.tasks.finalize_workout_zones_task import finalize_workout_zones  # noqa: PLC0415
 
         finalize_workout_zones.apply_async(
             args=[str(record_id)],
@@ -860,11 +872,12 @@ class EventRecordService(
             # detail FK guarantees the EventRecord exists, and deferring to after_commit
             # avoids racing the task against uncommitted rows. No live zone compute needed
             # here (the task computes zones later from the settled HR trace).
-            @sa_event.listens_for(db_session, "after_commit", once=True)
-            def _schedule_workout_finalizers(session: DbSession) -> None:  # noqa: ARG001
+            def _schedule_workout_finalizers() -> None:
                 for record_id in record_ids:
                     self._schedule_workout_finalize(record_id)
 
+            # After the OUTERMOST commit only, never for a rolled-back savepoint (Codex P1 on #46).
+            run_after_outer_commit(db_session, _schedule_workout_finalizers)
             return
 
         records = db_session.query(EventRecord).filter(EventRecord.id.in_(record_ids)).all()
@@ -897,10 +910,12 @@ class EventRecordService(
         for data_source in data_sources:
             db_session.expunge(data_source)
 
-        @sa_event.listens_for(db_session, "after_commit", once=True)
-        def _dispatch_bulk_webhooks(session: DbSession) -> None:  # noqa: ARG001
+        def _dispatch_bulk_webhooks() -> None:
             for record, data_source, detail in dispatches:
                 self._emit_event_record_webhook(record, data_source, detail)
+
+        # After the OUTERMOST commit only, never for a rolled-back savepoint (Codex P1 on #46).
+        run_after_outer_commit(db_session, _dispatch_bulk_webhooks)
 
     @handle_exceptions
     def _get_records_with_filters(

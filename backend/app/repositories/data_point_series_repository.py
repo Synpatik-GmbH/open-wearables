@@ -46,6 +46,8 @@ from app.repositories.repositories import (
     timeline_key_column,
     utc_bucket_start,
 )
+from app.repositories.wearable_history_ingress_repository import NIGHT_PHYSIOLOGY, WearableHistoryIngressRepository
+from app.repositories.wearable_history_read_repository import WearableHistoryReadRepository
 from app.schemas.enums import (
     BUCKET_SIZES,
     AggregationMethod,
@@ -218,6 +220,7 @@ class DataPointSeriesRepository(
         Returns the number of rows actually written, split into inserted (new)
         vs updated (refreshed in place via ON CONFLICT).
         """
+        creators = WearableHistoryIngressRepository(db_session).filter_samples(creators)
         if not creators:
             return WriteCounts(0, 0)
 
@@ -1093,6 +1096,9 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
                 self.model.recorded_at >= start_date - timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
@@ -1180,6 +1186,9 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
                 self.model.recorded_at >= start_date - timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
@@ -1283,6 +1292,9 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
                 self.model.recorded_at >= start_date - timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
@@ -1392,6 +1404,9 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
                 self.model.recorded_at < before_date,
                 self.model.series_type_definition_id.in_(type_ids),
             )
@@ -1423,7 +1438,12 @@ class DataPointSeriesRepository(
                 (self.model.series_type_definition_id == latest_subq.c.series_type_definition_id)
                 & (self.model.recorded_at == latest_subq.c.max_recorded_at),
             )
-            .filter(DataSource.user_id == user_id)
+            .filter(
+                DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
+            )
             # DISTINCT ON (PostgreSQL) ensures exactly one result per series type
             # Order by priorities (lower number = higher priority), then id desc as tiebreaker
             .distinct(self.model.series_type_definition_id)
@@ -1479,6 +1499,9 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
                 self.model.recorded_at >= start_date,
                 self.model.recorded_at < end_date,
                 self.model.series_type_definition_id.in_(type_ids),
@@ -1542,6 +1565,9 @@ class DataPointSeriesRepository(
             )
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    self.model.data_source_id, self.model.series_type_definition_id, self.model.recorded_at
+                ),
                 self.model.series_type_definition_id == type_id,
                 self.model.recorded_at >= window_start,
                 self.model.recorded_at <= window_end,
@@ -1574,7 +1600,7 @@ class DataPointSeriesRepository(
         [start_dt, end_dt), ordered by recorded_at ascending.
         """
         results = (
-            db_session.query(self.model.recorded_at, self.model.value)
+            db_session.query(self.model, DataSource)
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
@@ -1585,4 +1611,12 @@ class DataPointSeriesRepository(
             .order_by(self.model.recorded_at, self.model.id)
             .all()
         )
-        return [(row.recorded_at, float(row.value)) for row in results]
+
+        series = get_series_type_from_id(type_id).value
+        return WearableHistoryReadRepository(db_session, user_id).filter_series(
+            [(sample, source) for sample, source in results],
+            start_dt,
+            end_dt,
+            weight=series == "weight",
+            night_physiology=series in NIGHT_PHYSIOLOGY,
+        )

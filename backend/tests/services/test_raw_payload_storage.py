@@ -18,6 +18,13 @@ def _reset_module_state() -> None:
     raw_payload_storage._s3_client = None
 
 
+@pytest.fixture(autouse=True)
+def _archive_admission() -> None:
+    """Storage mechanics use an admitted archive; history behavior has real-store tests."""
+    with patch.object(raw_payload_storage, "_history_allows_archive", return_value=True):
+        yield
+
+
 class TestConfigure:
     def test_configure_disabled(self) -> None:
         raw_payload_storage.configure("disabled", 1024)

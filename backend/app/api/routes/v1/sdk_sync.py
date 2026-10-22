@@ -3,13 +3,18 @@ import uuid
 from logging import getLogger
 
 from fastapi import APIRouter, HTTPException, status
+from pydantic import ValidationError
 
 from app.config import settings
 from app.constants.sdk_providers import normalize_sdk_provider, sdk_providers
+from app.database import DbSession
 from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_upload
 from app.schemas.providers.mobile_sdk import SyncRequest
 from app.schemas.responses.upload import UploadDataResponse
 from app.services.raw_payload_storage import put_payload_to_s3, store_raw_payload
+from app.services.sdk.sleep_service import load_sleep_state
+from app.services.sdk.wearable_history import sanitize_sdk_payload
+from app.services.wearable_history_sources_service import wearable_history_sources_service
 from app.utils.api_utils import inline_schema_defs
 from app.utils.auth import SDKAuthDep
 from app.utils.sentry_helpers import log_and_capture_error
@@ -34,6 +39,7 @@ def sync_sdk_data(
     user_id: str,
     body: dict,
     auth: SDKAuthDep,
+    db: DbSession,
 ) -> UploadDataResponse:
     """Import health data from SDK provider asynchronously via Celery.
 
@@ -60,8 +66,9 @@ def sync_sdk_data(
         UploadDataResponse with 202 status and task queued message
 
     Raises:
-        HTTPException: 403 if token doesn't match user_id, 400 if provider unsupported.
-        Payload validation runs async in the worker, not here.
+        HTTPException: 403 if token doesn't match user_id, 400 if provider unsupported, 400 if a
+        frozen source's payload has an invalid envelope (its history gate parses it here).
+        Other payload validation runs async in the worker, not here.
     """
     if auth.auth_type == "sdk_token" and (not auth.user_id or str(auth.user_id) != user_id):
         raise HTTPException(
@@ -70,7 +77,8 @@ def sync_sdk_data(
         )
 
     # Raw dict, not SyncRequest: schema-validating here would 400 the whole batch on one
-    # bad record pre-dispatch. The worker validates and reports failures to Sentry.
+    # bad record pre-dispatch. The worker validates and reports failures to Sentry; only a
+    # frozen source's payload is parsed here, by the history gate below.
     raw_provider = str(body.get("provider") or "").lower()
 
     # Validate provider (routing decision — needed to select an import service)
@@ -83,6 +91,34 @@ def sync_sdk_data(
     # The worker and import service re-read the provider from the payload, so the
     # canonical slug has to replace the alias here rather than travel alongside it.
     body["provider"] = provider
+    try:
+        wearable_history_sources_service.begin_source(db, uuid.UUID(user_id), provider)
+        db.commit()
+        body = sanitize_sdk_payload(db, uuid.UUID(user_id), body, load_sleep_state(user_id))
+        # The gate reads the source row FOR UPDATE; release it before S3 and the queue, so the
+        # worker this request enqueues does not wait on it.
+        db.commit()
+    except HTTPException:
+        raise  # An unknown member is the service's 404, not a retryable outage.
+    except ValidationError as exc:
+        # A frozen source's payload is parsed here; an invalid envelope is permanent, not an outage.
+        # Report it as the worker reports a provisional one: locations and types, never values.
+        errors = exc.errors()
+        first = errors[0] if errors else {}
+        log_structured(
+            logger,
+            "warning",
+            "SDK payload validation failed",
+            provider=provider,
+            action=f"{provider}_sdk_validation_failed",
+            user_id=user_id,
+            error_count=len(errors),
+            first_error_loc=".".join(str(x) for x in first.get("loc", [])),
+            first_error_msg=first.get("msg"),
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid sync payload") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Wearable history admission unavailable; retry") from exc
 
     # Generate unique batch ID for tracking
     batch_id = str(uuid.uuid4())

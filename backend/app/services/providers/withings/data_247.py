@@ -384,8 +384,10 @@ class Withings247Data(Base247DataTemplate):
             is_nap=False,
         )
         try:
-            event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
-            return True
+            stored = event_record_service.create_or_merge_sleep(
+                db, user_id, record, detail, settings.sleep_end_gap_minutes
+            )
+            return stored is not None
         except Exception as e:
             db.rollback()
             log_and_capture_error(

@@ -300,7 +300,9 @@ class GarminWorkouts(BaseWorkoutsTemplate):
         created_ids: list[UUID] = []
 
         for record, detail in self._build_bundles(activities, user_id):
-            created_record = event_record_service.create(db, record)
+            created_record = event_record_service.create_if_admitted(db, record)
+            if created_record is None:
+                continue
             detail_for_record = detail.model_copy(update={"record_id": created_record.id})
             event_record_service.create_detail(db, detail_for_record)
             created_ids.append(created_record.id)

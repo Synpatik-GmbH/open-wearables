@@ -291,7 +291,11 @@ class Suunto247Data(Base247DataTemplate):
         )
 
         try:
-            event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
+            stored = event_record_service.create_or_merge_sleep(
+                db, user_id, record, detail, settings.sleep_end_gap_minutes
+            )
+            if stored is None:
+                return False
         except Exception as e:
             log_structured(
                 self.logger,

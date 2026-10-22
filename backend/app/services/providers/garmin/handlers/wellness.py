@@ -15,6 +15,10 @@ from app.services.providers.garmin.backfill_state import get_trace_id
 from app.services.providers.garmin.data_247 import Garmin247Data
 from app.services.sync_status_service import emit_sync_completed, new_run_id
 from app.utils.structured_logging import log_structured
+from app.utils.wearable_history_ingress import (
+    WearableHistoryMetadataUnavailableError,
+    is_history_boundary_failure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,13 +91,19 @@ def process_wellness_items(
     total_processed = sum(len(items) for items in user_items.values())
     total_saved = 0
     succeeded_users: list[str] = []
+    blocked_users: list[str] = []
 
+    retry_error: WearableHistoryMetadataUnavailableError | None = None
+    db.commit()  # Earlier payload work is not this loop's to roll back.
     for uid, items in user_items.items():
         trace_id = get_trace_id(uid) or request_trace_id
         is_secondary = uid in secondary_primary
         sync_source = SyncSource.LINKED_ACCOUNT if is_secondary else SyncSource.WEBHOOK
         try:
             count = garmin_247.process_items_batch(db, uid, summary_type, items)
+            # Commit per member: the deferred wh_ingress check then fails inside this
+            # member's try, and a boundary rollback below discards only this batch.
+            db.commit()
             total_saved += count
             synced_user_ids.add(uid)
             succeeded_users.append(str(uid))
@@ -123,7 +133,22 @@ def process_wellness_items(
                     "items": len(items),
                 },
             )
+        except WearableHistoryMetadataUnavailableError as exc:
+            # Raised by the gate before this member's writes. A blocked profile must not
+            # consume the shared account's other profiles, and it is never chained.
+            retry_error = retry_error or exc
+            blocked_users.append(str(uid))
+            continue
         except Exception as e:
+            if is_history_boundary_failure(e):
+                # The batch met the freeze or a source change at flush/commit. Earlier
+                # members are committed; this session still holds the rolled-back
+                # batch's after-commit callbacks, so it is not reused: the task retry
+                # redelivers the payload, and the gate then sees the current cutoff.
+                db.rollback()
+                raise WearableHistoryMetadataUnavailableError(
+                    "Wearable history boundary moved during the batch; retry"
+                ) from e
             log_structured(
                 logger,
                 "error",
@@ -135,4 +160,11 @@ def process_wellness_items(
             )
             errors.append(f"{summary_type} error: {e}")
 
-    return {"processed": total_processed, "saved": total_saved, "succeeded_users": succeeded_users}
+    # The caller marks the members that succeeded before it raises the retry.
+    return {
+        "processed": total_processed,
+        "saved": total_saved,
+        "succeeded_users": succeeded_users,
+        "blocked_users": blocked_users,
+        "retry_error": retry_error,
+    }

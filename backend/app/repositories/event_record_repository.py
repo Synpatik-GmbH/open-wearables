@@ -29,6 +29,8 @@ from app.database import DbSession
 from app.models import DataPointSeries, DataSource, EventRecord, SleepDetails, WorkoutDetails
 from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.repositories import CrudRepository, source_filter_conditions, utc_bucket_start
+from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
+from app.repositories.wearable_history_read_repository import WearableHistoryReadRepository
 from app.schemas.enums import ProviderName, SeriesType, TimelineBucket, get_series_type_id
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -49,7 +51,9 @@ class EventRecordRepository(
         super().__init__(model)
         self.data_source_repo = DataSourceRepository()
 
-    def _build_creation(self, db_session: DbSession, creator: EventRecordCreate) -> tuple[UUID, EventRecord]:
+    def _build_creation(
+        self, db_session: DbSession, creator: EventRecordCreate, *, commit_source: bool = True
+    ) -> tuple[UUID, EventRecord]:
         """Resolve the data source and build the ORM object without touching the session."""
         if creator.data_source_id:
             data_source_id = creator.data_source_id
@@ -67,6 +71,7 @@ class EventRecordRepository(
                 source=creator.source,
                 software_version=creator.software_version,
                 original_source_name=creator.source,
+                commit=commit_source,
             )
             data_source_id = data_source.id
 
@@ -163,7 +168,7 @@ class EventRecordRepository(
         Uses a savepoint for IntegrityError handling so a conflict rolls back only
         the INSERT and leaves the outer transaction intact.
         """
-        data_source_id, creation = self._build_creation(db_session, creator)
+        data_source_id, creation = self._build_creation(db_session, creator, commit_source=False)
         nested = db_session.begin_nested()
         try:
             db_session.add(creation)
@@ -182,6 +187,17 @@ class EventRecordRepository(
         db_session: DbSession,
         creators: list[EventRecordCreate],
     ) -> list[UUID]:
+        # One savepoint for the night evidence and the insert: a batch that fails to
+        # insert leaves no evidence that could move a source's start date earlier.
+        with db_session.begin_nested():
+            return self._bulk_create(db_session, creators)
+
+    def _bulk_create(
+        self,
+        db_session: DbSession,
+        creators: list[EventRecordCreate],
+    ) -> list[UUID]:
+        creators = WearableHistoryIngressRepository(db_session).filter_events(creators)
         if not creators:
             return []
 
@@ -249,6 +265,26 @@ class EventRecordRepository(
         # NOTE: Caller should commit - allows batching multiple operations
 
         return list(inserted_ids)
+
+    def find_persisted_for_creator(self, db_session: DbSession, creator: EventRecordCreate) -> EventRecord | None:
+        """Resolve the exact member/source/window after a bulk insert or deduplicated replay."""
+        provider = self.data_source_repo.infer_provider_from_source(creator.source)
+        if creator.provider:
+            provider = ProviderName(creator.provider)
+        return (
+            db_session.query(EventRecord)
+            .join(DataSource)
+            .filter(
+                DataSource.user_id == creator.user_id,
+                DataSource.provider == provider,
+                DataSource.source == creator.source,
+                DataSource.device_model == creator.device_model,
+                EventRecord.category == creator.category,
+                EventRecord.start_datetime == creator.start_datetime,
+                EventRecord.end_datetime == creator.end_datetime,
+            )
+            .first()
+        )
 
     def get_record_with_details(
         self,
@@ -692,6 +728,13 @@ class EventRecordRepository(
             .outerjoin(SleepDetails, SleepDetails.record_id == EventRecord.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_event(
+                    EventRecord.data_source_id,
+                    EventRecord.category,
+                    EventRecord.start_datetime,
+                    EventRecord.end_datetime,
+                    EventRecord.zone_offset,
+                ),
                 EventRecord.category == "sleep",
                 EventRecord.end_datetime >= start_date - timedelta(days=1),
                 local_sleep_date >= cast(start_date, Date),
@@ -735,6 +778,11 @@ class EventRecordRepository(
             .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
             .where(
                 DataSource.user_id == user_id,
+                func.wh_read_sample(
+                    DataPointSeries.data_source_id,
+                    DataPointSeries.series_type_definition_id,
+                    DataPointSeries.recorded_at,
+                ),
                 DataPointSeries.series_type_definition_id.in_([hr_id, sdnn_id, rmssd_id, resp_id, spo2_id]),
                 DataPointSeries.recorded_at >= subquery.c.min_start_time,
                 DataPointSeries.recorded_at < subquery.c.max_end_time,
@@ -886,6 +934,13 @@ class EventRecordRepository(
             .outerjoin(SleepDetails, SleepDetails.record_id == EventRecord.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_event(
+                    EventRecord.data_source_id,
+                    EventRecord.category,
+                    EventRecord.start_datetime,
+                    EventRecord.end_datetime,
+                    EventRecord.zone_offset,
+                ),
                 EventRecord.category == "sleep",
                 EventRecord.end_datetime >= start_date - timedelta(days=1),
                 local_sleep_date >= cast(start_date, Date),
@@ -946,6 +1001,13 @@ class EventRecordRepository(
             .outerjoin(WorkoutDetails, self.model.id == WorkoutDetails.record_id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_event(
+                    self.model.data_source_id,
+                    self.model.category,
+                    self.model.start_datetime,
+                    self.model.end_datetime,
+                    self.model.zone_offset,
+                ),
                 self.model.category == "workout",
                 self.model.end_datetime >= start_date - timedelta(days=1),
                 local_workout_date >= cast(start_date, Date),
@@ -1000,6 +1062,13 @@ class EventRecordRepository(
         threshold = timedelta(minutes=threshold_minutes)
         filters = [
             DataSource.user_id == user_id,
+            func.wh_event_admitted(
+                self.model.data_source_id,
+                self.model.category,
+                self.model.start_datetime,
+                self.model.end_datetime,
+                self.model.zone_offset,
+            ),
             self.model.category == "sleep",
             self.model.type == "sleep_session",
             self.model.start_datetime <= end_time + threshold,
@@ -1042,4 +1111,10 @@ class EventRecordRepository(
             )
             .all()
         )
-        return [(event_record, sleep_details) for event_record, sleep_details in rows]
+
+        history = WearableHistoryReadRepository(db_session, user_id)
+        return [
+            (event_record, sleep_details)
+            for event_record, sleep_details in rows
+            if history.event_eligible(event_record)
+        ]

@@ -282,7 +282,7 @@ class TestSuuntoWorkouts:
     ) -> None:
         """Should fetch workouts from Suunto API with correct parameters."""
         # Arrange
-        from tests.factories import UserFactory
+        from tests.factories import UserFactory  # noqa: PLC0415
 
         user = UserFactory()
         mock_request.return_value = {"payload": [sample_workout_data]}
@@ -314,7 +314,7 @@ class TestSuuntoWorkouts:
     ) -> None:
         """Should respect maximum limit of 100 workouts per request."""
         # Arrange
-        from tests.factories import UserFactory
+        from tests.factories import UserFactory  # noqa: PLC0415
 
         user = UserFactory()
         mock_request.return_value = {"payload": []}
@@ -330,7 +330,7 @@ class TestSuuntoWorkouts:
     def test_get_workout_detail(self, mock_request: MagicMock, suunto_workouts: SuuntoWorkouts, db: Session) -> None:
         """Should fetch detailed workout data from API."""
         # Arrange
-        from tests.factories import UserFactory
+        from tests.factories import UserFactory  # noqa: PLC0415
 
         user = UserFactory()
         workout_key = "suunto-workout-123"
@@ -347,7 +347,7 @@ class TestSuuntoWorkouts:
         assert result["workoutKey"] == workout_key
 
     @patch.object(SuuntoWorkouts, "_make_api_request")
-    @patch("app.services.event_record_service.event_record_service.create")
+    @patch("app.services.event_record_service.event_record_service.create_if_admitted")
     @patch("app.services.event_record_service.event_record_service.create_detail")
     @patch("app.repositories.data_source_repository.DataSourceRepository.ensure_data_source")
     def test_load_data_creates_records(
@@ -362,7 +362,7 @@ class TestSuuntoWorkouts:
     ) -> None:
         """Should load data and create event records."""
         # Arrange
-        from tests.factories import UserFactory
+        from tests.factories import UserFactory  # noqa: PLC0415
 
         user = UserFactory()
         mock_request.return_value = {"payload": [sample_workout_data]}
@@ -377,7 +377,7 @@ class TestSuuntoWorkouts:
         # Verify data source creation was attempted
         mock_ensure_data_source.assert_called_once()
 
-    @patch("app.services.event_record_service.event_record_service.create")
+    @patch("app.services.event_record_service.event_record_service.create_if_admitted")
     @patch("app.services.event_record_service.event_record_service.create_detail")
     @patch("app.repositories.data_source_repository.DataSourceRepository.ensure_data_source")
     def test_process_push_activity_creates_record_and_detail(
@@ -395,7 +395,7 @@ class TestSuuntoWorkouts:
         the workout.created outgoing webhook, so skipping it silently drops
         live workouts from every downstream consumer.
         """
-        from tests.factories import UserFactory
+        from tests.factories import UserFactory  # noqa: PLC0415
 
         user = UserFactory()
         expected_id = uuid4()

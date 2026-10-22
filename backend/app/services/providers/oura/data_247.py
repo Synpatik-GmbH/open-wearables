@@ -31,6 +31,7 @@ from app.schemas.providers.oura import (
     OuraSleepJSON,
 )
 from app.schemas.providers.oura.imports import OuraIntervalData, OuraMetJSON, OuraPersonalInfoJSON
+from app.schemas.sync_status import DataTypeFailure
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.providers.api_client import make_authenticated_request
@@ -44,9 +45,14 @@ from app.services.providers.oura.coverage import (
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.raw_payload_storage import store_raw_payload
+from app.services.sync_error_code import UNKNOWN, error_code
 from app.services.timeseries_service import timeseries_service
 from app.utils.dates import offset_to_iso, parse_iso_datetime, to_rfc3339
 from app.utils.structured_logging import LogContext, log_structured
+from app.utils.wearable_history_ingress import (
+    is_history_retriable,
+    raise_if_history_retriable,
+)
 
 
 class Oura247Data(Base247DataTemplate):
@@ -325,6 +331,9 @@ class Oura247Data(Base247DataTemplate):
                         )
                     )
                 except Exception as e:
+                    # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                    # which reports DataTypeFailure and holds the pull cursor.
+                    raise_if_history_retriable(e)
                     log_structured(
                         self.logger,
                         "warning",
@@ -411,6 +420,9 @@ class Oura247Data(Base247DataTemplate):
                     )
                 )
             except Exception as e:
+                # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                # which reports DataTypeFailure and holds the pull cursor.
+                raise_if_history_retriable(e)
                 log_structured(
                     self.logger,
                     "warning",
@@ -558,6 +570,9 @@ class Oura247Data(Base247DataTemplate):
                             )
                         )
                     except Exception as e:
+                        # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                        # which reports DataTypeFailure and holds the pull cursor.
+                        raise_if_history_retriable(e)
                         log_structured(
                             self.logger,
                             "warning",
@@ -774,9 +789,16 @@ class Oura247Data(Base247DataTemplate):
             )
 
             try:
-                event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
-                count += 1
+                stored = event_record_service.create_or_merge_sleep(
+                    db, user_id, record, detail, settings.sleep_end_gap_minutes
+                )
+                if stored is None:
+                    continue
+                count += int(stored is not None)
             except Exception as e:
+                # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                # which reports DataTypeFailure and holds the pull cursor.
+                raise_if_history_retriable(e)
                 db.rollback()
                 log_structured(
                     self.logger,
@@ -789,6 +811,7 @@ class Oura247Data(Base247DataTemplate):
                     provider_user_id=provider_user_id,
                     trace_id=trace_id,
                 )
+                continue
 
             hr: OuraIntervalData | None = normalized_sleep.get("heart_rate")
             hrv: OuraIntervalData | None = normalized_sleep.get("hrv")
@@ -822,6 +845,9 @@ class Oura247Data(Base247DataTemplate):
                         timeseries_service.bulk_create_samples(db, samples)
                         db.commit()
                 except Exception as e:
+                    # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                    # which reports DataTypeFailure and holds the pull cursor.
+                    raise_if_history_retriable(e)
                     log_structured(
                         self.logger,
                         "warning",
@@ -856,6 +882,9 @@ class Oura247Data(Base247DataTemplate):
                         )
                         db.commit()
                     except Exception as e:
+                        # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                        # which reports DataTypeFailure and holds the pull cursor.
+                        raise_if_history_retriable(e)
                         log_structured(
                             self.logger,
                             "warning",
@@ -994,6 +1023,9 @@ class Oura247Data(Base247DataTemplate):
                         )
                     )
                 except Exception as e:
+                    # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                    # which reports DataTypeFailure and holds the pull cursor.
+                    raise_if_history_retriable(e)
                     log_structured(
                         self.logger,
                         "warning",
@@ -1019,6 +1051,9 @@ class Oura247Data(Base247DataTemplate):
                         )
                     )
                 except Exception as e:
+                    # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                    # which reports DataTypeFailure and holds the pull cursor.
+                    raise_if_history_retriable(e)
                     log_structured(
                         self.logger,
                         "warning",
@@ -1092,6 +1127,9 @@ class Oura247Data(Base247DataTemplate):
                     )
                 )
             except Exception as e:
+                # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                # which reports DataTypeFailure and holds the pull cursor.
+                raise_if_history_retriable(e)
                 log_structured(
                     self.logger,
                     "warning",
@@ -1246,6 +1284,9 @@ class Oura247Data(Base247DataTemplate):
                     )
                 )
             except Exception as e:
+                # A retriable history error or a wh_ingress rejection reaches the dispatch loop,
+                # which reports DataTypeFailure and holds the pull cursor.
+                raise_if_history_retriable(e)
                 log_structured(
                     self.logger,
                     "warning",
@@ -1274,7 +1315,7 @@ class Oura247Data(Base247DataTemplate):
         start_time: datetime | str | None = None,
         end_time: datetime | str | None = None,
         is_first_sync: bool = False,
-    ) -> dict[str, int]:
+    ) -> dict[str, int | DataTypeFailure]:
         """Load and save all 247 data types.
 
         Args:
@@ -1330,13 +1371,18 @@ class Oura247Data(Base247DataTemplate):
             "vo2_max": lambda: self.save_vo2_data(db, user_id, self.get_vo2_data(db, user_id, start_time, end_time)),
         }
 
-        results: dict[str, int] = {}
+        results: dict[str, int | DataTypeFailure] = {}
         for data_type, fn in tasks.items():
             try:
                 results[data_type] = fn()
             except Exception as e:
                 db.rollback()
-                results[data_type] = 0
+                # A retriable history error holds the cursor, so the next pull asks for this
+                # span again; any other failure keeps the existing "nothing saved" result.
+                # A wh_ingress rejection met at a save's own commit (the freeze passed mid-pull)
+                # rolled the whole type back, so it holds the cursor too.
+                retriable = is_history_retriable(e)
+                results[data_type] = DataTypeFailure(code=error_code(e) or UNKNOWN) if retriable else 0
                 log_structured(
                     self.logger,
                     "error",

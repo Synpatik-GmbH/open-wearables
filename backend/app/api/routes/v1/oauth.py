@@ -19,6 +19,7 @@ from app.services import ApiKeyDep, DeveloperDep, user_connection_service
 from app.services.provider_settings_service import ProviderSettingsService
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
+from app.services.wearable_history_sources_service import wearable_history_sources_service
 
 router = APIRouter()
 factory = ProviderFactory()
@@ -102,6 +103,10 @@ def oauth_callback(
 
     assert strategy.oauth
     oauth_state = strategy.oauth.handle_callback(db, code, state)
+    connection = user_connection_service.get_connection(db, oauth_state.user_id, provider_name.value)
+    if connection is None:
+        raise HTTPException(status_code=503, detail="Wearable connection unavailable; retry")
+    wearable_history_sources_service.begin_source(db, oauth_state.user_id, provider_name.value, connection.created_at)
 
     # Stamp last_synced_at=now so the first periodic sync uses the connection
     # timestamp as its live-sync cursor and won't attempt to pull all history.
@@ -114,11 +119,11 @@ def oauth_callback(
         caps = strategy.capabilities
         if caps.webhook_callback:
             # this code is going to be removed later, so leave inner imports heres
-            from app.integrations.celery.tasks import start_garmin_full_backfill
+            from app.integrations.celery.tasks import start_garmin_full_backfill  # noqa: PLC0415
 
             start_garmin_full_backfill.delay(str(oauth_state.user_id))
         elif caps.rest_pull:
-            from app.integrations.celery.tasks import sync_vendor_data
+            from app.integrations.celery.tasks import sync_vendor_data  # noqa: PLC0415
 
             now = datetime.now(timezone.utc)
             start_date = (now - timedelta(days=90)).isoformat()

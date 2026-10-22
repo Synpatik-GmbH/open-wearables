@@ -9,7 +9,7 @@ Usage:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -33,6 +33,7 @@ from app.models import (
     UserConnection,
     WorkoutDetails,
 )
+from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.utils.security import get_password_hash, hash_api_key
@@ -378,7 +379,17 @@ class DataSourceFactory(BaseFactory):
             except ValueError:
                 kwargs["provider"] = ProviderName.UNKNOWN
 
-        return super()._create(model_class, *args, **kwargs)
+        data_source = super()._create(model_class, *args, **kwargs)
+
+        repository = WearableHistoryRepository()
+        session = cls._meta.sqlalchemy_session
+        provider = getattr(data_source.provider, "value", data_source.provider)
+        if repository.list_sources(session, user.id) and repository.get(session, user.id, provider) is None:
+            source = repository.begin_source(session, user.id, provider)
+            repository.observe_nights(
+                session, user.id, provider, [source.connection_day - timedelta(days=i) for i in range(29)]
+            )
+        return data_source
 
 
 # Backward-compatible alias for tests still using the old name
@@ -416,7 +427,19 @@ class UserConnectionFactory(BaseFactory):
         if user is None:
             user = UserFactory()
         kwargs["user_id"] = user.id
-        return super()._create(model_class, *args, **kwargs)
+        connection = super()._create(model_class, *args, **kwargs)
+        # A connected fixture must satisfy the same independent source contract as OAuth/SDK.
+        # The old provider regressions assume a complete imported history window.
+
+        repository = WearableHistoryRepository()
+        session = cls._meta.sqlalchemy_session
+        provider = getattr(connection.provider, "value", connection.provider)
+        if repository.get(session, user.id, provider) is None:
+            source = repository.begin_source(session, user.id, provider)
+            repository.observe_nights(
+                session, user.id, provider, [source.connection_day - timedelta(days=i) for i in range(29)]
+            )
+        return connection
 
 
 class EventRecordFactory(BaseFactory):

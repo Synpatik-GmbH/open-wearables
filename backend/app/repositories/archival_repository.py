@@ -5,7 +5,7 @@ import uuid
 from datetime import date, datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, Date, Subquery, case, cast, func, text
+from sqlalchemy import ColumnElement, Date, Subquery, case, cast, func, select, text, tuple_
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
@@ -164,19 +164,40 @@ class DataPointSeriesArchiveRepository:
             if elapsed >= MAX_SECONDS_PER_RUN:
                 break
 
-            # Step 1: Find data_source_ids with archivable data (batch by source)
-            source_ids = (
-                db.query(DataPointSeries.data_source_id)
+            # Compact whole UTC buckets only. A mixed bucket stays raw until S12 removes
+            # its held contributors, preserving the first night's admitted evening samples.
+            ready_buckets = (
+                db.query(
+                    DataPointSeries.data_source_id.label("source_id"),
+                    DataPointSeries.series_type_definition_id.label("type_id"),
+                    cast(DataPointSeries.recorded_at, Date).label("day"),
+                )
                 .filter(cast(DataPointSeries.recorded_at, Date) < cutoff_date)
-                .distinct()
-                .limit(10)
-                .all()
+                .group_by(
+                    DataPointSeries.data_source_id,
+                    DataPointSeries.series_type_definition_id,
+                    cast(DataPointSeries.recorded_at, Date),
+                )
+                .having(
+                    func.bool_and(
+                        func.wh_archive_ready(
+                            DataPointSeries.data_source_id,
+                            DataPointSeries.series_type_definition_id,
+                            DataPointSeries.recorded_at,
+                        )
+                    )
+                )
+                .subquery()
             )
-
+            source_ids = db.query(ready_buckets.c.source_id).distinct().limit(10).all()
             if not source_ids:
                 break
-
             source_id_list = [s[0] for s in source_ids]
+            ready_bucket = tuple_(
+                DataPointSeries.data_source_id,
+                DataPointSeries.series_type_definition_id,
+                cast(DataPointSeries.recorded_at, Date),
+            ).in_(select(ready_buckets))
 
             # Step 2: Group by (source, type, date) and compute all aggregates
             # We'll post-process to select the correct one per type
@@ -201,6 +222,7 @@ class DataPointSeriesArchiveRepository:
                 )
                 .filter(
                     DataPointSeries.data_source_id.in_(source_id_list),
+                    ready_bucket,
                     cast(DataPointSeries.recorded_at, Date) < cutoff_date,
                 )
                 .group_by(
@@ -216,6 +238,7 @@ class DataPointSeriesArchiveRepository:
 
             # Step 3: For each group, pick the correct aggregate column based on series type
             values_list = []
+            archived_keys: list[tuple[UUID, int, date]] = []
             for row in raw_aggregates:
                 try:
                     series_type = get_series_type_from_id(row.series_type_definition_id)
@@ -241,6 +264,7 @@ class DataPointSeriesArchiveRepository:
                             "sample_count": row.sample_count,
                         }
                     )
+                    archived_keys.append((row.data_source_id, row.series_type_definition_id, row.date))
                 except KeyError:
                     # Unknown series type ID — skip this aggregate but don't
                     # delete the corresponding live rows either.
@@ -264,16 +288,21 @@ class DataPointSeriesArchiveRepository:
                 )
                 db.execute(stmt)
 
-            # Step 5: Delete the live rows we just archived
-            deleted_count = (
-                db.query(DataPointSeries)
-                .filter(
-                    DataPointSeries.data_source_id.in_(source_id_list),
-                    cast(DataPointSeries.recorded_at, Date) < cutoff_date,
+            # Readiness uses a volatile source clock and newly arrived intervals. Delete
+            # only the materialized buckets successfully upserted above, never a second
+            # evaluation of readiness that could include unarchived samples.
+            for i in range(0, len(archived_keys), ARCHIVE_BATCH_SIZE):
+                total_deleted += (
+                    db.query(DataPointSeries)
+                    .filter(
+                        tuple_(
+                            DataPointSeries.data_source_id,
+                            DataPointSeries.series_type_definition_id,
+                            cast(DataPointSeries.recorded_at, Date),
+                        ).in_(archived_keys[i : i + ARCHIVE_BATCH_SIZE])
+                    )
+                    .delete(synchronize_session=False)
                 )
-                .delete(synchronize_session=False)
-            )
-            total_deleted += deleted_count
 
             db.commit()
 
@@ -415,7 +444,16 @@ class DataPointSeriesArchiveRepository:
                 func.max(DataPointSeriesArchive.sample_count).label("sample_count"),
             )
             .join(DataSource, DataPointSeriesArchive.data_source_id == DataSource.id)
-            .filter(DataSource.user_id == user_id, *range_filters)
+            .filter(
+                DataSource.user_id == user_id,
+                func.wh_read_archive(
+                    DataPointSeriesArchive.data_source_id,
+                    DataPointSeriesArchive.series_type_definition_id,
+                    DataPointSeriesArchive.bucket_start_at,
+                    DataPointSeriesArchive.history_start_date,
+                ),
+                *range_filters,
+            )
             .group_by(
                 DataPointSeriesArchive.data_source_id,
                 DataPointSeriesArchive.series_type_definition_id,
@@ -519,6 +557,12 @@ class DataPointSeriesArchiveRepository:
             .join(DataSource, DataPointSeriesArchive.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                func.wh_read_archive(
+                    DataPointSeriesArchive.data_source_id,
+                    DataPointSeriesArchive.series_type_definition_id,
+                    DataPointSeriesArchive.bucket_start_at,
+                    DataPointSeriesArchive.history_start_date,
+                ),
                 DataPointSeriesArchive.bucket_start_at >= start_ts,
                 DataPointSeriesArchive.bucket_start_at < end_ts,
                 DataPointSeriesArchive.series_type_definition_id.in_(series_type_ids),

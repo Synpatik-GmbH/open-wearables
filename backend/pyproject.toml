@@ -68,6 +68,7 @@ select = [
     "N",     # pep8-naming
     "E",     # pycodestyle errors
     "W",     # pycodestyle warnings
+    "PLC0415", # import-outside-top-level (backend/AGENTS.md: all imports at module level)
 ]
 ignore = [
     "ANN002", # missing-type-args
@@ -81,6 +82,53 @@ ignore = [
 "app/api/routes/v*/*.py" = ["ANN201"] # missing-type-annotation
 "app/schemas/providers/garmin/*.py" = ["N815"]  # mixedCase from external API
 "app/schemas/providers/suunto/*.py" = ["N815"]  # mixedCase from external API
+# FORK: files (upstream and fork) that already imported inside functions at f148f92a, when
+# PLC0415 was enabled; files this PR edits carry line-level noqa instead.
+"app/config.py" = ["PLC0415"]
+"app/constants/sdk_providers.py" = ["PLC0415"]
+"app/integrations/celery/tasks/garmin/backfill_timeout.py" = ["PLC0415"]
+"app/integrations/celery/tasks/garmin/backfill_trigger.py" = ["PLC0415"]
+"app/services/dashboard_stats_cache.py" = ["PLC0415"]
+"app/services/outgoing_webhooks/events.py" = ["PLC0415"]
+"app/services/providers/garmin/backfill_state/core.py" = ["PLC0415"]
+"app/services/providers/templates/base_oauth.py" = ["PLC0415"]
+"app/services/providers/withings/oauth.py" = ["PLC0415"]
+"app/services/sync_status_service.py" = ["PLC0415"]
+"app/utils/auth.py" = ["PLC0415"]
+"app/utils/cursors.py" = ["PLC0415"]
+"tests/api/v1/test_auth.py" = ["PLC0415"]
+"tests/api/v1/test_outgoing_webhooks.py" = ["PLC0415"]
+"tests/api/v1/test_summaries.py" = ["PLC0415"]
+"tests/api/v1/test_sync_data.py" = ["PLC0415"]
+"tests/api/v1/test_token.py" = ["PLC0415"]
+"tests/api/v1/test_users.py" = ["PLC0415"]
+"tests/api/v1/test_vendor_workouts.py" = ["PLC0415"]
+"tests/api/v1/test_workouts.py" = ["PLC0415"]
+"tests/integrations/test_polar_import.py" = ["PLC0415"]
+"tests/integrations/test_provider_oauth.py" = ["PLC0415"]
+"tests/providers/apple/test_apple_handlers.py" = ["PLC0415"]
+"tests/providers/polar/test_polar_oauth.py" = ["PLC0415"]
+"tests/providers/polar/test_polar_workouts.py" = ["PLC0415"]
+"tests/providers/suunto/test_suunto_oauth.py" = ["PLC0415"]
+"tests/providers/ultrahuman/test_ultrahuman_data_247.py" = ["PLC0415"]
+"tests/providers/ultrahuman/test_ultrahuman_oauth.py" = ["PLC0415"]
+"tests/providers/withings/test_withings_webhooks.py" = ["PLC0415"]
+"tests/repositories/test_application_repository.py" = ["PLC0415"]
+"tests/repositories/test_data_point_series_repository.py" = ["PLC0415"]
+"tests/repositories/test_developer_repository.py" = ["PLC0415"]
+"tests/repositories/test_event_record_repository.py" = ["PLC0415"]
+"tests/repositories/test_user_connection_repository.py" = ["PLC0415"]
+"tests/services/test_developer_service.py" = ["PLC0415"]
+"tests/services/test_event_record_service.py" = ["PLC0415"]
+"tests/services/test_provider_settings_service.py" = ["PLC0415"]
+"tests/services/test_svix_pseudonyms.py" = ["PLC0415"]
+"tests/services/test_system_info_service.py" = ["PLC0415"]
+"tests/services/test_user_service.py" = ["PLC0415"]
+"tests/tasks/sdk_upload_kill_worker.py" = ["PLC0415"]
+"tests/tasks/test_garmin_webhook_task.py" = ["PLC0415"]
+"tests/tasks/test_process_sdk_upload_task.py" = ["PLC0415"]
+"tests/utils_tests/test_conversion.py" = ["PLC0415"]
+"tests/utils_tests/test_security.py" = ["PLC0415"]
 
 [tool.ruff.lint.isort]
 known-third-party = ["celery"]

@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.models import DataPointSeries, DataSource, EventRecord, HealthScore, User, UserConnection, WorkoutDetails
+from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.schemas.auth import ConnectionStatus
 from app.services.sdk_token_service import create_sdk_user_token
 from tests.factories import (
@@ -230,7 +231,7 @@ class TestConnectionsEndpoints:
     def test_get_connections_nonexistent_user(self, client: TestClient, db: Session) -> None:
         """Test retrieving connections for a user that doesn't exist."""
         # Arrange
-        from uuid import uuid4
+        from uuid import uuid4  # noqa: PLC0415
 
         api_key = ApiKeyFactory()
         headers = api_key_headers(api_key.plain_key)
@@ -247,7 +248,7 @@ class TestConnectionsEndpoints:
     def test_get_connections_with_sync_metadata(self, client: TestClient, db: Session) -> None:
         """Test that connections include sync metadata."""
         # Arrange
-        from datetime import datetime, timezone
+        from datetime import datetime, timezone  # noqa: PLC0415
 
         user = UserFactory()
         last_synced = datetime(2025, 12, 15, 12, 0, 0, tzinfo=timezone.utc)
@@ -660,6 +661,7 @@ class TestDeleteProviderDataEndpoint:
 
     def _seed_provider_data(self, user: User, provider: str) -> DataSource:
         """Create a data_source with a workout (+details), a time series and a health score."""
+        WearableHistoryRepository().begin_source(user._sa_instance_state.session, user.id, provider)
         data_source = DataSourceFactory(user=user, provider=provider)
         event = EventRecordFactory(data_source=data_source, category="workout")
         WorkoutDetailsFactory(event_record=event)
