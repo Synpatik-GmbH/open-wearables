@@ -299,3 +299,31 @@ def test_frozen_sdk_upload_with_an_invalid_envelope_is_rejected_not_retried(
     archive.assert_not_called()
     s3.assert_not_called()
     queue.assert_not_called()
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_frozen_sdk_upload_releases_the_source_lock_before_s3_and_the_queue(db: Session, offload: bool) -> None:
+    """The gate reads the source FOR UPDATE; the worker it enqueues must not wait on this request."""
+
+    member, _ = frozen_source(db)
+    body = {
+        "provider": "apple",
+        "sdkVersion": "1",
+        "syncTimestamp": datetime.now(UTC).isoformat(),
+        "data": {"records": [], "sleep": [], "workouts": []},
+    }
+    open_during_transport: list[bool] = []
+
+    def record_transaction(*_args: object, **_kwargs: object) -> str:
+        open_during_transport.append(db.in_transaction())
+        return "s3://test-bucket/payload"
+
+    with (
+        patch.object(settings, "sdk_payload_s3_offload", offload),
+        patch("app.api.routes.v1.sdk_sync.load_sleep_state", return_value=None),
+        patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
+        patch("app.api.routes.v1.sdk_sync.put_payload_to_s3", side_effect=record_transaction),
+        patch("app.api.routes.v1.sdk_sync.process_sdk_upload.delay", side_effect=record_transaction),
+    ):
+        assert sync_sdk_data(str(member.id), body, SimpleNamespace(auth_type="api_key"), db).status_code == 202
+    assert open_during_transport == ([False, False] if offload else [False])

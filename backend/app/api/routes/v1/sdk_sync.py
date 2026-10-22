@@ -94,6 +94,9 @@ def sync_sdk_data(
         wearable_history_sources_service.begin_source(db, uuid.UUID(user_id), provider)
         db.commit()
         body = sanitize_sdk_payload(db, uuid.UUID(user_id), body, load_sleep_state(user_id))
+        # The gate reads the source row FOR UPDATE; release it before S3 and the queue, so the
+        # worker this request enqueues does not wait on it.
+        db.commit()
     except HTTPException:
         raise  # An unknown member is the service's 404, not a retryable outage.
     except ValidationError as exc:
