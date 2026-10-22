@@ -274,7 +274,7 @@ def test_provisional_sdk_payload_keeps_opaque_extensions_and_worker_validation_p
     ],
 )
 def test_frozen_sdk_upload_with_an_invalid_envelope_is_rejected_not_retried(
-    db: Session, offload: bool, broken: dict
+    db: Session, offload: bool, broken: dict, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Parsing a frozen source's payload must not turn a permanent 400 into a retryable 503."""
 
@@ -286,6 +286,7 @@ def test_frozen_sdk_upload_with_an_invalid_envelope_is_rejected_not_retried(
         "data": {"records": [], "sleep": [], "workouts": []},
         **broken,
     }
+    capsys.readouterr()
     with (
         patch.object(settings, "sdk_payload_s3_offload", offload),
         patch("app.api.routes.v1.sdk_sync.load_sleep_state", return_value=None),
@@ -299,6 +300,13 @@ def test_frozen_sdk_upload_with_an_invalid_envelope_is_rejected_not_retried(
     archive.assert_not_called()
     s3.assert_not_called()
     queue.assert_not_called()
+    # Reported like the worker's rejection of a provisional payload, without record values.
+    out = capsys.readouterr().out
+    reports = [json.loads(line) for line in out.splitlines() if "apple_sdk_validation_failed" in line]
+    assert len(reports) == 1
+    assert reports[0]["error_count"] >= 1
+    assert "not-a-list" not in out
+    assert "not-a-dict" not in out
 
 
 @pytest.mark.parametrize("offload", [False, True])

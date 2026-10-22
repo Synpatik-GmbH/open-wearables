@@ -77,7 +77,8 @@ def sync_sdk_data(
         )
 
     # Raw dict, not SyncRequest: schema-validating here would 400 the whole batch on one
-    # bad record pre-dispatch. The worker validates and reports failures to Sentry.
+    # bad record pre-dispatch. The worker validates and reports failures to Sentry; only a
+    # frozen source's payload is parsed here, by the history gate below.
     raw_provider = str(body.get("provider") or "").lower()
 
     # Validate provider (routing decision — needed to select an import service)
@@ -101,6 +102,20 @@ def sync_sdk_data(
         raise  # An unknown member is the service's 404, not a retryable outage.
     except ValidationError as exc:
         # A frozen source's payload is parsed here; an invalid envelope is permanent, not an outage.
+        # Report it as the worker reports a provisional one: locations and types, never values.
+        errors = exc.errors()
+        first = errors[0] if errors else {}
+        log_structured(
+            logger,
+            "warning",
+            f"{provider.capitalize()} SDK payload validation failed",
+            provider=provider,
+            action=f"{provider}_sdk_validation_failed",
+            user_id=user_id,
+            error_count=len(errors),
+            first_error_loc=".".join(str(x) for x in first.get("loc", [])),
+            first_error_msg=first.get("msg"),
+        )
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid sync payload") from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Wearable history admission unavailable; retry") from exc
