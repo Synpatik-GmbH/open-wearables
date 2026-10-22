@@ -140,7 +140,7 @@ class DataSourceRepository(
 
         identities_list = list(identities)
 
-        from sqlalchemy import or_
+        from sqlalchemy import or_  # noqa: PLC0415
 
         conditions = []
         for user_id, device_model, source in identities_list:

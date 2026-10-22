@@ -119,11 +119,11 @@ def oauth_callback(
         caps = strategy.capabilities
         if caps.webhook_callback:
             # this code is going to be removed later, so leave inner imports heres
-            from app.integrations.celery.tasks import start_garmin_full_backfill
+            from app.integrations.celery.tasks import start_garmin_full_backfill  # noqa: PLC0415
 
             start_garmin_full_backfill.delay(str(oauth_state.user_id))
         elif caps.rest_pull:
-            from app.integrations.celery.tasks import sync_vendor_data
+            from app.integrations.celery.tasks import sync_vendor_data  # noqa: PLC0415
 
             now = datetime.now(timezone.utc)
             start_date = (now - timedelta(days=90)).isoformat()

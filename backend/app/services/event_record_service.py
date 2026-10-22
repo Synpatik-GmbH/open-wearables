@@ -828,7 +828,7 @@ class EventRecordService(
         ``event_record_service`` singleton at load time. ``on_workout_created`` keys Svix
         idempotency on the record id, so even a duplicate schedule collapses to one delivery.
         """
-        from app.integrations.celery.tasks.finalize_workout_zones_task import finalize_workout_zones
+        from app.integrations.celery.tasks.finalize_workout_zones_task import finalize_workout_zones  # noqa: PLC0415
 
         finalize_workout_zones.apply_async(
             args=[str(record_id)],

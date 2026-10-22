@@ -241,7 +241,7 @@ class TestSensorBio247SaveRecoveryData:
         mock_ts.bulk_create_samples.assert_called_once()
         mock_hs.bulk_create.assert_called_once()
         scores = mock_hs.bulk_create.call_args[0][1]
-        from app.schemas.enums import HealthScoreCategory
+        from app.schemas.enums import HealthScoreCategory  # noqa: PLC0415
 
         assert len(scores) == 1
         assert scores[0].category == HealthScoreCategory.RECOVERY
@@ -639,7 +639,7 @@ class TestSensorBio247ScoresActivitySleepNormalization:
         assert result["activity_score"] == 97
         assert result["sleep_score"] == 99
         assert result["resting_heart_rate"] == 52.0
-        from datetime import datetime, timezone
+        from datetime import datetime, timezone  # noqa: PLC0415
 
         assert result["timestamp"] == datetime(2026, 3, 14, 0, 0, 0, tzinfo=timezone.utc)
 
@@ -672,7 +672,7 @@ class TestSensorBio247SaveRecoveryDataScores:
 
         assert counts == {"metrics_synced": 0, "scores_synced": 2}
         mock_hs.bulk_create.assert_called_once()
-        from app.schemas.enums import HealthScoreCategory
+        from app.schemas.enums import HealthScoreCategory  # noqa: PLC0415
 
         scores = mock_hs.bulk_create.call_args[0][1]
         categories = {s.category for s in scores}
@@ -697,7 +697,7 @@ class TestSensorBio247SaveRecoveryDataScores:
             counts = data_247.save_recovery_data(db, USER_ID, normalized)
 
         assert counts == {"metrics_synced": 0, "scores_synced": 2}
-        from app.schemas.enums import HealthScoreCategory
+        from app.schemas.enums import HealthScoreCategory  # noqa: PLC0415
 
         scores = mock_hs.bulk_create.call_args[0][1]
         categories = {s.category for s in scores}
@@ -727,7 +727,7 @@ class TestSensorBio247SaveRecoveryDataScores:
 
         assert counts == {"metrics_synced": 3, "scores_synced": 3}
         assert mock_hs.bulk_create.call_count == 1
-        from app.schemas.enums import HealthScoreCategory
+        from app.schemas.enums import HealthScoreCategory  # noqa: PLC0415
 
         scores = mock_hs.bulk_create.call_args[0][1]
         categories = {s.category for s in scores}
@@ -749,7 +749,7 @@ class TestSensorBio247SaveRecoveryDataScores:
             counts = data_247.save_recovery_data(db, USER_ID, normalized)
 
         assert counts == {"metrics_synced": 0, "scores_synced": 1}
-        from app.schemas.enums import HealthScoreCategory
+        from app.schemas.enums import HealthScoreCategory  # noqa: PLC0415
 
         scores = mock_hs.bulk_create.call_args[0][1]
         assert len(scores) == 1

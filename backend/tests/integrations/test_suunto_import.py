@@ -126,7 +126,7 @@ class TestSuuntoImport:
             "provider": "suunto",
             "redirect_uri": None,
         }
-        import json
+        import json  # noqa: PLC0415
 
         # Create a mock redis client
         mock_redis = MagicMock()
@@ -210,8 +210,8 @@ class TestSuuntoImport:
     def test_workout_type_mapping(self, suunto_strategy: SuuntoStrategy) -> None:
         """Should correctly map Suunto activity IDs to unified workout types."""
         # Arrange
-        from app.constants.workout_types.suunto import get_unified_workout_type
-        from app.schemas.enums import WorkoutType
+        from app.constants.workout_types.suunto import get_unified_workout_type  # noqa: PLC0415
+        from app.schemas.enums import WorkoutType  # noqa: PLC0415
 
         # Act & Assert
         assert get_unified_workout_type(1) == WorkoutType.RUNNING

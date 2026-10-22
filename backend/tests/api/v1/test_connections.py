@@ -231,7 +231,7 @@ class TestConnectionsEndpoints:
     def test_get_connections_nonexistent_user(self, client: TestClient, db: Session) -> None:
         """Test retrieving connections for a user that doesn't exist."""
         # Arrange
-        from uuid import uuid4
+        from uuid import uuid4  # noqa: PLC0415
 
         api_key = ApiKeyFactory()
         headers = api_key_headers(api_key.plain_key)
@@ -248,7 +248,7 @@ class TestConnectionsEndpoints:
     def test_get_connections_with_sync_metadata(self, client: TestClient, db: Session) -> None:
         """Test that connections include sync metadata."""
         # Arrange
-        from datetime import datetime, timezone
+        from datetime import datetime, timezone  # noqa: PLC0415
 
         user = UserFactory()
         last_synced = datetime(2025, 12, 15, 12, 0, 0, tzinfo=timezone.utc)
