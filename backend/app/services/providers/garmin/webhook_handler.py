@@ -196,9 +196,15 @@ class GarminWebhookHandler(BaseWebhookHandler):
         # --- data processing ---------------------------------------------
         act_result = self._process_activities(db, payload, errors, synced_user_ids, users_with_new_success, trace_id)
         blocked_users: set[str] = set()
-        well_result, retry_error = self._process_wellness(
-            db, payload, errors, synced_user_ids, users_with_new_success, blocked_users, trace_id
-        )
+        try:
+            well_result, retry_error = self._process_wellness(
+                db, payload, errors, synced_user_ids, users_with_new_success, blocked_users, trace_id
+            )
+        except WearableHistoryMetadataUnavailableError:
+            # A boundary rollback raised mid-wellness. Members marked earlier in this delivery
+            # are committed, and the mark fires once, so the retry would never chain them.
+            self._chain_backfills(users_with_new_success - blocked_users, trace_id)
+            raise
 
         # --- commit + update last_synced_at ------------------------------
         db.commit()

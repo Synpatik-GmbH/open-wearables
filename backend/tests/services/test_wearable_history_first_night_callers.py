@@ -464,3 +464,28 @@ def test_garmin_member_blocked_on_one_type_is_not_chained_by_another_and_lifecyc
         handler.process_payload(MagicMock(), {"epochs": [{}], "sleeps": [{}], "deregistrations": [{}]}, "trace")
     chained.assert_called_once_with({other}, "trace")
     lifecycle.assert_not_called()
+
+
+def test_garmin_boundary_rollback_still_chains_members_already_marked_in_the_delivery() -> None:
+    """The mark fires once: a member marked before the boundary raise must be chained now."""
+
+    marked, crossing = str(uuid4()), str(uuid4())
+
+    def wellness(_db: object, _repo: object, _svc: object, data_type: str, *_: object) -> dict:
+        if data_type == "epochs":
+            return {"processed": 1, "saved": 1, "succeeded_users": [marked], "blocked_users": [], "retry_error": None}
+        if data_type == "sleeps":
+            raise WearableHistoryMetadataUnavailableError("Wearable history boundary moved during the batch; retry")
+        return {"processed": 0, "saved": 0, "succeeded_users": [], "blocked_users": [], "retry_error": None}
+
+    handler = GarminWebhookHandler(MagicMock(), MagicMock())
+    with (
+        patch("app.services.providers.garmin.webhook_handler.process_wellness_items", side_effect=wellness),
+        patch("app.services.providers.garmin.webhook_handler.mark_type_success", return_value=True),
+        patch.object(handler, "_chain_backfills", return_value=[]) as chained,
+        patch.object(handler, "_process_lifecycle_events") as lifecycle,
+        pytest.raises(WearableHistoryMetadataUnavailableError),
+    ):
+        handler.process_payload(MagicMock(), {"epochs": [{}], "sleeps": [{"userId": crossing}]}, "trace")
+    chained.assert_called_once_with({marked}, "trace")
+    lifecycle.assert_not_called()
