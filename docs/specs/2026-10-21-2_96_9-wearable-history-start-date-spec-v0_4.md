@@ -4,6 +4,8 @@ Spec v0.4, Product Studio, 21 Oct 2026 (v0.1 to v0.3 the same day). Roadmap item
 Status: APPROVED, ready for build. All predicates ratified by Andrei on 21 Oct 2026. Data-protection rulings R-2026-10-21-a and R-2026-10-21-b decided by Andrei on 21 Oct 2026. Ships in the 30 Oct 2026 release, an exception to the release scope freeze (Andrei, 21 Oct 2026); the S12 deletion may follow, but must be live before any production source reaches its freeze (section 10).
 Source: Andrei's own account (Polar Loop Gen 2, account created 13 Oct 2026; he started wearing the device on 13 Oct 2026), his member export of 21 Oct 2026, the CC read-only diagnosis reports relayed 21 Oct 2026, and the build plan from the GPT-6.1 Sol session relayed 21 Oct 2026 (code read at adapter `ebcbf036` and Open Wearables `815a978b`, nothing run).
 
+Change after approval (Dragan, 22 Oct 2026, on Open Wearables #46): R2 exception for a first night that reaches Open Wearables only after the freeze (section 8, R2 row). All other predicates are as ratified on 21 Oct 2026.
+
 Changes from v0.3 (Andrei, 21 Oct 2026, on the Sol build plan):
 - S4 changed: a source's start date is provisional and recomputed as its nights arrive, then frozen. This removes the need to know when Apple's first history upload is complete.
 - S11 added: before the freeze, readings, baselines and prompts use only data on or after the provisional date.
