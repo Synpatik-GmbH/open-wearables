@@ -881,3 +881,22 @@ def test_baseline_reads_date_a_daytime_sleep_by_its_calendar_day_like_ingress(db
         for r in (after, before, night)
     ]
     assert read_event == [True, False, True]  # The SQL read rule these readers must agree with.
+
+
+def test_baseline_reads_date_a_workout_by_its_calendar_day_like_ingress(db: Session) -> None:
+    """Only sleep uses the night rule; an evening workout is not moved onto the next day."""
+
+    member = UserFactory()
+    connected = datetime.now(UTC) + timedelta(days=2)  # Provisional whatever the test clock reads.
+    source = WearableHistoryRepository().begin_source(db, member.id, "apple", connected)
+    source.start_date = source.connection_day - timedelta(days=5)
+    data_source = DataSourceFactory(user=member, provider="apple")
+    db.flush()
+    evening = datetime.combine(source.start_date - timedelta(days=1), datetime.min.time(), BERLIN).replace(hour=19)
+    workouts = [
+        EventRecordFactory(data_source=data_source, category="workout", start_datetime=start.astimezone(UTC))
+        for start in (evening, evening + timedelta(days=1))
+    ]
+    db.flush()
+    history = WearableHistoryReadRepository(db, member.id)
+    assert [history.event_eligible(w) for w in workouts] == [False, True]

@@ -53,10 +53,13 @@ class WearableHistoryReadRepository:
         if source is None:
             raise WearableHistoryMetadataUnavailableError("Baseline data source unavailable")
         first = self.cutoff(source)
-        day = (
+        # The ingress rule (event_date, wh_read_event): only a sleep is dated by its night.
+        night = (
             recorded_night_date(record.start_datetime, record.end_datetime, record.zone_offset)
-            or record.start_datetime.astimezone(BERLIN).date()
+            if record.category == "sleep"
+            else None
         )
+        day = night or record.start_datetime.astimezone(BERLIN).date()
         return first is None or day >= first
 
     def filter_series(
