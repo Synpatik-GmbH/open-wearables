@@ -184,11 +184,19 @@ def test_xml_sleep_with_an_apple_source_is_admitted_instead_of_raising(db: Sessi
     assert WearableHistoryIngressRepository(db).event_admitted(sleep) is True
 
 
-@pytest.mark.parametrize("failure", ["metadata"])
+@pytest.mark.parametrize("failure", ["metadata", "sql_boundary"])
 def test_oura_retriable_history_error_holds_the_pull_cursor(failure: str) -> None:
-    """Codex P1 on #46: a swallowed retry error let the cursor pass an acknowledged sample."""
+    """Codex P1 on #46: a swallowed retry error let the cursor pass an acknowledged sample.
 
-    error = WearableHistoryMetadataUnavailableError(failure)
+    sql_boundary: a save's own commit meets the deferred wh_ingress check after the freeze
+    instant; the whole type rolled back, so the cursor must not pass it either.
+    """
+
+    error: Exception = (
+        WearableHistoryMetadataUnavailableError(failure)
+        if failure == "metadata"
+        else IntegrityError("COMMIT", {}, _BoundaryRejectionError("commit rejected"))
+    )
     service = Oura247Data("oura", "https://provider.test", MagicMock())
     db = MagicMock()
     with patch.multiple(
@@ -204,7 +212,8 @@ def test_oura_retriable_history_error_holds_the_pull_cursor(failure: str) -> Non
         with patch.multiple(service, **saves):
             results = service.load_and_save_all(db, uuid4())
     assert isinstance(results["heart_rate"], DataTypeFailure)
-    assert results["heart_rate"].code == type(error).__name__
+    if failure == "metadata":
+        assert results["heart_rate"].code == type(error).__name__
     assert results["sleep"] == 0  # Ordinary types still report their counts.
 
 
