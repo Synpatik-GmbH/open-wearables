@@ -217,10 +217,10 @@ def test_purge_deletes_only_the_frozen_sources_prestart_rows(db: Session) -> Non
     assert WearableHistoryPurgeService().run(db).due == 0
 
 
-def sleep_state(night_start: datetime) -> SleepState:
+def sleep_state(night_start: datetime, provider: str = "apple") -> SleepState:
     return SleepState(
         uuid=str(uuid4()),
-        provider="apple",
+        provider=provider,
         zone_offset="+02:00",
         start_time=night_start,
         end_time=night_start + timedelta(hours=7),
@@ -242,6 +242,18 @@ def test_apple_sleep_state_is_cleared_only_when_its_night_is_prestart(db: Sessio
     assert run.completed == 2
     assert load_sleep_state(str(member.id)) is None
     assert load_sleep_state(str(later.id)) is not None
+
+
+@pytest.mark.parametrize(
+    ("provider", "cleared"), [("apple", True), ("apple_health_xml", True), ("samsung", False), (None, False)]
+)
+def test_only_the_purged_providers_sleep_state_is_cleared(db: Session, provider: str | None, cleared: bool) -> None:
+    """The Redis buffer is per member; it is the Apple source's only when the gate maps its provider there."""
+    member, *_ = seed(db)
+    save_sleep_state(str(member.id), sleep_state(at(27, 20), provider))  # pre-start night
+
+    assert WearableHistoryPurgeService().run(db).completed == 1
+    assert (load_sleep_state(str(member.id)) is None) == cleared
 
 
 @pytest.mark.parametrize("state", ["pending_import", "imported", "failed"])

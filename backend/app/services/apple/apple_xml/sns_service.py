@@ -2,6 +2,7 @@ import base64
 import json
 import re
 from logging import getLogger
+from urllib.parse import unquote_plus
 
 import httpx
 from cryptography.exceptions import InvalidSignature
@@ -178,7 +179,8 @@ class SNSService:
                 continue
 
             bucket_name = record["s3"]["bucket"]["name"]
-            object_key = record["s3"]["object"]["key"]
+            # S3 URL-encodes the key in event notifications; the object itself has the decoded key.
+            object_key = unquote_plus(record["s3"]["object"]["key"])
 
             object_key_parts = object_key.split("/")
             user_id = object_key_parts[0] if len(object_key_parts) >= 3 else None

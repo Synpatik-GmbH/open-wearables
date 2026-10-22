@@ -94,12 +94,24 @@ def test_a_completed_upload_is_tracked_once_and_only_for_a_known_member(db: Sess
     assert db.scalar(text("SELECT count(*) FROM xml_uploads WHERE object_key IN ('x/raw/b.xml','y/raw/c.xml')")) == 0
 
 
-def test_the_sns_trigger_tracks_the_upload_before_dispatching_it(db: Session) -> None:
+@pytest.mark.parametrize(
+    ("event_key", "name"),
+    [("a.xml", "a.xml"), ("f00d-%C3%9Cbung.xml", "f00d-Übung.xml"), ("my+export.xml", "my export.xml")],
+)
+def test_the_sns_trigger_tracks_the_upload_before_dispatching_it(db: Session, event_key: str, name: str) -> None:
+    """S3 URL-encodes the key in its event; the row and the import use the object's real key."""
     user_id = member(db, frozen=None)
-    key = f"{user_id}/raw/a.xml"
+    key = f"{user_id}/raw/{name}"
     notification = MagicMock(
         message=json.dumps(
-            {"Records": [{"eventSource": "aws:s3", "s3": {"bucket": {"name": BUCKET}, "object": {"key": key}}}]}
+            {
+                "Records": [
+                    {
+                        "eventSource": "aws:s3",
+                        "s3": {"bucket": {"name": BUCKET}, "object": {"key": f"{user_id}/raw/{event_key}"}},
+                    }
+                ]
+            }
         )
     )
     with (
@@ -108,7 +120,7 @@ def test_the_sns_trigger_tracks_the_upload_before_dispatching_it(db: Session) ->
         patch.object(sns_service.process_aws_upload, "delay") as delay,
     ):
         sns_service.SNSService()._process_s3_notification(notification)
-    delay.assert_called_once()
+    delay.assert_called_once_with(bucket_name=BUCKET, object_key=key, user_id=str(user_id))
     assert states(db, user_id) == {key: "pending_import"}
 
 
