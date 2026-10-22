@@ -16,7 +16,7 @@ from app.utils.wearable_history_ingress import (
     WearableHistoryMetadataUnavailableError,
 )
 
-_NIGHT_PHYSIOLOGY = frozenset(
+NIGHT_PHYSIOLOGY = frozenset(
     (
         "heart_rate",
         "heart_rate_variability_sdnn",
@@ -199,7 +199,7 @@ class WearableHistoryIngressRepository:
         """Fetch containing intervals once per frozen source and batch, before per-sample admission."""
         ranges: dict[tuple[UUID, str], tuple[datetime, datetime]] = {}
         for sample in samples:
-            if self.series_code(sample) not in _NIGHT_PHYSIOLOGY:
+            if self.series_code(sample) not in NIGHT_PHYSIOLOGY:
                 continue
             identity = self.identity(sample)
             if identity is None:
@@ -225,7 +225,7 @@ class WearableHistoryIngressRepository:
             return True
         instant = sample.recorded_at
         calendar = instant.astimezone(BERLIN).date()
-        if series in _NIGHT_PHYSIOLOGY:
+        if series in NIGHT_PHYSIOLOGY:
             sleeps = [*self._sleep_intervals(identity, instant, instant), *(intervals or [])]
             matching = [
                 r for r in sleeps if r.start_datetime <= instant <= r.end_datetime and self.identity(r) == identity

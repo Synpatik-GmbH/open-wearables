@@ -63,7 +63,13 @@ class WearableHistoryReadRepository:
         return first is None or day >= first
 
     def filter_series(
-        self, rows: list[tuple[DataPointSeries, DataSource]], start: datetime, end: datetime, *, weight: bool
+        self,
+        rows: list[tuple[DataPointSeries, DataSource]],
+        start: datetime,
+        end: datetime,
+        *,
+        weight: bool,
+        night_physiology: bool,
     ) -> list[tuple[datetime, float]]:
         if weight or not self.sources:
             return [(sample.recorded_at, float(sample.value)) for sample, _ in rows]
@@ -91,10 +97,14 @@ class WearableHistoryReadRepository:
         result = []
         for sample, source in rows:
             first = self.cutoff(source)
+            # As on ingress (wh_read_sample): only night physiology follows its containing night.
             matching = [
                 night
                 for provider, onset, wake, night in intervals
-                if provider == source.provider and onset <= sample.recorded_at <= wake and night is not None
+                if night_physiology
+                and provider == source.provider
+                and onset <= sample.recorded_at <= wake
+                and night is not None
             ]
             admitted = first is None or (
                 any(day >= first for day in matching)

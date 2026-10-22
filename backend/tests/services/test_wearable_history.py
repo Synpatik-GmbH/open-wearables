@@ -21,6 +21,7 @@ from app.models import (
     DataSource,
     EventRecord,
     HealthScore,
+    SeriesTypeDefinition,
     SleepDetails,
     WorkoutDetails,
 )
@@ -900,3 +901,33 @@ def test_baseline_reads_date_a_workout_by_its_calendar_day_like_ingress(db: Sess
     db.flush()
     history = WearableHistoryReadRepository(db, member.id)
     assert [history.event_eligible(w) for w in workouts] == [False, True]
+
+
+@pytest.mark.parametrize(("series", "kept"), [(SeriesType.heart_rate, True), (SeriesType.steps, False)])
+def test_series_reads_apply_the_night_rule_only_to_night_physiology(
+    db: Session, series: SeriesType, kept: bool
+) -> None:
+    """As on ingress (wh_read_sample): only the night-physiology families follow their night."""
+
+    member = UserFactory()
+    connected = datetime.now(UTC) + timedelta(days=2)  # Provisional whatever the test clock reads.
+    source = WearableHistoryRepository().begin_source(db, member.id, "apple", connected)
+    source.start_date = source.connection_day - timedelta(days=5)
+    data_source = DataSourceFactory(user=member, provider="apple")
+    onset = datetime.combine(source.start_date - timedelta(days=1), datetime.min.time(), BERLIN).replace(hour=22)
+    EventRecordFactory(
+        data_source=data_source,
+        category="sleep",
+        start_datetime=onset.astimezone(UTC),
+        end_datetime=(onset + timedelta(hours=8)).astimezone(UTC),
+    )
+    instant = (onset + timedelta(hours=1)).astimezone(UTC)  # 23:00 Berlin, inside the start-date night
+    definition = db.get(SeriesTypeDefinition, get_series_type_id(series))
+    assert definition is not None
+    assert definition.code == series.value
+    DataPointSeriesFactory(data_source=data_source, series_type=definition, recorded_at=instant, value=60)
+    db.flush()
+    rows = DataPointSeriesRepository(DataPointSeries).query_series(
+        db, member.id, get_series_type_id(series), instant - timedelta(hours=1), instant + timedelta(hours=1)
+    )
+    assert [t for t, _ in rows] == ([instant] if kept else [])

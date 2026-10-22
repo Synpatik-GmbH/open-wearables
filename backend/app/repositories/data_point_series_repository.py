@@ -46,7 +46,7 @@ from app.repositories.repositories import (
     timeline_key_column,
     utc_bucket_start,
 )
-from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
+from app.repositories.wearable_history_ingress_repository import NIGHT_PHYSIOLOGY, WearableHistoryIngressRepository
 from app.repositories.wearable_history_read_repository import WearableHistoryReadRepository
 from app.schemas.enums import (
     BUCKET_SIZES,
@@ -1612,9 +1612,11 @@ class DataPointSeriesRepository(
             .all()
         )
 
+        series = get_series_type_from_id(type_id).value
         return WearableHistoryReadRepository(db_session, user_id).filter_series(
             [(sample, source) for sample, source in results],
             start_dt,
             end_dt,
-            weight=get_series_type_from_id(type_id).value == "weight",
+            weight=series == "weight",
+            night_physiology=series in NIGHT_PHYSIOLOGY,
         )
