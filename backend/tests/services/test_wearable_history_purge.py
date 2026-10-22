@@ -269,8 +269,9 @@ def test_the_sleep_state_is_cleared_only_under_the_sleep_lock(db: Session) -> No
     finally:
         lock.release()
 
-    assert (run.completed, run.failed) == (0, 1)
-    assert history(db, member.id, "apple").purge_last_error == "sleep_state: SleepLockBusyError"
+    # A busy lock is ordinary contention: the source waits and records no error (D-03).
+    assert (run.completed, run.failed, run.waiting) == (0, 0, 1)
+    assert history(db, member.id, "apple").purge_last_error is None
     assert load_sleep_state(str(member.id)) is not None
     assert service.run(db).completed == 1
     assert load_sleep_state(str(member.id)) is None
