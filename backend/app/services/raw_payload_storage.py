@@ -15,7 +15,7 @@ Usage (one-liner at ingestion point):
 import json
 import logging
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -147,6 +147,41 @@ def delete_payload_from_s3(ref: str) -> None:
         _s3_client.delete_object(Bucket=bucket, Key=key)
     except Exception:
         logger.exception("Failed to delete payload from S3: %s", ref)
+
+
+# 2.96.9.2 D-02: copies are temporary. Raw payload and SDK copies share ``_s3_prefix``; FIT
+# files have their own. No copy of any member is kept longer than this.
+COPY_RETENTION = timedelta(days=7)
+
+
+def sweep_expired_copies(now: datetime | None = None) -> int:
+    """Delete every stored copy last modified more than ``COPY_RETENTION`` ago.
+
+    A failed deletion is logged and the sweep goes on; at the end it raises, so the
+    scheduled run shows as failed and the next one retries. A deployment without object
+    storage stores no copies.
+    """
+    if _s3_client is None or _s3_bucket is None:
+        return 0
+    cutoff = (now or datetime.now(UTC)) - COPY_RETENTION
+    deleted = 0
+    failed = 0
+    for prefix in (f"{_s3_prefix}/", "fit-files/"):
+        for page in _s3_client.get_paginator("list_objects_v2").paginate(Bucket=_s3_bucket, Prefix=prefix):
+            for item in page.get("Contents", []):
+                if item["LastModified"] >= cutoff:
+                    continue
+                try:
+                    _s3_client.delete_object(Bucket=_s3_bucket, Key=item["Key"])
+                    deleted += 1
+                except Exception as exc:
+                    failed += 1
+                    log_structured(
+                        logger, "error", "Expired copy deletion failed", key=item["Key"], error=type(exc).__name__
+                    )
+    if failed:
+        raise RuntimeError(f"{failed} of {deleted + failed} expired copies could not be deleted; retrying next run")
+    return deleted
 
 
 def _split_ref(ref: str) -> tuple[str, str]:

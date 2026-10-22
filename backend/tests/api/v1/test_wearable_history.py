@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -35,7 +36,14 @@ def test_source_metadata_is_api_key_only_and_is_scoped_to_the_member(client: Tes
     response = client.get(url, headers=api_key_headers(key.plain_key))
     assert response.status_code == 200
     assert [source["provider"] for source in response.json()] == ["polar"]
-    assert set(response.json()[0]) == {"provider", "connection_day", "start_date", "freeze_at"}
+    assert set(response.json()[0]) == {
+        "provider",
+        "connection_day",
+        "start_date",
+        "freeze_at",
+        "records_purged_at",
+        "purge_completed_at",
+    }
     application = ApplicationFactory(app_secret="history-api-scope-secret")
     token = client.post(
         f"/api/v1/users/{member.id}/token",
@@ -68,3 +76,22 @@ def test_first_sdk_upload_establishes_its_own_source_before_dispatch(
     source = WearableHistoryRepository().get(db, member.id, canonical)
     assert source is not None
     assert source.start_date == source.connection_day
+
+
+def test_source_metadata_carries_both_purge_timestamps(client: TestClient, db: Session) -> None:
+    """2.96.9.2 D-03: the adapter copies these into its mirror; null until each purge step is done."""
+    member = UserFactory()
+    repository = WearableHistoryRepository()
+    repository.begin_source(db, member.id, "polar")
+    repository.begin_source(db, member.id, "apple")
+    purged = repository.get(db, member.id, "apple")
+    assert purged is not None
+    purged.records_purged_at = datetime(2026, 11, 6, 9, tzinfo=UTC)
+    purged.purge_completed_at = datetime(2026, 11, 6, 9, 15, tzinfo=UTC)
+    db.flush()
+    key = ApiKeyFactory()
+    response = client.get(f"/api/v1/users/{member.id}/wearable-history-sources", headers=api_key_headers(key.plain_key))
+    sources = {source["provider"]: source for source in response.json()}
+    assert sources["apple"]["records_purged_at"] == "2026-11-06T09:00:00Z"
+    assert sources["apple"]["purge_completed_at"] == "2026-11-06T09:15:00Z"
+    assert (sources["polar"]["records_purged_at"], sources["polar"]["purge_completed_at"]) == (None, None)

@@ -88,6 +88,13 @@ def engine(_postgres_url: str) -> Any:
             "data_point_series_archive", "history_start_date"
         )
         migration.upgrade()
+        # 2.96.9.2: the purge-state migration builds on the table the migration above just made.
+        purge_path = migration_path.parent / "2026_10_21_2300-c4e1d2b7a9f3_wearable_history_purge_state.py"
+        purge_spec = importlib.util.spec_from_file_location("history_purge_schema", purge_path)
+        purge_migration = importlib.util.module_from_spec(purge_spec)
+        purge_spec.loader.exec_module(purge_migration)
+        Operations(MigrationContext.configure(connection)).drop_table("xml_uploads")
+        purge_migration.upgrade()
 
     # Seed series type definitions (these need to exist for foreign key constraints)
     with Session(bind=test_engine) as session:

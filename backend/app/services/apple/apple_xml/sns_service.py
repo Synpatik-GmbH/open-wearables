@@ -2,6 +2,7 @@ import base64
 import json
 import re
 from logging import getLogger
+from urllib.parse import unquote_plus
 
 import httpx
 from cryptography.exceptions import InvalidSignature
@@ -11,10 +12,12 @@ from cryptography.x509 import load_pem_x509_certificate
 from fastapi import status
 
 from app.config import settings
+from app.database import SessionLocal
 from app.integrations.celery.tasks.process_aws_upload_task import process_aws_upload
 from app.schemas.providers.apple.apple_xml import SNSNotification
 from app.schemas.responses.upload import UploadDataResponse
 from app.services.apple.apple_xml.aws_service import get_sns_client
+from app.services.apple.apple_xml.xml_upload_lifecycle import record_completed_upload
 from app.utils.structured_logging import log_structured
 
 logger = getLogger(__name__)
@@ -176,7 +179,8 @@ class SNSService:
                 continue
 
             bucket_name = record["s3"]["bucket"]["name"]
-            object_key = record["s3"]["object"]["key"]
+            # S3 URL-encodes the key in event notifications; the object itself has the decoded key.
+            object_key = unquote_plus(record["s3"]["object"]["key"])
 
             object_key_parts = object_key.split("/")
             user_id = object_key_parts[0] if len(object_key_parts) >= 3 else None
@@ -190,6 +194,9 @@ class SNSService:
                 )
                 continue
 
+            # 2.96.9.2 D-04: the upload is complete; track its file until it is deleted.
+            with SessionLocal() as db:
+                record_completed_upload(db, bucket_name, object_key, user_id)
             process_aws_upload.delay(
                 bucket_name=bucket_name,
                 object_key=object_key,

@@ -55,6 +55,16 @@ class WearableHistoryRepository:
             db.refresh(source, with_for_update=True)
         return source
 
+    def frozen_start_date(self, db: Session, user_id: UUID, provider: str) -> date | None:
+        """The source's start date once it is frozen; None while it is provisional or absent."""
+        return db.scalar(
+            select(WearableHistorySource.start_date).where(
+                WearableHistorySource.user_id == user_id,
+                WearableHistorySource.provider == provider,
+                WearableHistorySource.freeze_at <= func.clock_timestamp(),
+            )
+        )
+
     def list_sources(self, db: Session, user_id: UUID) -> list[WearableHistorySource]:
         return list(
             db.scalars(

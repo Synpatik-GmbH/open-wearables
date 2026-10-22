@@ -17,7 +17,9 @@ from app.schemas.sync_status import SyncScope, SyncSource, SyncStatus
 from app.services import event_record_service
 from app.services.apple.apple_xml.aws_service import get_s3_client
 from app.services.apple.apple_xml.multipart_upload_service import multipart_upload_service
+from app.services.apple.apple_xml.wearable_history_filter import PrestartSkipper
 from app.services.apple.apple_xml.xml_service import XMLService
+from app.services.apple.apple_xml.xml_upload_lifecycle import mark_import, record_completed_upload
 from app.services.sdk.sleep_service import handle_sleep_data
 from app.services.sync_status_service import (
     emit_sync_completed,
@@ -29,6 +31,8 @@ from app.services.timeseries_service import timeseries_service
 from app.services.user_service import user_service
 from app.utils.exceptions import ResourceNotFoundError
 from app.utils.sentry_helpers import log_and_capture_error
+from app.utils.structured_logging import log_structured
+from app.utils.wearable_history_ingress import PreStartDataRejectedError
 
 logger = getLogger(__name__)
 
@@ -146,6 +150,23 @@ def _as_uuid(user_id: str) -> UUID | None:
         return None
 
 
+def _mark_import(bucket_name: str, object_key: str, state: str) -> None:
+    """Record the import's outcome; a row left pending is failed by the beat task after a day."""
+    try:
+        with SessionLocal() as db:
+            mark_import(db, bucket_name, object_key, state)
+    except Exception as error:
+        log_structured(
+            logger,
+            "error",
+            "XML upload state not recorded",
+            provider="apple_xml",
+            object_key=object_key,
+            state=state,
+            error=type(error).__name__,
+        )
+
+
 def _run_import_task(
     task: Task,
     *,
@@ -188,9 +209,13 @@ def _run_import_task(
             and not _upload_completion_persisted(bucket_name, object_key, user_id)
         ):
             _ensure_upload_completed(bucket_name, object_key, upload_id, parts, user_id)
+            # 2.96.9.2 D-04: the upload is complete; track its file until it is deleted.
+            with SessionLocal() as db:
+                record_completed_upload(db, bucket_name, object_key, user_id)
             _store_upload_completion(bucket_name, object_key, user_id)
         result = _process_aws_upload(bucket_name, object_key, user_id)
         _store_completed_import(bucket_name, object_key, user_id, result)
+        _mark_import(bucket_name, object_key, "imported")
         if user_uuid is not None:
             emit_sync_completed(
                 user_uuid,
@@ -210,6 +235,7 @@ def _run_import_task(
             raise task.retry(exc=exc, countdown=min(10 * (2**task.request.retries), 300)) from exc
 
         _release_import_claim(bucket_name, object_key, user_id, run_id)
+        _mark_import(bucket_name, object_key, "failed")
         if user_uuid is not None:
             emit_sync_failed(
                 user_uuid,
@@ -256,7 +282,7 @@ def _process_aws_upload(bucket_name: str, object_key: str, user_id: str) -> dict
         response: dict[str, Any] = s3_client.get_object(Bucket=bucket_name, Key=object_key)
         body: BinaryIO = response["Body"]
         try:
-            _import_xml_data(db, body, user_id)
+            skipped_prestart = _import_xml_data(db, body, user_id)
         except Exception:
             db.rollback()
             raise
@@ -269,6 +295,7 @@ def _process_aws_upload(bucket_name: str, object_key: str, user_id: str) -> dict
             "user_id": user_id,
             "status": "success",
             "message": "Import completed successfully",
+            "skipped_prestart": str(skipped_prestart),
         }
 
 
@@ -354,7 +381,7 @@ def complete_and_process_aws_upload(
     )
 
 
-def _import_xml_data(db: Session, xml_source: str | Path | BinaryIO, user_id: str) -> None:
+def _import_xml_data(db: Session, xml_source: str | Path | BinaryIO, user_id: str) -> int:
     """
     Parse XML file and import data to database using XMLExporter.
 
@@ -366,7 +393,13 @@ def _import_xml_data(db: Session, xml_source: str | Path | BinaryIO, user_id: st
     normalized_source = Path(xml_source) if isinstance(xml_source, str) else xml_source
     xml_service = XMLService(normalized_source, getLogger(__name__))
 
+    skipper = PrestartSkipper.for_member(db, user_id)
     for time_series_records, workouts, sync_request in xml_service.parse_xml(user_id):
+        skipper.refresh(db)
+        # 2.96.9.2 D-04: after the Apple freeze, pre-start records never leave the upload file.
+        time_series_records = skipper.samples(time_series_records)
+        workouts = skipper.workouts(workouts)
+        sync_request = skipper.sleep(sync_request)
         for record, detail in workouts:
             created_record = event_record_service.create(db, record)
             detail_for_record = detail.model_copy(update={"record_id": created_record.id})
@@ -375,4 +408,9 @@ def _import_xml_data(db: Session, xml_source: str | Path | BinaryIO, user_id: st
             timeseries_service.bulk_create_samples(db, time_series_records)
             db.commit()
         if sync_request and sync_request.data.sleep:
-            handle_sleep_data(db, sync_request, user_id)
+            try:
+                handle_sleep_data(db, sync_request, user_id)
+            except PreStartDataRejectedError:
+                if not skipper.rejected_sleep_batch(db, len(sync_request.data.sleep)):
+                    raise
+    return skipper.skipped
