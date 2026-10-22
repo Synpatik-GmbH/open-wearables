@@ -311,7 +311,6 @@ def handle_sleep_data(
             lock.release()
 
     # import not at module level in order to avoid circular import
-    # Import cycle: finalize_stale_sleep_task imports this module at load.
     from app.integrations.celery.tasks.finalize_stale_sleep_task import finalize_stale_sleeps  # noqa: PLC0415
 
     # Dispatch the stale-sleep task so sessions that have gone quiet (including
