@@ -6,6 +6,7 @@ each decided against the state before any change. D-03: that transaction sets
 when every temporary store is confirmed too. Failures are recorded and retried every run.
 """
 
+import contextlib
 from dataclasses import dataclass
 from logging import getLogger
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
+from app.integrations.redis_client import get_redis_client
 from app.models.wearable_history_source import WearableHistorySource
 from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.repositories.wearable_history_purge_repository import WearableHistoryPurgeRepository
@@ -20,6 +22,7 @@ from app.services.apple.apple_xml.aws_service import get_s3_client
 from app.services.apple.apple_xml.xml_upload_lifecycle import member_has_incomplete_upload
 from app.services.sdk.sleep_service import delete_sleep_state, load_sleep_state
 from app.services.sdk.sleep_stages import normalized_sleep_window
+from app.utils.exceptions import SleepLockBusyError
 from app.utils.structured_logging import log_structured
 from app.utils.wearable_history_clock import BERLIN, recorded_night_date
 
@@ -51,20 +54,28 @@ class WearableHistoryPurgeService:
         """D-02: the Apple sleep buffer, when the night it would record is before the start date.
 
         The Redis key is per member, so the buffer is this source's only when the ingress gate
-        attributes its provider to it.
+        attributes its provider to it. It is read and deleted under the lock handle_sleep_data
+        holds while it rewrites the buffer; a busy lock fails this step and the next run retries.
         """
-        state = load_sleep_state(str(source.user_id))
-        if state is None:
-            return
-        owner = WearableHistoryIngressRepository(db).identity(
-            SimpleNamespace(user_id=source.user_id, provider=state.provider)
-        )
-        if owner != (source.user_id, source.provider):
-            return
-        start, end = normalized_sleep_window(state.stages, state.start_time, state.end_time)
-        night = recorded_night_date(start, end, state.zone_offset) or start.astimezone(BERLIN).date()
-        if night < source.start_date:
-            delete_sleep_state(str(source.user_id))
+        lock = get_redis_client().lock(f"sleep:lock:{source.user_id}", timeout=30, blocking_timeout=1)
+        if not lock.acquire():
+            raise SleepLockBusyError()
+        try:
+            state = load_sleep_state(str(source.user_id))
+            if state is None:
+                return
+            owner = WearableHistoryIngressRepository(db).identity(
+                SimpleNamespace(user_id=source.user_id, provider=state.provider)
+            )
+            if owner != (source.user_id, source.provider):
+                return
+            start, end = normalized_sleep_window(state.stages, state.start_time, state.end_time)
+            night = recorded_night_date(start, end, state.zone_offset) or start.astimezone(BERLIN).date()
+            if night < source.start_date:
+                delete_sleep_state(str(source.user_id))
+        finally:
+            with contextlib.suppress(Exception):
+                lock.release()
 
     def uploads_waiting(self, db: Session, member: UUID) -> bool:
         """D-03: an Apple source completes only once no upload file of the member is left."""

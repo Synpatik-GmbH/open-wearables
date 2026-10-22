@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.integrations.celery.core import create_celery
 from app.integrations.celery.tasks.wearable_history_purge_task import purge_frozen_sources_task
+from app.integrations.redis_client import get_redis_client
 from app.models import (
     DataPointSeries,
     DataPointSeriesArchive,
@@ -254,6 +255,25 @@ def test_only_the_purged_providers_sleep_state_is_cleared(db: Session, provider:
 
     assert WearableHistoryPurgeService().run(db).completed == 1
     assert (load_sleep_state(str(member.id)) is None) == cleared
+
+
+def test_the_sleep_state_is_cleared_only_under_the_sleep_lock(db: Session) -> None:
+    """handle_sleep_data rewrites the buffer under sleep:lock:{member}; the purge waits its turn."""
+    member, *_ = seed(db)
+    save_sleep_state(str(member.id), sleep_state(at(27, 20)))  # pre-start night
+    service = WearableHistoryPurgeService()
+    lock = get_redis_client().lock(f"sleep:lock:{member.id}", timeout=30)
+    assert lock.acquire(blocking=False)
+    try:
+        run = service.run(db)
+    finally:
+        lock.release()
+
+    assert (run.completed, run.failed) == (0, 1)
+    assert history(db, member.id, "apple").purge_last_error == "sleep_state: SleepLockBusyError"
+    assert load_sleep_state(str(member.id)) is not None
+    assert service.run(db).completed == 1
+    assert load_sleep_state(str(member.id)) is None
 
 
 @pytest.mark.parametrize("state", ["pending_import", "imported", "failed"])
