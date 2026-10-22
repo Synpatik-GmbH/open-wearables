@@ -108,10 +108,7 @@ class WearableHistoryReadRepository:
             matching = [
                 night
                 for provider, onset, wake, night in intervals
-                if night_physiology
-                and provider == source.provider
-                and onset <= sample.recorded_at <= wake
-                and night is not None
+                if provider == source.provider and onset <= sample.recorded_at <= wake and night is not None
             ]
             admitted = first is None or (
                 any(day >= first for day in matching)

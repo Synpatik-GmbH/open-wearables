@@ -108,7 +108,7 @@ def sync_sdk_data(
         log_structured(
             logger,
             "warning",
-            f"{provider.capitalize()} SDK payload validation failed",
+            "SDK payload validation failed",
             provider=provider,
             action=f"{provider}_sdk_validation_failed",
             user_id=user_id,
