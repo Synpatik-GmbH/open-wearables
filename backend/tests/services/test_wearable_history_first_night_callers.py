@@ -22,7 +22,6 @@ from app.services.providers.garmin.data_247 import Garmin247Data
 from app.services.providers.garmin.webhook_handler import GarminWebhookHandler
 from app.services.providers.oura.data_247 import Oura247Data
 from app.utils.wearable_history_ingress import (
-    FirstNightAssociationUnavailableError,
     WearableHistoryMetadataUnavailableError,
 )
 from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectionFactory, UserFactory
@@ -157,7 +156,7 @@ def test_garmin_unresolved_sample_is_dropped_without_a_task_retry_and_kept_after
         patch("app.services.providers.garmin.handlers.wellness.emit_sync_completed"),
         patch("app.services.providers.garmin.webhook_handler.mark_type_success", return_value=False),
         patch.object(
-            process_webhook_push, "retry", side_effect=FirstNightAssociationUnavailableError("task retry")
+            process_webhook_push, "retry", side_effect=WearableHistoryMetadataUnavailableError("task retry")
         ) as retry,
     ):
         # A pre-start sample with no stored night is dropped; the delivery never retries.
@@ -221,9 +220,7 @@ def test_garmin_parent_resolution_does_not_cross_a_persisted_namespace(db: Sessi
     assert repo.find_persisted_for_creator(db, exact).id == sibling.id
 
 
-@pytest.mark.parametrize(
-    "failure", [FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError, RuntimeError]
-)
+@pytest.mark.parametrize("failure", [WearableHistoryMetadataUnavailableError, RuntimeError])
 def test_garmin_task_retries_history_failures_but_preserves_ordinary_error_handling(
     db: Session, failure: type[RuntimeError]
 ) -> None:
@@ -449,7 +446,7 @@ def test_garmin_member_blocked_on_one_type_is_not_chained_by_another_and_lifecyc
             "saved": 1,
             "succeeded_users": [other],
             "blocked_users": [blocked],
-            "retry_error": FirstNightAssociationUnavailableError("first night"),
+            "retry_error": WearableHistoryMetadataUnavailableError("blocked member"),
         },
         "sleeps": {"processed": 1, "saved": 1, "succeeded_users": [blocked], "blocked_users": [], "retry_error": None},
     }
@@ -462,7 +459,7 @@ def test_garmin_member_blocked_on_one_type_is_not_chained_by_another_and_lifecyc
         patch("app.services.providers.garmin.webhook_handler.mark_type_success", return_value=True),
         patch.object(handler, "_chain_backfills", return_value=[]) as chained,
         patch.object(handler, "_process_lifecycle_events") as lifecycle,
-        pytest.raises(FirstNightAssociationUnavailableError),
+        pytest.raises(WearableHistoryMetadataUnavailableError),
     ):
         handler.process_payload(MagicMock(), {"epochs": [{}], "sleeps": [{}], "deregistrations": [{}]}, "trace")
     chained.assert_called_once_with({other}, "trace")

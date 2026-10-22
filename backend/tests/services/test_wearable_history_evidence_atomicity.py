@@ -22,7 +22,6 @@ from app.schemas.model_crud.activities import EventRecordCreate, TimeSeriesSampl
 from app.schemas.sync_status import DataTypeFailure
 from app.services.providers.oura.data_247 import Oura247Data
 from app.utils.wearable_history_ingress import (
-    FirstNightAssociationUnavailableError,
     WearableHistoryMetadataUnavailableError,
 )
 from tests.factories import DataSourceFactory, UserConnectionFactory, UserFactory
@@ -185,15 +184,11 @@ def test_xml_sleep_with_an_apple_source_is_admitted_instead_of_raising(db: Sessi
     assert WearableHistoryIngressRepository(db).event_admitted(sleep) is True
 
 
-@pytest.mark.parametrize("failure", ["first_night", "metadata"])
+@pytest.mark.parametrize("failure", ["metadata"])
 def test_oura_retriable_history_error_holds_the_pull_cursor(failure: str) -> None:
     """Codex P1 on #46: a swallowed retry error let the cursor pass an acknowledged sample."""
 
-    error = (
-        FirstNightAssociationUnavailableError("first night")
-        if failure == "first_night"
-        else WearableHistoryMetadataUnavailableError("metadata")
-    )
+    error = WearableHistoryMetadataUnavailableError(failure)
     service = Oura247Data("oura", "https://provider.test", MagicMock())
     db = MagicMock()
     with patch.multiple(
@@ -223,12 +218,11 @@ class _BoundaryRejectionError(Exception):
     diag = _BoundaryDiag()
 
 
-@pytest.mark.parametrize("failure", ["first_night", "metadata", "sql_boundary"])
+@pytest.mark.parametrize("failure", ["metadata", "sql_boundary"])
 def test_oura_sleep_history_error_inside_save_reaches_the_cursor_classifier(failure: str) -> None:
     """Codex P1 on #46 at 8546b1ae: save_sleep_data's own catch swallowed the retriable error."""
 
     error = {
-        "first_night": FirstNightAssociationUnavailableError("first night"),
         "metadata": WearableHistoryMetadataUnavailableError("metadata"),
         "sql_boundary": _BoundaryRejectionError("commit rejected"),
     }[failure]

@@ -38,7 +38,6 @@ from app.services.providers.templates.base_webhook_handler import BaseWebhookHan
 from app.services.raw_payload_storage import store_raw_payload
 from app.utils.structured_logging import log_structured
 from app.utils.wearable_history_ingress import (
-    FirstNightAssociationUnavailableError,
     WearableHistoryMetadataUnavailableError,
 )
 
@@ -281,9 +280,9 @@ class GarminWebhookHandler(BaseWebhookHandler):
         users_with_new_success: set[str],
         blocked_users: set[str],
         request_trace_id: str,
-    ) -> tuple[dict[str, Any], FirstNightAssociationUnavailableError | WearableHistoryMetadataUnavailableError | None]:
+    ) -> tuple[dict[str, Any], WearableHistoryMetadataUnavailableError | None]:
         wellness_results: dict[str, Any] = {}
-        retry_error: FirstNightAssociationUnavailableError | WearableHistoryMetadataUnavailableError | None = None
+        retry_error: WearableHistoryMetadataUnavailableError | None = None
 
         for data_type in WELLNESS_TYPES:
             if not payload.get(data_type):
@@ -310,8 +309,8 @@ class GarminWebhookHandler(BaseWebhookHandler):
                 synced_user_ids,
                 request_trace_id,
             )
-            # Finish sibling types so a sleep in this payload can supply proof
-            # before the existing task retry redelivers its earlier samples.
+            # Finish sibling types before the existing task retry redelivers the blocked
+            # member's items.
             retry_error = retry_error or result["retry_error"]
             blocked_users.update(result["blocked_users"])
             wellness_results[data_type] = {"processed": result["processed"], "saved": result["saved"]}

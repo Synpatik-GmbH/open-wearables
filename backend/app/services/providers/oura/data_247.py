@@ -50,7 +50,6 @@ from app.services.timeseries_service import timeseries_service
 from app.utils.dates import offset_to_iso, parse_iso_datetime, to_rfc3339
 from app.utils.structured_logging import LogContext, log_structured
 from app.utils.wearable_history_ingress import (
-    FirstNightAssociationUnavailableError,
     WearableHistoryMetadataUnavailableError,
     raise_if_history_retriable,
 )
@@ -1380,9 +1379,7 @@ class Oura247Data(Base247DataTemplate):
                 db.rollback()
                 # A retriable history error holds the cursor, so the next pull asks for this
                 # span again; any other failure keeps the existing "nothing saved" result.
-                retriable = isinstance(
-                    e, (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError)
-                )
+                retriable = isinstance(e, WearableHistoryMetadataUnavailableError)
                 results[data_type] = DataTypeFailure(code=error_code(e) or UNKNOWN) if retriable else 0
                 log_structured(
                     self.logger,

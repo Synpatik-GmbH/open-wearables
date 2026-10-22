@@ -9,10 +9,6 @@ class WearableHistoryMetadataUnavailableError(RuntimeError):
     pass
 
 
-class FirstNightAssociationUnavailableError(RuntimeError):
-    pass
-
-
 # The deferred wh_ingress checks (migration a29691004b01). A batch that passed the
 # Python gate can still meet one at flush or commit when the freeze or a source row
 # moves underneath it; the whole batch is rolled back, so it must be redelivered.
@@ -46,7 +42,7 @@ def raise_if_history_retriable(exc: BaseException) -> None:
     flush or commit becomes ``WearableHistoryMetadataUnavailableError``. Anything else
     returns, and the catch keeps its existing handling.
     """
-    if isinstance(exc, (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError)):
+    if isinstance(exc, WearableHistoryMetadataUnavailableError):
         raise exc
     if is_history_boundary_failure(exc):
         raise WearableHistoryMetadataUnavailableError(

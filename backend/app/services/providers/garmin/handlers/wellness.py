@@ -16,7 +16,6 @@ from app.services.providers.garmin.data_247 import Garmin247Data
 from app.services.sync_status_service import emit_sync_completed, new_run_id
 from app.utils.structured_logging import log_structured
 from app.utils.wearable_history_ingress import (
-    FirstNightAssociationUnavailableError,
     WearableHistoryMetadataUnavailableError,
     is_history_boundary_failure,
 )
@@ -94,7 +93,7 @@ def process_wellness_items(
     succeeded_users: list[str] = []
     blocked_users: list[str] = []
 
-    retry_error: FirstNightAssociationUnavailableError | WearableHistoryMetadataUnavailableError | None = None
+    retry_error: WearableHistoryMetadataUnavailableError | None = None
     db.commit()  # Earlier payload work is not this loop's to roll back.
     for uid, items in user_items.items():
         trace_id = get_trace_id(uid) or request_trace_id
@@ -134,7 +133,7 @@ def process_wellness_items(
                     "items": len(items),
                 },
             )
-        except (FirstNightAssociationUnavailableError, WearableHistoryMetadataUnavailableError) as exc:
+        except WearableHistoryMetadataUnavailableError as exc:
             # Raised by the gate before this member's writes. A blocked profile must not
             # consume the shared account's other profiles, and it is never chained.
             retry_error = retry_error or exc
