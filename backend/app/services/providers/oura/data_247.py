@@ -50,8 +50,7 @@ from app.services.timeseries_service import timeseries_service
 from app.utils.dates import offset_to_iso, parse_iso_datetime, to_rfc3339
 from app.utils.structured_logging import LogContext, log_structured
 from app.utils.wearable_history_ingress import (
-    WearableHistoryMetadataUnavailableError,
-    is_history_boundary_failure,
+    is_history_retriable,
     raise_if_history_retriable,
 )
 
@@ -1382,7 +1381,7 @@ class Oura247Data(Base247DataTemplate):
                 # span again; any other failure keeps the existing "nothing saved" result.
                 # A wh_ingress rejection met at a save's own commit (the freeze passed mid-pull)
                 # rolled the whole type back, so it holds the cursor too.
-                retriable = isinstance(e, WearableHistoryMetadataUnavailableError) or is_history_boundary_failure(e)
+                retriable = is_history_retriable(e)
                 results[data_type] = DataTypeFailure(code=error_code(e) or UNKNOWN) if retriable else 0
                 log_structured(
                     self.logger,

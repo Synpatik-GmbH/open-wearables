@@ -82,7 +82,8 @@ ignore = [
 "app/api/routes/v*/*.py" = ["ANN201"] # missing-type-annotation
 "app/schemas/providers/garmin/*.py" = ["N815"]  # mixedCase from external API
 "app/schemas/providers/suunto/*.py" = ["N815"]  # mixedCase from external API
-# FORK: upstream files that already imported inside functions when PLC0415 was enabled.
+# FORK: files (upstream and fork) that already imported inside functions at f148f92a, when
+# PLC0415 was enabled; files this PR edits carry line-level noqa instead.
 "app/config.py" = ["PLC0415"]
 "app/constants/sdk_providers.py" = ["PLC0415"]
 "app/integrations/celery/tasks/garmin/backfill_timeout.py" = ["PLC0415"]

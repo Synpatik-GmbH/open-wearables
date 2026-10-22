@@ -35,6 +35,11 @@ def is_history_boundary_failure(exc: BaseException) -> bool:
     return False
 
 
+def is_history_retriable(exc: BaseException) -> bool:
+    """True for what a caller must retry rather than count as saved or swallow."""
+    return isinstance(exc, WearableHistoryMetadataUnavailableError) or is_history_boundary_failure(exc)
+
+
 def raise_if_history_retriable(exc: BaseException) -> None:
     """Re-raise what a per-item catch must not swallow, so the caller can retry.
 

@@ -73,6 +73,13 @@ class WearableHistoryReadRepository:
     ) -> list[tuple[datetime, float]]:
         if weight or not self.sources:
             return [(sample.recorded_at, float(sample.value)) for sample, _ in rows]
+        if not night_physiology:
+            # Dated by calendar day only, as on ingress; no containing night is needed.
+            return [
+                (sample.recorded_at, float(sample.value))
+                for sample, source in rows
+                if (first := self.cutoff(source)) is None or sample.recorded_at.astimezone(BERLIN).date() >= first
+            ]
         nights = list(
             self.db.execute(
                 select(EventRecord, DataSource)
