@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import event as sa_event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -22,6 +23,7 @@ from app.schemas.model_crud.activities import EventRecordCreate, TimeSeriesSampl
 from app.schemas.sync_status import DataTypeFailure
 from app.services.providers.oura.data_247 import Oura247Data
 from app.utils.wearable_history_ingress import (
+    PreStartDataRejectedError,
     WearableHistoryMetadataUnavailableError,
 )
 from tests.factories import DataSourceFactory, UserConnectionFactory, UserFactory
@@ -267,3 +269,75 @@ def test_oura_sleep_history_error_inside_save_reaches_the_cursor_classifier(fail
     assert isinstance(results["sleep"], DataTypeFailure)
     expected = WearableHistoryMetadataUnavailableError if failure == "sql_boundary" else type(error)
     assert results["sleep"].code == expected.__name__
+
+
+def frozen_garmin_record(db: Session) -> EventRecord:
+    """A sleep from before a frozen source's start date: the gate rejects it."""
+
+    member = UserFactory()
+    connected = datetime.now(UTC) - timedelta(days=20)
+    source = WearableHistoryRepository().begin_source(db, member.id, "garmin", connected)
+    source.freeze_at = datetime.now(UTC) - timedelta(seconds=1)
+    data_source = DataSourceFactory(user=member, provider="garmin", source="garmin")
+    db.commit()
+    night_start = datetime.combine(source.start_date - timedelta(days=3), datetime.min.time(), UTC) + timedelta(
+        hours=22
+    )
+    return EventRecord(
+        id=uuid4(),
+        data_source_id=data_source.id,
+        category="sleep",
+        type="sleep_session",
+        source_name="Garmin",
+        start_datetime=night_start,
+        end_datetime=night_start + timedelta(hours=8),
+        zone_offset="+00:00",
+    )
+
+
+@pytest.mark.parametrize("outcome", ["admitted", "rejected_after_write", "failed"])
+def test_a_rolled_back_item_leaves_no_after_commit_callback(db: Session, outcome: str) -> None:
+    """Codex P1 on #46 at 37cb004c: webhooks registered by a rolled-back item fired on a later commit.
+
+    A savepoint rollback does not remove an after_commit listener, so the gate drops the
+    listeners an item registered whenever that item's savepoint rolls back.
+    """
+
+    if outcome in ("admitted", "failed"):
+        member, data_source, connection_day = provisional_source(db)
+        night_start = datetime.combine(connection_day - timedelta(days=2), datetime.min.time(), UTC) + timedelta(
+            hours=22
+        )
+        record = EventRecord(
+            id=uuid4(),
+            data_source_id=data_source.id,
+            category="sleep",
+            type="sleep_session",
+            source_name="Garmin",
+            start_datetime=night_start,
+            end_datetime=night_start + timedelta(hours=8),
+            zone_offset="+00:00",
+        )
+    else:
+        record = frozen_garmin_record(db)
+    fired: list[str] = []
+
+    def write() -> None:
+        sa_event.listen(db, "after_commit", lambda _session: fired.append("webhook"), once=True)
+        if outcome == "rejected_after_write":
+            # The freeze crossed after the gate admitted the item: the deferred check rejects it.
+            raise PreStartDataRejectedError("Frozen source rejects pre-start data")
+        if outcome == "failed":
+            raise IntegrityError("INSERT INTO sleep_details", {}, Exception("null value in column"))
+
+    gate = WearableHistoryIngressRepository(db)
+    if outcome == "rejected_after_write":
+        with patch.object(gate, "filter_events", side_effect=lambda records: records):
+            assert gate.persist_event(record, write) is None
+    elif outcome == "failed":
+        with patch.object(gate, "filter_events", side_effect=lambda records: records), pytest.raises(IntegrityError):
+            gate.persist_event(record, write)
+    else:
+        gate.persist_event(record, write)
+    db.commit()  # A provider that carries on after the item still commits.
+    assert fired == (["webhook"] if outcome == "admitted" else [])

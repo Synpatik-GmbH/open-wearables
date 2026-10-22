@@ -40,6 +40,11 @@ class WearableHistoryIngressRepository:
         Callbacks must not commit: the gate commits only after the item and its
         deferred source constraints have succeeded, when the caller requests it.
         """
+        # after_commit listeners (outgoing webhooks, workout finalizers) live on the session, so a
+        # savepoint rollback does not remove them. SQLAlchemy has no public removal for a `once`
+        # listener, hence the collection's own deque, re-read after the item: the session's
+        # collection is replaced when its first listener is added.
+        registered_before = list(self._after_commit_listeners())
         try:
             with self.db.begin_nested():
                 # Night evidence is recorded inside the item's savepoint, so a sleep whose
@@ -53,6 +58,10 @@ class WearableHistoryIngressRepository:
                 # transaction; already-immediate callers are never weakened.
                 self.db.execute(text("SET CONSTRAINTS wh_ingress IMMEDIATE"))
         except Exception as exc:
+            # The item's savepoint rolled back, so a later commit must not announce its rows.
+            listeners = self._after_commit_listeners()
+            for listener in [fn for fn in listeners if fn not in registered_before]:
+                listeners.remove(listener)
             # Decorated repositories wrap SQL errors in HTTPException; inspect its cause.
             if not isinstance(exc, (PreStartDataRejectedError, IntegrityError)) and not isinstance(
                 exc.__cause__, IntegrityError
@@ -67,6 +76,10 @@ class WearableHistoryIngressRepository:
         if commit:
             self.db.commit()
         return result
+
+    def _after_commit_listeners(self) -> Any:
+        """The session's live after_commit listener deque (empty tuple before the first one)."""
+        return getattr(getattr(self.db.dispatch, "after_commit"), "listeners", ())
 
     def __init__(self, db: Session) -> None:
         self.db = db
