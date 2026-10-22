@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -79,10 +80,6 @@ def test_first_sdk_upload_establishes_its_own_source_before_dispatch(
 
 def test_source_metadata_carries_both_purge_timestamps(client: TestClient, db: Session) -> None:
     """2.96.9.2 D-03: the adapter copies these into its mirror; null until each purge step is done."""
-    from datetime import UTC, datetime
-
-    from app.repositories.wearable_history_repository import WearableHistoryRepository
-
     member = UserFactory()
     repository = WearableHistoryRepository()
     repository.begin_source(db, member.id, "polar")

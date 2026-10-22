@@ -1,5 +1,6 @@
 """2.96.9.2 D-01 and D-03: a frozen source's pre-start rows are purged, and nothing else."""
 
+from contextlib import nullcontext
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import patch
@@ -9,6 +10,8 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.integrations.celery.core import create_celery
+from app.integrations.celery.tasks.wearable_history_purge_task import purge_frozen_sources_task
 from app.models import (
     DataPointSeries,
     DataPointSeriesArchive,
@@ -304,11 +307,6 @@ def test_failure_after_the_records_commit_keeps_the_purge_and_retries_the_rest(d
 
 
 def test_the_purge_is_scheduled_every_fifteen_minutes_and_purges_due_sources(db: Session) -> None:
-    from contextlib import nullcontext
-
-    from app.integrations.celery.core import create_celery
-    from app.integrations.celery.tasks.wearable_history_purge_task import purge_frozen_sources_task
-
     entry = create_celery().conf.beat_schedule["purge-frozen-sources"]
     assert entry["task"] == purge_frozen_sources_task.name
     assert entry["schedule"].minute == set(range(0, 60, 15))

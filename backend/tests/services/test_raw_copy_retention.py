@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from app.integrations.celery.core import create_celery
+from app.integrations.celery.tasks.wearable_history_purge_task import sweep_expired_copies_task
 from app.services import raw_payload_storage
 
 NOW = datetime(2026, 11, 10, 12, tzinfo=UTC)
@@ -67,9 +69,6 @@ def test_sweep_is_a_no_op_without_object_storage() -> None:
 
 
 def test_the_sweep_is_scheduled_every_fifteen_minutes_and_runs_the_retention_sweep() -> None:
-    from app.integrations.celery.core import create_celery
-    from app.integrations.celery.tasks.wearable_history_purge_task import sweep_expired_copies_task
-
     entry = create_celery().conf.beat_schedule["sweep-expired-copies"]
     assert entry["task"] == sweep_expired_copies_task.name
     assert entry["schedule"].minute == set(range(0, 60, 15))

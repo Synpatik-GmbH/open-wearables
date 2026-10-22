@@ -11,9 +11,11 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.integrations.celery.core import create_celery
+from app.integrations.celery.tasks import process_aws_upload_task, wearable_history_purge_task
 from app.models import XmlUpload
 from app.repositories.wearable_history_repository import WearableHistoryRepository
-from app.services.apple.apple_xml import xml_upload_lifecycle
+from app.services.apple.apple_xml import sns_service, xml_upload_lifecycle
 from app.services.apple.apple_xml.xml_upload_lifecycle import (
     abort_stale_multipart_uploads,
     delete_processed_files,
@@ -93,8 +95,6 @@ def test_a_completed_upload_is_tracked_once_and_only_for_a_known_member(db: Sess
 
 
 def test_the_sns_trigger_tracks_the_upload_before_dispatching_it(db: Session) -> None:
-    from app.services.apple.apple_xml import sns_service as module
-
     user_id = member(db, frozen=None)
     key = f"{user_id}/raw/a.xml"
     notification = MagicMock(
@@ -103,19 +103,17 @@ def test_the_sns_trigger_tracks_the_upload_before_dispatching_it(db: Session) ->
         )
     )
     with (
-        patch.object(module.settings, "apple_xml_upload_completion_mode", "sns"),
-        patch.object(module, "SessionLocal", return_value=nullcontext(db)),
-        patch.object(module.process_aws_upload, "delay") as delay,
+        patch.object(sns_service.settings, "apple_xml_upload_completion_mode", "sns"),
+        patch.object(sns_service, "SessionLocal", return_value=nullcontext(db)),
+        patch.object(sns_service.process_aws_upload, "delay") as delay,
     ):
-        module.SNSService()._process_s3_notification(notification)
+        sns_service.SNSService()._process_s3_notification(notification)
     delay.assert_called_once()
     assert states(db, user_id) == {key: "pending_import"}
 
 
 @pytest.mark.parametrize("outcome", ["imported", "failed"])
 def test_the_client_completion_trigger_tracks_the_upload_and_its_import_outcome(db: Session, outcome: str) -> None:
-    from app.integrations.celery.tasks import process_aws_upload_task as module
-
     user_id = member(db, frozen=None)
     key = f"{user_id}/raw/a.xml"
     task = MagicMock()
@@ -131,19 +129,19 @@ def test_the_client_completion_trigger_tracks_the_upload_and_its_import_outcome(
         return {"status": "success"}
 
     with (
-        patch.object(module, "SessionLocal", side_effect=lambda: nullcontext(db)),
-        patch.object(module, "_claim_import", return_value=("claimed", None)),
-        patch.object(module, "_upload_completion_persisted", return_value=False),
-        patch.object(module, "_ensure_upload_completed"),
-        patch.object(module, "_store_upload_completion"),
-        patch.object(module, "_store_completed_import"),
-        patch.object(module, "_release_import_claim"),
-        patch.object(module, "_process_aws_upload", side_effect=process),
-        patch.object(module, "emit_sync_started"),
-        patch.object(module, "emit_sync_completed"),
-        patch.object(module, "emit_sync_failed"),
+        patch.object(process_aws_upload_task, "SessionLocal", side_effect=lambda: nullcontext(db)),
+        patch.object(process_aws_upload_task, "_claim_import", return_value=("claimed", None)),
+        patch.object(process_aws_upload_task, "_upload_completion_persisted", return_value=False),
+        patch.object(process_aws_upload_task, "_ensure_upload_completed"),
+        patch.object(process_aws_upload_task, "_store_upload_completion"),
+        patch.object(process_aws_upload_task, "_store_completed_import"),
+        patch.object(process_aws_upload_task, "_release_import_claim"),
+        patch.object(process_aws_upload_task, "_process_aws_upload", side_effect=process),
+        patch.object(process_aws_upload_task, "emit_sync_started"),
+        patch.object(process_aws_upload_task, "emit_sync_completed"),
+        patch.object(process_aws_upload_task, "emit_sync_failed"),
     ):
-        run = lambda: module._run_import_task(  # noqa: E731
+        run = lambda: process_aws_upload_task._run_import_task(  # noqa: E731
             task, bucket_name=BUCKET, object_key=key, user_id=str(user_id), upload_id="u", parts=[]
         )
         if outcome == "failed":
@@ -218,22 +216,19 @@ def test_the_apple_purge_waits_for_an_incomplete_multipart_upload(db: Session) -
 
 
 def test_the_cleanup_is_scheduled_every_fifteen_minutes_and_cleans(db: Session) -> None:
-    from app.integrations.celery.core import create_celery
-    from app.integrations.celery.tasks import wearable_history_purge_task as module
-
     entry = create_celery().conf.beat_schedule["clean-xml-uploads"]
-    assert entry["task"] == module.clean_xml_uploads_task.name
+    assert entry["task"] == wearable_history_purge_task.clean_xml_uploads_task.name
     assert entry["schedule"].minute == set(range(0, 60, 15))
     user_id = member(db, frozen=True)
     add(db, user_id, "imp", "imported")
     add(db, user_id, "old", "pending_import", timedelta(hours=25))
     s3 = FakeS3(uploads=[{"Key": "z/raw/x.xml", "UploadId": "1", "Initiated": NOW - timedelta(days=2)}])
     with (
-        patch.object(module, "SessionLocal", return_value=nullcontext(db)),
-        patch.object(module, "get_s3_client", return_value=s3),
+        patch.object(wearable_history_purge_task, "SessionLocal", return_value=nullcontext(db)),
+        patch.object(wearable_history_purge_task, "get_s3_client", return_value=s3),
         patch.object(xml_upload_lifecycle.settings, "aws_bucket_name", BUCKET),
     ):
-        assert module.clean_xml_uploads_task.run() == {
+        assert wearable_history_purge_task.clean_xml_uploads_task.run() == {
             "stale": 1,
             "deleted": 2,
             "failed": 0,

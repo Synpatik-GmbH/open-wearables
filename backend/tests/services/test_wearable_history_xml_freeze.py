@@ -6,8 +6,10 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.integrations.celery.tasks import process_aws_upload_task, process_xml_upload_task
 from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.schemas.enums import SeriesType
 from app.schemas.model_crud.activities import EventRecordCreate, TimeSeriesSampleCreate
@@ -123,13 +125,9 @@ def test_both_xml_paths_write_only_admitted_records_and_complete(db: Session, pa
     ):
         series.bulk_create_samples.side_effect = lambda _db, samples: written_samples.extend(samples)
         if path == "aws":
-            from app.integrations.celery.tasks.process_aws_upload_task import _import_xml_data
-
-            skipped = _import_xml_data(db, MagicMock(), user_id)
+            skipped = process_aws_upload_task._import_xml_data(db, MagicMock(), user_id)
         else:
-            from app.integrations.celery.tasks.process_xml_upload_task import _import_xml_data
-
-            skipped = _import_xml_data(db, "/tmp/unused.xml", user_id).skipped_prestart
+            skipped = process_xml_upload_task._import_xml_data(db, "/tmp/unused.xml", user_id).skipped_prestart
     assert [s.recorded_at.date() for s in written_samples] == [date(2026, 10, 1), date(2026, 9, 29)]
     assert [c.args[1].start_datetime.date() for c in events.create.call_args_list] == [date(2026, 10, 2)]
     assert [r.startDate for r in sleep_handler.call_args.args[1].data.sleep] == [datetime(2026, 9, 30, 20, tzinfo=UTC)]
@@ -138,8 +136,6 @@ def test_both_xml_paths_write_only_admitted_records_and_complete(db: Session, pa
 
 @pytest.mark.parametrize("path", ["aws", "direct"])
 def test_an_import_crossing_the_freeze_switches_at_its_next_chunk(db: Session, path: str) -> None:
-    from sqlalchemy import text
-
     user_id = frozen_member(db, frozen=False)
     module = (
         "app.integrations.celery.tasks.process_aws_upload_task"
@@ -167,12 +163,8 @@ def test_an_import_crossing_the_freeze_switches_at_its_next_chunk(db: Session, p
     ):
         series.bulk_create_samples.side_effect = lambda _db, samples: written.append(len(samples))
         if path == "aws":
-            from app.integrations.celery.tasks.process_aws_upload_task import _import_xml_data
-
-            skipped = _import_xml_data(db, MagicMock(), user_id)
+            skipped = process_aws_upload_task._import_xml_data(db, MagicMock(), user_id)
         else:
-            from app.integrations.celery.tasks.process_xml_upload_task import _import_xml_data
-
-            skipped = _import_xml_data(db, "/tmp/unused.xml", user_id).skipped_prestart
+            skipped = process_xml_upload_task._import_xml_data(db, "/tmp/unused.xml", user_id).skipped_prestart
     assert written == [4, 2]
     assert skipped == 4
