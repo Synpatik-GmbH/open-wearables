@@ -53,6 +53,9 @@ def upgrade() -> None:
             f"THEN 'null'::jsonb ELSE components - '{key}' END WHERE components ? '{key}'"
         )
     op.execute("ALTER TABLE health_score ENABLE TRIGGER wh_ingress")
+    # Alembic runs every pending migration in one transaction: hand the guard back as it was,
+    # checking at commit, for whatever runs after this.
+    op.execute("SET CONSTRAINTS wh_ingress DEFERRED")
 
 
 def downgrade() -> None:

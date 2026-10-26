@@ -191,3 +191,27 @@ def test_the_component_strip_runs_past_the_wearable_history_guard(db: Session, s
 
     stored = db.scalar(select(HealthScore.components).where(HealthScore.user_id == member.id))
     assert stored == {"resting_heart_rate": {"value": 52}}
+
+
+def test_the_wearable_history_guard_is_deferred_again_after_the_migration(db: Session) -> None:
+    """Alembic runs every pending migration in one transaction: a later one may write a row whose
+    proof follows later in that transaction, so the guard must be back to checking at commit."""
+    member = UserFactory()
+    db.flush()
+    source = WearableHistoryRepository().begin_source(db, member.id, "whoop")
+    source.freeze_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    data_source = DataSourceFactory(user=member, source="whoop", provider=ProviderName.WHOOP)
+    db.flush()
+
+    with Operations.context(MigrationContext.configure(db.connection())):
+        migration().upgrade()
+
+    # Pre-start for a frozen source: the database guard refuses it at commit, but not at the
+    # statement while it is deferred. Raw SQL, so only the database trigger is in play.
+    db.execute(
+        text(
+            "INSERT INTO data_point_series (id, data_source_id, recorded_at, value, series_type_definition_id) "
+            "VALUES (gen_random_uuid(), :source, now() - interval '90 days', 52, :metric)"
+        ),
+        {"source": data_source.id, "metric": get_series_type_id(SeriesType.resting_heart_rate)},
+    )
