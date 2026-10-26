@@ -10,6 +10,7 @@ import sentry_sdk
 from pydantic import ValidationError
 
 from app.constants.entry_source import get_unified_sdk_entry_source
+from app.constants.series_types.not_kept import drop_not_kept
 from app.constants.series_types.sdk import (
     WorkoutStatisticType,
     get_detail_field_from_workout_statistic_type,
@@ -332,7 +333,9 @@ class ImportService:
             details_to_insert = [details_by_id[rid] for rid in inserted_ids if rid in details_by_id]
             workouts_saved = len(inserted_ids)
 
-            # Bulk create the workout-embedded time series samples
+            # Bulk create the workout-embedded time series samples. FORK (R-2026-10-23-f,
+            # R-2026-10-26-d): a series never stored is neither saved nor counted nor reported.
+            time_series_samples = drop_not_kept(time_series_samples)
             if time_series_samples:
                 counts = self.timeseries_service.bulk_create_samples(db_session, time_series_samples)
                 records_saved += len(time_series_samples)
@@ -341,7 +344,7 @@ class ImportService:
                 types.update(sample.series_type.value for sample in time_series_samples)
 
         # Process time series samples (records) — the granular heart_rate trace lives here.
-        samples = self._build_statistic_bundles(request, user_id)
+        samples = drop_not_kept(self._build_statistic_bundles(request, user_id))
         if samples:
             counts = self.timeseries_service.bulk_create_samples(db_session, samples)
             records_saved += len(samples)
