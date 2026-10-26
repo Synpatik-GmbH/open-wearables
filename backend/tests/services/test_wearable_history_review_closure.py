@@ -224,8 +224,7 @@ def test_real_oura_loop_skips_a_frozen_item_without_starving_its_admitted_neighb
         SeriesType.resting_heart_rate,
         SeriesType.respiratory_rate,
         SeriesType.oxygen_saturation,
-        # skin_temperature is never stored (R-2026-10-23-f).
-        SeriesType.body_temperature,
+        # skin and body temperature are never stored (R-2026-10-23-f, R-2026-10-26-d).
     ],
 )
 def test_cross_midnight_daytime_nap_does_not_override_an_on_cutoff_samples_calendar_date(
@@ -450,7 +449,7 @@ def test_prefetch_range_expands_for_an_unprimed_persisted_first_night(db: Sessio
         "RESTING_HEART_RATE",
         "RESPIRATORY_RATE",
         "OXYGEN_SATURATION",
-        "HKQuantityTypeIdentifierAppleSleepingWristTemperature",
+        # AppleSleepingWristTemperature is body temperature, never stored (R-2026-10-26-d).
     ],
 )
 def test_unresolved_first_night_sdk_sample_is_dropped_then_kept_once_its_night_is_stored(
@@ -504,8 +503,7 @@ def test_unresolved_first_night_sdk_sample_is_dropped_then_kept_once_its_night_i
         "heart_rate",
         "heart_rate_variability_sdnn",
         "heart_rate_variability_rmssd",
-        # skin_temperature is never stored (R-2026-10-23-f).
-        "body_temperature",
+        # skin and body temperature are never stored (R-2026-10-23-f, R-2026-10-26-d).
         "resting_heart_rate",
         "respiratory_rate",
         "oxygen_saturation",

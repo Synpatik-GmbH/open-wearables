@@ -1,10 +1,12 @@
-"""FORK (Calibra ruling R-2026-10-23-f): delete the skin temperature already held.
+"""FORK (Calibra rulings R-2026-10-23-f, R-2026-10-26-d): delete the skin and body temperature held.
 
 Skin temperature is not kept: stored without a purpose and close to inferring a woman's cycle
-(DPO point 9). From this release no write stores it (``NOT_KEPT_SERIES``); this deletes what
-was stored before, from the live series and from the daily archive, for every member and
-provider, and the skin_temp_celsius component of WHOOP recovery scores. The codes are written
-out, not imported, so this migration means the same thing whatever the code later says.
+(DPO point 9); body temperature, from every source, goes with it. From this release no write
+stores either (``NOT_KEPT_SERIES``, ``NOT_KEPT_COMPONENTS``); this deletes what was stored
+before, from the live series and from the daily archive, for every member and provider, and
+the temperature components of health scores (WHOOP recovery's skin_temp_celsius, Oura
+readiness's body_temperature). The codes are written out, not imported, so this migration
+means the same thing whatever the code later says.
 
 Revision ID: 51fa8d7eba23
 Revises: c4e1d2b7a9f3
@@ -18,25 +20,26 @@ down_revision = "c4e1d2b7a9f3"
 branch_labels = None
 depends_on = None
 
-SKIN_TEMPERATURE_CODES = (
+TEMPERATURE_CODES = (
     "skin_temperature",
     "skin_temperature_deviation",
     "skin_temperature_trend_deviation",
     "garmin_skin_temperature",
+    "body_temperature",
 )
+TEMPERATURE_COMPONENTS = ("skin_temp_celsius", "body_temperature")
 
 
 def upgrade() -> None:
-    codes = ", ".join(f"'{code}'" for code in SKIN_TEMPERATURE_CODES)
+    codes = ", ".join(f"'{code}'" for code in TEMPERATURE_CODES)
     for table in ("data_point_series", "data_point_series_archive"):
         op.execute(
             f"DELETE FROM {table} WHERE series_type_definition_id IN "
             f"(SELECT id FROM series_type_definition WHERE code IN ({codes}))"
         )
-    # WHOOP's recovery score carried the night's skin temperature as a component.
-    op.execute(
-        "UPDATE health_score SET components = components - 'skin_temp_celsius' WHERE components ? 'skin_temp_celsius'"
-    )
+    # Health scores that carried a temperature as a component.
+    for key in TEMPERATURE_COMPONENTS:
+        op.execute(f"UPDATE health_score SET components = components - '{key}' WHERE components ? '{key}'")
 
 
 def downgrade() -> None:

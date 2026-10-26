@@ -6,6 +6,7 @@ from sqlalchemy import String, and_, asc, desc, func, tuple_
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
 
+from app.constants.series_types.not_kept import without_not_kept_components
 from app.database import DbSession
 from app.models import DataSource, HealthScore
 from app.repositories.repositories import CrudRepository
@@ -49,10 +50,15 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         results = query.order_by(desc(HealthScore.recorded_at)).offset(params.offset).limit(params.limit).all()
         return results, total_count
 
+    def create(self, db_session: DbSession, creator: HealthScoreCreate) -> HealthScore | None:
+        """FORK (R-2026-10-23-f, R-2026-10-26-d): no temperature component is stored."""
+        return super().create(db_session, without_not_kept_components(creator))
+
     def bulk_create(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> None:
         """Bulk insert health scores, doing nothing on conflict with the unique constraint."""
         gate = WearableHistoryIngressRepository(db_session)
-        creators = [creator for creator in creators if gate.score_admitted(creator)]
+        # FORK (R-2026-10-23-f, R-2026-10-26-d): no temperature component is stored.
+        creators = [without_not_kept_components(c) for c in creators if gate.score_admitted(c)]
         if not creators:
             return
 

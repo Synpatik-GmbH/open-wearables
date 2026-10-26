@@ -1,9 +1,11 @@
-"""FORK (Calibra ruling R-2026-10-23-f, on DPO point 9): skin temperature is not kept.
+"""FORK (Calibra rulings R-2026-10-23-f and R-2026-10-26-d): skin and body temperature are not kept.
 
-No skin-temperature series, from any provider, is stored or announced: not the night's value,
-not its deviation from the member's baseline, not its trend deviation, not Garmin's. Every
-write path into ``data_point_series`` drops them, and a batch that also carries other series
-keeps the rest.
+No skin-temperature series (the night's value, its deviation from the member's baseline, its
+trend deviation, Garmin's) and no body-temperature series (Polar core, Apple wrist and basal,
+Withings, Google Health), from any provider, is stored or announced. Every write path into
+``data_point_series`` drops them, and a batch that also carries other series keeps the rest.
+Neither is kept as a score component either. Environmental temperatures are not the member's
+and stay.
 """
 
 from collections.abc import Iterator
@@ -17,10 +19,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.constants.series_types.not_kept import NOT_KEPT_SERIES
-from app.models import DataPointSeries, DataSource, SeriesTypeDefinition
+from app.models import DataPointSeries, DataSource, HealthScore, SeriesTypeDefinition
 from app.repositories.data_point_series_repository import DataPointSeriesRepository
+from app.repositories.health_score_repository import HealthScoreRepository
 from app.schemas.enums import ProviderName, SeriesType
+from app.schemas.enums.health_score_category import HealthScoreCategory
 from app.schemas.model_crud.activities import TimeSeriesSampleCreate
+from app.schemas.model_crud.activities.health_score import HealthScoreCreate, ScoreComponent
 from app.services.timeseries_service import timeseries_service
 from tests.factories import UserFactory
 
@@ -31,7 +36,9 @@ SKIN = [
     SeriesType.skin_temperature_deviation,
     SeriesType.skin_temperature_trend_deviation,
     SeriesType.garmin_skin_temperature,
+    SeriesType.body_temperature,
 ]
+ENVIRONMENT = [SeriesType.water_temperature, SeriesType.weather_temperature, SeriesType.air_temperature]
 
 
 def _sample(user_id: Any, series: SeriesType, value: float) -> TimeSeriesSampleCreate:
@@ -77,9 +84,18 @@ def emitted() -> Iterator[list[dict]]:
         yield calls
 
 
-def test_the_not_kept_set_is_exactly_the_skin_temperature_series() -> None:
+def test_the_not_kept_set_is_every_temperature_series_but_the_environments() -> None:
     assert frozenset(SKIN) == NOT_KEPT_SERIES
-    assert {s for s in SeriesType if "skin_temp" in s.value} == set(SKIN)
+    assert {s for s in SeriesType if "temp" in s.value} == set(SKIN) | set(ENVIRONMENT)
+
+
+@pytest.mark.parametrize("series", ENVIRONMENT)
+def test_an_environmental_temperature_is_still_stored(db: Session, series: SeriesType) -> None:
+    user = UserFactory()
+
+    DataPointSeriesRepository(DataPointSeries).bulk_create(db, [_sample(user.id, series, 18.0)])
+
+    assert _stored(db, user.id) == [series.value]
 
 
 @pytest.mark.parametrize("series", SKIN)
@@ -123,3 +139,27 @@ def test_the_service_create_of_a_skin_sample_stores_nothing_and_does_not_raise(d
 
     assert timeseries_service.create(db, _sample(user.id, series, 33.6)) is None
     assert _stored(db, user.id) == []
+
+
+@pytest.mark.parametrize("path", ["bulk_create", "create"])
+@pytest.mark.parametrize("key", ["skin_temp_celsius", "body_temperature"])
+def test_a_health_score_keeps_its_other_components_and_no_temperature(db: Session, key: str, path: str) -> None:
+    user = UserFactory()
+    db.flush()
+    score = HealthScoreCreate(
+        id=uuid4(),
+        user_id=user.id,
+        provider=ProviderName.OURA,
+        category=HealthScoreCategory.READINESS,
+        value=80,
+        recorded_at=T0,
+        components={key: ScoreComponent(value=60), "hrv_balance": ScoreComponent(value=75)},
+    )
+    repo = HealthScoreRepository(HealthScore)
+    if path == "create":
+        repo.create(db, score)
+    else:
+        repo.bulk_create(db, [score])
+
+    stored = db.scalar(select(HealthScore.components).where(HealthScore.user_id == user.id))
+    assert set(stored or {}) == {"hrv_balance"}

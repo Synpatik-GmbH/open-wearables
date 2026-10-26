@@ -30,8 +30,9 @@ SKIN = [
     SeriesType.skin_temperature_deviation,
     SeriesType.skin_temperature_trend_deviation,
     SeriesType.garmin_skin_temperature,
+    SeriesType.body_temperature,
 ]
-KEPT = [SeriesType.resting_heart_rate, SeriesType.body_temperature]
+KEPT = [SeriesType.resting_heart_rate, SeriesType.weather_temperature]
 
 
 def migration() -> object:
@@ -89,12 +90,13 @@ def test_held_skin_temperature_is_deleted_from_the_series_and_the_archive_and_th
     assert _codes(db, DataPointSeriesArchive) == kept
 
 
-def test_a_held_recovery_score_loses_its_skin_temperature_component_and_keeps_the_rest(db: Session) -> None:
+def test_a_held_score_loses_its_temperature_components_and_keeps_the_rest(db: Session) -> None:
     member = UserFactory()
     db.flush()
     held = {"skin_temp_celsius": {"value": 33.6}, "resting_heart_rate": {"value": 52}}
+    oura = {"body_temperature": {"value": 60}, "hrv_balance": {"value": 75}}
     other = {"resting_heart_rate": {"value": 50}}
-    for day, components in enumerate((held, other, None)):
+    for day, components in enumerate((held, oura, other, None)):
         db.add(
             HealthScore(
                 id=uuid4(),
@@ -115,4 +117,5 @@ def test_a_held_recovery_score_loses_its_skin_temperature_component_and_keeps_th
     stored = sorted(
         (str(c) for (c,) in db.execute(select(HealthScore.components).where(HealthScore.user_id == member.id))),
     )
-    assert stored == sorted([str({"resting_heart_rate": {"value": 52}}), str(other), str(None)])
+    kept = [{"resting_heart_rate": {"value": 52}}, {"hrv_balance": {"value": 75}}, other, None]
+    assert stored == sorted(str(c) for c in kept)
