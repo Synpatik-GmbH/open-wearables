@@ -39,11 +39,20 @@ def upgrade() -> None:
         )
     # Health scores that carried a temperature as a component. A score left with none stores JSON
     # null, which is what the ORM writes for a score with no components, not an empty object.
+    # The wearable-history guard (wh_ingress, a29691004b01) checks every updated score and refuses
+    # one it would not admit today (pre-start for a frozen source, or a provider with no source
+    # beside a member's other sources). Removing a component only reduces what is held, so the
+    # guard is off for these statements alone, inside the migration's transaction. Checks already
+    # queued in this transaction are run first (they would run at commit anyway), because a table
+    # with pending trigger events cannot be altered.
+    op.execute("SET CONSTRAINTS wh_ingress IMMEDIATE")
+    op.execute("ALTER TABLE health_score DISABLE TRIGGER wh_ingress")
     for key in TEMPERATURE_COMPONENTS:
         op.execute(
             f"UPDATE health_score SET components = CASE WHEN components - '{key}' = '{{}}'::jsonb "
             f"THEN 'null'::jsonb ELSE components - '{key}' END WHERE components ? '{key}'"
         )
+    op.execute("ALTER TABLE health_score ENABLE TRIGGER wh_ingress")
 
 
 def downgrade() -> None:

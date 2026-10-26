@@ -11,12 +11,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.models import DataPointSeries, DataPointSeriesArchive, HealthScore, SeriesTypeDefinition
+from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
 from app.schemas.enums.aggregation_method import AggregationMethod
 from app.schemas.enums.health_score_category import HealthScoreCategory
@@ -156,3 +158,36 @@ def test_a_score_left_with_no_component_is_stored_as_a_new_write_stores_none(db:
         .all()
     )
     assert stored[0] == stored[1]
+
+
+@pytest.mark.parametrize("source_provider", ["whoop", "polar"])
+def test_the_component_strip_runs_past_the_wearable_history_guard(db: Session, source_provider: str) -> None:
+    """A held score the history guard would now refuse (pre-start for a frozen WHOOP source, or a
+    WHOOP score for a member whose only source is another provider) still loses its temperature.
+
+    Removing a component only reduces what is held, so the migration must not abort on the guard.
+    """
+    member = UserFactory()
+    db.flush()
+    db.add(
+        HealthScore(
+            id=uuid4(),
+            user_id=member.id,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.RECOVERY,
+            value=70,
+            recorded_at=datetime.now(timezone.utc) - timedelta(days=90),
+            components={"skin_temp_celsius": {"value": 34.0}, "resting_heart_rate": {"value": 52}},
+        )
+    )
+    db.flush()
+    db.execute(text("SET CONSTRAINTS wh_ingress IMMEDIATE"))
+    source = WearableHistoryRepository().begin_source(db, member.id, source_provider)
+    source.freeze_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    db.flush()
+
+    with Operations.context(MigrationContext.configure(db.connection())):
+        migration().upgrade()
+
+    stored = db.scalar(select(HealthScore.components).where(HealthScore.user_id == member.id))
+    assert stored == {"resting_heart_rate": {"value": 52}}
