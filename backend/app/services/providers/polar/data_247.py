@@ -121,9 +121,10 @@ POLAR_WINDOW_DAYS = 90
 # a type is fetched in full is set by pull_budget (spec R1, see _FULL_FORM_TYPES). Unchanged rows
 # are not re-emitted (emit_only_written). Per Polar AccessLink v3:
 # - activities accept a ``from`` up to 365 days back in 28-day ranges: the 90-day cap applies;
-# - SleepWise, body and skin temperature, SpO2 and wrist ECG serve "the last 28 days" with a
-#   28-day maximum range; continuous heart rate and cardio load document no older history,
-#   so they get the same 28 days. Widening one is a change to this table only.
+# - SleepWise, SpO2 and wrist ECG serve "the last 28 days" with a 28-day maximum range (so do
+#   body and skin temperature, which are not fetched: R-2026-10-23-f, R-2026-10-26-d);
+#   continuous heart rate and cardio load document no older history, so they get the same 28
+#   days. Widening one is a change to this table only.
 # Sleep and Nightly Recharge are not here: both are listed by Polar for its last 28 days
 # (``/sleep/available``, ``/nightly-recharge``) and filtered to POLAR_WINDOW_DAYS.
 _RANGE_WINDOW_DAYS: dict[str, int] = {
@@ -142,7 +143,7 @@ _RANGE_WINDOW_DAYS: dict[str, int] = {
 # FORK (2.96.6.1, spec R1, AC2, AC17): the data types pull_budget fetches in full at most once per
 # FULL_INTERVAL. Between full fetches a pull fetches the short form of sleep (the newest night
 # Polar lists, when it is not stored) and of daily activity (yesterday and today), and nothing
-# of the other eight. Nightly Recharge is one call for everything Polar serves, so it is fetched
+# of the other six. Nightly Recharge is one call for everything Polar serves, so it is fetched
 # whole on every pull (spec cause 8, AC11), as are workouts (one call, see PolarWorkouts).
 _FULL_FORM_TYPES: tuple[str, ...] = (
     "sleep",

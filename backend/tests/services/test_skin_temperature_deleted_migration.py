@@ -95,8 +95,9 @@ def test_a_held_score_loses_its_temperature_components_and_keeps_the_rest(db: Se
     db.flush()
     held = {"skin_temp_celsius": {"value": 33.6}, "resting_heart_rate": {"value": 52}}
     oura = {"body_temperature": {"value": 60}, "hrv_balance": {"value": 75}}
+    only = {"skin_temp_celsius": {"value": 34.0}}
     other = {"resting_heart_rate": {"value": 50}}
-    for day, components in enumerate((held, oura, other, None)):
+    for day, components in enumerate((held, oura, only, other, None)):
         db.add(
             HealthScore(
                 id=uuid4(),
@@ -117,5 +118,6 @@ def test_a_held_score_loses_its_temperature_components_and_keeps_the_rest(db: Se
     stored = sorted(
         (str(c) for (c,) in db.execute(select(HealthScore.components).where(HealthScore.user_id == member.id))),
     )
-    kept = [{"resting_heart_rate": {"value": 52}}, {"hrv_balance": {"value": 75}}, other, None]
+    # A score whose only component was a temperature has none left: NULL, as a new write stores it.
+    kept = [{"resting_heart_rate": {"value": 52}}, {"hrv_balance": {"value": 75}}, None, other, None]
     assert stored == sorted(str(c) for c in kept)

@@ -37,9 +37,13 @@ def upgrade() -> None:
             f"DELETE FROM {table} WHERE series_type_definition_id IN "
             f"(SELECT id FROM series_type_definition WHERE code IN ({codes}))"
         )
-    # Health scores that carried a temperature as a component.
+    # Health scores that carried a temperature as a component. A score left with none stores NULL,
+    # as a new write does (``without_not_kept_components``), not an empty object.
     for key in TEMPERATURE_COMPONENTS:
-        op.execute(f"UPDATE health_score SET components = components - '{key}' WHERE components ? '{key}'")
+        op.execute(
+            f"UPDATE health_score SET components = NULLIF(components - '{key}', '{{}}'::jsonb) "
+            f"WHERE components ? '{key}'"
+        )
 
 
 def downgrade() -> None:
