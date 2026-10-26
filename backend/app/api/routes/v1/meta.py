@@ -5,6 +5,7 @@ from functools import lru_cache
 
 from fastapi import APIRouter
 
+from app.constants.series_types.not_kept import NOT_KEPT_SERIES
 from app.schemas.enums import ProviderName, SeriesType
 from app.schemas.enums.health_score_category import HEALTH_SCORE_DESCRIPTION_BY_ENUM, HealthScoreCategory
 from app.schemas.enums.series_types import (
@@ -56,6 +57,9 @@ def _build_coverage() -> CoverageResponse:
     series_to_providers: dict[SeriesType, list[str]] = {}
     for provider, cov in coverage_by_provider.items():
         for st in cov.timeseries:
+            # FORK (R-2026-10-23-f, R-2026-10-26-d): a series never stored is not offered.
+            if st in NOT_KEPT_SERIES:
+                continue
             series_to_providers.setdefault(st, []).append(provider)
 
     categories: dict[str, list[TimeseriesMetric]] = {}

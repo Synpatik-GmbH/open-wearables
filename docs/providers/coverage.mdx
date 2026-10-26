@@ -41,16 +41,15 @@ This guide gives an overview of data type support across the integrated wearable
 
 ---
 
+<Warning>
+**This deployment does not store skin or body temperature.** `body_temperature`, `skin_temperature`, `skin_temperature_deviation`, `skin_temperature_trend_deviation` and `garmin_skin_temperature` are dropped at ingestion from every provider, held values have been deleted, and no webhook is emitted for them; provider score components carrying a temperature (WHOOP recovery `skin_temp_celsius`, Oura readiness `body_temperature`) are not stored either. They are therefore left out of the coverage below and of `GET /v1/meta/coverage`, even where a provider sends them. Environmental temperatures (water, weather, air) are unaffected.
+</Warning>
+
 {/* GENERATED:COVERAGE:START */}
 
 {/* Auto-generated from ProviderCoverage by scripts/generate_coverage_docs.py — do not edit by hand. */}
 
 ## Detailed Coverage Matrix
-
-<Warning>
-**This deployment does not store skin or body temperature.** `body_temperature`, `skin_temperature`, `skin_temperature_deviation`, `skin_temperature_trend_deviation` and `garmin_skin_temperature` are dropped at ingestion from every provider, held values have been deleted, and no webhook is emitted for them; provider score components carrying a temperature (WHOOP recovery `skin_temp_celsius`, Oura readiness `body_temperature`) are not stored either. Rows below marked *not stored* list what a provider sends, not what this deployment keeps. Environmental temperatures (water, weather, air) are unaffected.
-</Warning>
-
 
 ### Heart & Cardiovascular
 
@@ -60,7 +59,7 @@ This guide gives an overview of data type support across the integrated wearable
 | `heart_rate_recovery_one_minute` | bpm | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `heart_rate_variability_rmssd` | ms | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ |
 | `heart_rate_variability_sdnn` | ms | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
-| `resting_heart_rate` | bpm | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ |
+| `resting_heart_rate` | bpm | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ |
 | `walking_heart_rate_average` | bpm | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ### Blood & Respiratory
@@ -77,7 +76,7 @@ This guide gives an overview of data type support across the integrated wearable
 | `oxygen_saturation` | percent | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ✅ |
 | `peak_expiratory_flow_rate` | L/min | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `peripheral_perfusion_index` | score | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `respiratory_rate` | brpm | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `respiratory_rate` | brpm | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
 | `sleeping_breathing_disturbances` | count | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ### Body Composition
@@ -87,15 +86,11 @@ This guide gives an overview of data type support across the integrated wearable
 | `body_fat_mass` | kg | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `body_fat_percentage` | percent | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `body_mass_index` | kg_m2 | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `body_temperature` (*not stored*) | celsius | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `body_water_mass` | kg | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `bone_mass` | kg | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `height` | cm | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
 | `lean_body_mass` | kg | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `skeletal_muscle_mass` | kg | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| `skin_temperature` (*not stored*) | celsius | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ |
-| `skin_temperature_deviation` (*not stored*) | celsius | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `skin_temperature_trend_deviation` (*not stored*) | celsius | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `waist_circumference` | cm | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `weight` | kg | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
 

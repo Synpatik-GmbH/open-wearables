@@ -18,6 +18,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.api.routes.v1.meta import _build_coverage
 from app.constants.series_types.not_kept import NOT_KEPT_SERIES
 from app.models import DataPointSeries, DataSource, HealthScore, SeriesTypeDefinition
 from app.repositories.data_point_series_repository import DataPointSeriesRepository
@@ -163,3 +164,10 @@ def test_a_health_score_keeps_its_other_components_and_no_temperature(db: Sessio
 
     stored = db.scalar(select(HealthScore.components).where(HealthScore.user_id == user.id))
     assert set(stored or {}) == {"hrv_balance"}
+
+
+def test_the_coverage_endpoint_offers_no_series_that_is_never_stored() -> None:
+    """/v1/meta/coverage (and the docs generated from it) must not advertise a temperature."""
+    offered = {metric.code for category in _build_coverage().timeseries for metric in category.metrics}
+    assert offered.isdisjoint(s.value for s in NOT_KEPT_SERIES)
+    assert {s.value for s in ENVIRONMENT} & offered, "environmental temperatures stay on offer"
