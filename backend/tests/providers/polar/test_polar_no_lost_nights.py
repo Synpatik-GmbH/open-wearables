@@ -154,7 +154,6 @@ class TestWindows:
             "/v3/users/sleepwise/alertness",
             "/v3/users/sleepwise/circadian-bedtime",
             "/v3/users/body-temperature",
-            "/v3/users/sleep-skin-temperature",
             "/v3/users/spo2",
             "/v3/users/wrist-ecg",
         ):

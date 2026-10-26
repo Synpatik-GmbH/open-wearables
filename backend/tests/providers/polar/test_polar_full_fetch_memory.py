@@ -33,7 +33,6 @@ from tests.providers.polar.test_polar_no_lost_nights import TODAY, FakePolar, _p
 
 CONTINUOUS_HR = "/v3/users/continuous-heart-rate"
 BODY_TEMPERATURE = "/v3/users/body-temperature"
-SKIN_TEMPERATURE = "/v3/users/sleep-skin-temperature"
 SPO2 = "/v3/users/spo2"
 WRIST_ECG = "/v3/users/wrist-ecg"
 ACTIVITIES = "/v3/users/activities"
@@ -65,16 +64,6 @@ class DensePolar(FakePolar):
         if self.serve is not None and endpoint not in self.serve:
             return super().__call__(db, user_id, endpoint, params, headers)
         days = [TODAY - timedelta(days=d) for d in range(1, DAYS + 1)]
-        if endpoint == SKIN_TEMPERATURE:
-            self.calls.append((endpoint, params))
-            return [
-                {
-                    "sleep_date": d.isoformat(),
-                    "sleep_time_skin_temperature_celsius": 33.5,
-                    "deviation_from_baseline_celsius": 0.1,
-                }
-                for d in days
-            ]
         if endpoint in (SPO2, WRIST_ECG):
             self.calls.append((endpoint, params))
             stamp = [int(datetime(d.year, d.month, d.day, 6, tzinfo=timezone.utc).timestamp()) for d in days]
@@ -107,7 +96,8 @@ class DensePolar(FakePolar):
             self.calls.append((endpoint, params))
             return [
                 {
-                    "measurement_type": "TM_SKIN_TEMPERATURE",
+                    # CORE: SKIN samples are never stored (R-2026-10-23-f), so they would batch nothing.
+                    "measurement_type": "TM_CORE_TEMPERATURE",
                     "start_time": f"{(TODAY - timedelta(days=d)).isoformat()}T00:00:00+00:00",
                     "samples": [
                         {"temperature_celsius": 33.0 + i / 1000, "recording_time_delta_milliseconds": i * 60_000}
@@ -235,7 +225,6 @@ FULL_FETCH_ENTRY = {
     "alertness": "get_alertness_data",
     "circadian_bedtime": "get_circadian_bedtime_data",
     "body_temperature": "get_body_temperature_data",
-    "sleep_skin_temperature": "get_sleep_skin_temperature_data",
     "spo2": "get_spo2_data",
     "wrist_ecg": "get_wrist_ecg_data",
 }
@@ -244,7 +233,6 @@ FULL_FETCH_ENTRY = {
 BATCHED = {
     "continuous_hr": (CONTINUOUS_HR, PER_DAY),
     "body_temperature": (BODY_TEMPERATURE, PER_DAY),
-    "sleep_skin_temperature": (SKIN_TEMPERATURE, 2),
     "spo2": (SPO2, 2),
     "wrist_ecg": (WRIST_ECG, 2),
     "daily_activity": (ACTIVITIES, 3),
