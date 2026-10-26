@@ -224,7 +224,7 @@ def test_real_oura_loop_skips_a_frozen_item_without_starving_its_admitted_neighb
         SeriesType.resting_heart_rate,
         SeriesType.respiratory_rate,
         SeriesType.oxygen_saturation,
-        SeriesType.skin_temperature,
+        # skin_temperature is never stored (R-2026-10-23-f).
         SeriesType.body_temperature,
     ],
 )
@@ -504,7 +504,7 @@ def test_unresolved_first_night_sdk_sample_is_dropped_then_kept_once_its_night_i
         "heart_rate",
         "heart_rate_variability_sdnn",
         "heart_rate_variability_rmssd",
-        "skin_temperature",
+        # skin_temperature is never stored (R-2026-10-23-f).
         "body_temperature",
         "resting_heart_rate",
         "respiratory_rate",

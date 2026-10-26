@@ -125,7 +125,8 @@ def test_frozen_sdk_transport_uses_persisted_start_timestamp_and_strips_sleep_va
         "heart_rate",
         "heart_rate_variability_sdnn",
         "heart_rate_variability_rmssd",
-        "skin_temperature",
+        # skin_temperature is never stored (R-2026-10-23-f); body_temperature is the temperature family.
+        "body_temperature",
         "resting_heart_rate",
         "respiratory_rate",
         "oxygen_saturation",
