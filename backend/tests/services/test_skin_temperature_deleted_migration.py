@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.models import DataPointSeries, DataPointSeriesArchive, HealthScore, SeriesTypeDefinition
@@ -121,3 +121,38 @@ def test_a_held_score_loses_its_temperature_components_and_keeps_the_rest(db: Se
     # A score whose only component was a temperature has none left: NULL, as a new write stores it.
     kept = [{"resting_heart_rate": {"value": 52}}, {"hrv_balance": {"value": 75}}, None, other, None]
     assert stored == sorted(str(c) for c in kept)
+
+
+def test_a_score_left_with_no_component_is_stored_as_a_new_write_stores_none(db: Session) -> None:
+    """The ORM stores a score with no components as JSON null; the migration must store the same."""
+    member = UserFactory()
+    db.flush()
+    for day, components in enumerate(({"skin_temp_celsius": {"value": 34.0}}, None)):
+        db.add(
+            HealthScore(
+                id=uuid4(),
+                user_id=member.id,
+                provider=ProviderName.WHOOP,
+                category=HealthScoreCategory.RECOVERY,
+                value=70,
+                recorded_at=T0 + timedelta(days=day),
+                components=components,
+            )
+        )
+    db.flush()
+
+    with Operations.context(MigrationContext.configure(db.connection())):
+        migration().upgrade()
+
+    stored = (
+        db.execute(
+            text(
+                "SELECT coalesce(jsonb_typeof(components), 'sql null') FROM health_score "
+                "WHERE user_id = :u ORDER BY recorded_at"
+            ),
+            {"u": member.id},
+        )
+        .scalars()
+        .all()
+    )
+    assert stored[0] == stored[1]
