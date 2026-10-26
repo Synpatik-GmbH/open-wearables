@@ -30,13 +30,12 @@ from tests.providers.polar.test_polar_no_lost_nights import (
     _stored_polar_nights,
 )
 
-# The seven range types that have no short form, by the endpoint each one calls.
+# The six range types that have no short form, by the endpoint each one calls.
 FULL_ONLY = {
     "continuous_hr": "/v3/users/continuous-heart-rate",
     "cardio_load": "/v3/users/cardio-load/date",
     "alertness": "/v3/users/sleepwise/alertness",
     "circadian_bedtime": "/v3/users/sleepwise/circadian-bedtime",
-    "body_temperature": "/v3/users/body-temperature",
     "spo2": "/v3/users/spo2",
     "wrist_ecg": "/v3/users/wrist-ecg",
 }
@@ -88,9 +87,9 @@ class TestTheFirstPull:
 
 
 class TestSkinTemperatureIsNotFetched:
-    """FORK (Calibra ruling R-2026-10-23-f): Polar's sleep skin temperature is not asked for."""
+    """FORK (Calibra rulings R-2026-10-23-f, R-2026-10-26-d): Polar's skin and body temperature are not asked for."""
 
-    def test_no_pull_requests_sleep_skin_temperature(
+    def test_no_pull_requests_skin_or_body_temperature(
         self, db: Session, data_247: Polar247Data, polar: FakePolar
     ) -> None:
         user_id = _polar_user(db)
@@ -100,7 +99,9 @@ class TestSkinTemperatureIsNotFetched:
             data_247.load_and_save_all(db, user_id)
 
         assert "sleep_skin_temperature" not in first
+        assert "body_temperature" not in first
         assert polar.requested("/v3/users/sleep-skin-temperature") == []
+        assert polar.requested("/v3/users/body-temperature") == []
 
 
 class TestTheNextPull:
@@ -355,7 +356,7 @@ class TestRateLimit:
         result = data_247.load_and_save_all(db, user_id)
 
         assert polar.calls == [("/v3/users/sleep/available", None)]
-        assert len(result) == 10
+        assert len(result) == 9
         assert all(isinstance(v, DataTypeFailure) and v.code == RATE_LIMITED for v in result.values())
 
     def test_a_429_on_a_later_type_ends_the_pull_there(

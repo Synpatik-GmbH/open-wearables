@@ -132,9 +132,8 @@ _RANGE_WINDOW_DAYS: dict[str, int] = {
     "cardio_load": 27,
     "alertness": 27,
     "circadian_bedtime": 27,
-    "body_temperature": 27,
-    # FORK (Calibra ruling R-2026-10-23-f): no sleep_skin_temperature. Skin temperature is not
-    # kept, so it is not asked for; body-temperature SKIN samples are dropped at the write.
+    # FORK (Calibra rulings R-2026-10-23-f, R-2026-10-26-d): no body_temperature and no
+    # sleep_skin_temperature. Neither is kept, so neither is asked for.
     "spo2": 27,
     "wrist_ecg": 27,
 }
@@ -1412,12 +1411,6 @@ class Polar247Data(Base247DataTemplate):
                 self.normalize_circadian_bedtime(
                     self.get_circadian_bedtime_data(db, user_id, since("circadian_bedtime"), now), user_id
                 ),
-            ),
-            "body_temperature": lambda: self._save_timeseries_in_batches(
-                db,
-                self.get_body_temperature_data(db, user_id, since("body_temperature"), now),
-                self.normalize_body_temperature,
-                user_id,
             ),
             "spo2": lambda: self._save_timeseries_in_batches(
                 db, self.get_spo2_data(db, user_id, since("spo2"), now), self.normalize_spo2, user_id
