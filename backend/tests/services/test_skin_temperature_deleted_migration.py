@@ -9,12 +9,14 @@ member's skin temperature (which goes too, since the ruling is not per member).
 import importlib.util
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.models import DataPointSeries, DataPointSeriesArchive, HealthScore, SeriesTypeDefinition
@@ -215,3 +217,17 @@ def test_the_wearable_history_guard_is_deferred_again_after_the_migration(db: Se
         ),
         {"source": data_source.id, "metric": get_series_type_id(SeriesType.resting_heart_rate)},
     )
+
+
+def test_the_migration_gives_up_on_a_held_lock_instead_of_hanging_the_api_start(db: Session, engine: Any) -> None:
+    """The migration runs when the API starts. A worker still on the old image can hold a lock on
+    health_score; the migration must fail fast (and be retried) rather than wait behind it."""
+    db.execute(text("SET LOCAL statement_timeout = '30s'"))  # so a missing timeout fails, not hangs
+    with engine.connect() as worker:
+        worker.execute(text("BEGIN"))
+        worker.execute(text("LOCK TABLE health_score IN ROW EXCLUSIVE MODE"))
+        with pytest.raises(OperationalError) as raised, Operations.context(MigrationContext.configure(db.connection())):
+            migration().upgrade()
+        worker.execute(text("ROLLBACK"))
+
+    assert raised.value.orig.sqlstate == "55P03"  # lock_not_available, not a statement timeout

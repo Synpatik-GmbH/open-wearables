@@ -31,6 +31,11 @@ TEMPERATURE_COMPONENTS = ("skin_temp_celsius", "body_temperature")
 
 
 def upgrade() -> None:
+    # This runs when the API starts. A worker still on the old image can hold a lock on these
+    # tables; fail fast (the deploy is retried) rather than hold the API start, and every write
+    # queued behind this migration, until that worker lets go. Reset at the end for whatever
+    # runs after this in the same transaction.
+    op.execute("SET LOCAL lock_timeout = '10s'")
     codes = ", ".join(f"'{code}'" for code in TEMPERATURE_CODES)
     for table in ("data_point_series", "data_point_series_archive"):
         op.execute(
@@ -56,6 +61,7 @@ def upgrade() -> None:
     # Alembic runs every pending migration in one transaction: hand the guard back as it was,
     # checking at commit, for whatever runs after this.
     op.execute("SET CONSTRAINTS wh_ingress DEFERRED")
+    op.execute("SET LOCAL lock_timeout TO DEFAULT")
 
 
 def downgrade() -> None:
