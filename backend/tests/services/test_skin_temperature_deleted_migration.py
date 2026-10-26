@@ -7,7 +7,7 @@ member's skin temperature (which goes too, since the ruling is not per member).
 """
 
 import importlib.util
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,9 +16,10 @@ from alembic.operations import Operations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import DataPointSeries, DataPointSeriesArchive, SeriesTypeDefinition
-from app.schemas.enums import SeriesType, get_series_type_id
+from app.models import DataPointSeries, DataPointSeriesArchive, HealthScore, SeriesTypeDefinition
+from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
 from app.schemas.enums.aggregation_method import AggregationMethod
+from app.schemas.enums.health_score_category import HealthScoreCategory
 from tests.factories import DataSourceFactory, UserFactory
 
 PATH = Path(__file__).parents[2] / "migrations/versions/2026_10_26_1500-51fa8d7eba23_skin_temperature_not_kept.py"
@@ -86,3 +87,32 @@ def test_held_skin_temperature_is_deleted_from_the_series_and_the_archive_and_th
     kept = sorted(s.value for s in KEPT)
     assert _codes(db, DataPointSeries) == kept
     assert _codes(db, DataPointSeriesArchive) == kept
+
+
+def test_a_held_recovery_score_loses_its_skin_temperature_component_and_keeps_the_rest(db: Session) -> None:
+    member = UserFactory()
+    db.flush()
+    held = {"skin_temp_celsius": {"value": 33.6}, "resting_heart_rate": {"value": 52}}
+    other = {"resting_heart_rate": {"value": 50}}
+    for day, components in enumerate((held, other, None)):
+        db.add(
+            HealthScore(
+                id=uuid4(),
+                user_id=member.id,
+                provider=ProviderName.WHOOP,
+                category=HealthScoreCategory.RECOVERY,
+                value=70,
+                recorded_at=T0 + timedelta(days=day),
+                components=components,
+            )
+        )
+    db.flush()
+
+    with Operations.context(MigrationContext.configure(db.connection())):
+        migration().upgrade()
+    db.expire_all()
+
+    stored = sorted(
+        (str(c) for (c,) in db.execute(select(HealthScore.components).where(HealthScore.user_id == member.id))),
+    )
+    assert stored == sorted([str({"resting_heart_rate": {"value": 52}}), str(other), str(None)])

@@ -124,6 +124,10 @@ class TimeSeriesService(
     def __init__(self, log: Logger):
         super().__init__(crud_model=DataPointSeriesRepository, model=DataPointSeries, log=log)
 
+    def create(self, db_session: DbSession, creator: TimeSeriesSampleCreate) -> DataPointSeries | None:  # ty:ignore[invalid-method-override]
+        """FORK (R-2026-10-23-f): None, not an error, for a sample of a series never stored."""
+        return self.crud.create(db_session, creator)
+
     def bulk_create_samples(
         self,
         db_session: DbSession,

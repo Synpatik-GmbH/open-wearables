@@ -3,8 +3,8 @@
 Skin temperature is not kept: stored without a purpose and close to inferring a woman's cycle
 (DPO point 9). From this release no write stores it (``NOT_KEPT_SERIES``); this deletes what
 was stored before, from the live series and from the daily archive, for every member and
-provider. The codes are written out, not imported, so this migration means the same thing
-whatever the code later says.
+provider, and the skin_temp_celsius component of WHOOP recovery scores. The codes are written
+out, not imported, so this migration means the same thing whatever the code later says.
 
 Revision ID: 51fa8d7eba23
 Revises: c4e1d2b7a9f3
@@ -33,6 +33,10 @@ def upgrade() -> None:
             f"DELETE FROM {table} WHERE series_type_definition_id IN "
             f"(SELECT id FROM series_type_definition WHERE code IN ({codes}))"
         )
+    # WHOOP's recovery score carried the night's skin temperature as a component.
+    op.execute(
+        "UPDATE health_score SET components = components - 'skin_temp_celsius' WHERE components ? 'skin_temp_celsius'"
+    )
 
 
 def downgrade() -> None:

@@ -115,3 +115,11 @@ def test_the_service_neither_stores_nor_announces_skin_temperature(
 
     assert _stored(db, user.id) == ["resting_heart_rate"]
     assert [s["type"] for call in emitted for s in call["samples"]] == ["resting_heart_rate"]
+
+
+@pytest.mark.parametrize("series", SKIN)
+def test_the_service_create_of_a_skin_sample_stores_nothing_and_does_not_raise(db: Session, series: SeriesType) -> None:
+    user = UserFactory()
+
+    assert timeseries_service.create(db, _sample(user.id, series, 33.6)) is None
+    assert _stored(db, user.id) == []
