@@ -13,6 +13,7 @@ Revises: c4e1d2b7a9f3
 Create Date: 2026-10-26 15:00:00
 """
 
+import sqlalchemy as sa
 from alembic import op
 
 revision = "51fa8d7eba23"
@@ -49,18 +50,23 @@ def upgrade() -> None:
     # beside a member's other sources). Removing a component only reduces what is held, so the
     # guard is off for these statements alone, inside the migration's transaction. Checks already
     # queued in this transaction are run first (they would run at commit anyway), because a table
-    # with pending trigger events cannot be altered.
-    op.execute("SET CONSTRAINTS wh_ingress IMMEDIATE")
-    op.execute("ALTER TABLE health_score DISABLE TRIGGER wh_ingress")
-    for key in TEMPERATURE_COMPONENTS:
-        op.execute(
-            f"UPDATE health_score SET components = CASE WHEN components - '{key}' = '{{}}'::jsonb "
-            f"THEN 'null'::jsonb ELSE components - '{key}' END WHERE components ? '{key}'"
-        )
-    op.execute("ALTER TABLE health_score ENABLE TRIGGER wh_ingress")
-    # Alembic runs every pending migration in one transaction: hand the guard back as it was,
-    # checking at commit, for whatever runs after this.
-    op.execute("SET CONSTRAINTS wh_ingress DEFERRED")
+    # with pending trigger events cannot be altered. Turning the guard off locks health_score
+    # against every writer, so it is done only where a score holds such a component: where none
+    # does (prod held none), an old-image worker writing scores during the rollout is never waited on.
+    keys = ", ".join(f"'{key}'" for key in TEMPERATURE_COMPONENTS)
+    held = sa.text(f"SELECT EXISTS (SELECT 1 FROM health_score WHERE components ?| ARRAY[{keys}])")
+    if op.get_bind().execute(held).scalar():
+        op.execute("SET CONSTRAINTS wh_ingress IMMEDIATE")
+        op.execute("ALTER TABLE health_score DISABLE TRIGGER wh_ingress")
+        for key in TEMPERATURE_COMPONENTS:
+            op.execute(
+                f"UPDATE health_score SET components = CASE WHEN components - '{key}' = '{{}}'::jsonb "
+                f"THEN 'null'::jsonb ELSE components - '{key}' END WHERE components ? '{key}'"
+            )
+        op.execute("ALTER TABLE health_score ENABLE TRIGGER wh_ingress")
+        # Alembic runs every pending migration in one transaction: hand the guard back as it was
+        # declared, checking at commit, for whatever runs after this.
+        op.execute("SET CONSTRAINTS wh_ingress DEFERRED")
     op.execute("SET LOCAL lock_timeout TO DEFAULT")
 
 

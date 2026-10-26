@@ -219,9 +219,43 @@ def test_the_wearable_history_guard_is_deferred_again_after_the_migration(db: Se
     )
 
 
-def test_the_migration_gives_up_on_a_held_lock_instead_of_hanging_the_api_start(db: Session, engine: Any) -> None:
-    """The migration runs when the API starts. A worker still on the old image can hold a lock on
-    health_score; the migration must fail fast (and be retried) rather than wait behind it."""
+def _seed_score(db: Session, components: dict | None) -> None:
+    member = UserFactory()
+    db.flush()
+    db.add(
+        HealthScore(
+            id=uuid4(),
+            user_id=member.id,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.RECOVERY,
+            value=70,
+            recorded_at=T0,
+            components=components,
+        )
+    )
+    db.flush()
+
+
+def test_with_no_temperature_component_held_a_worker_lock_does_not_stop_the_migration(db: Session, engine: Any) -> None:
+    """Where no score holds a temperature component (prod), the migration takes no lock on
+    health_score, so an old-image worker writing scores during the rollout cannot fail it."""
+    _seed_score(db, {"resting_heart_rate": {"value": 52}})
+    db.execute(text("SET LOCAL statement_timeout = '30s'"))
+    with engine.connect() as worker:
+        worker.execute(text("BEGIN"))
+        worker.execute(text("LOCK TABLE health_score IN ROW EXCLUSIVE MODE"))
+        with Operations.context(MigrationContext.configure(db.connection())):
+            migration().upgrade()
+        worker.execute(text("ROLLBACK"))
+
+
+def test_with_a_component_to_strip_the_migration_gives_up_on_a_held_lock_instead_of_hanging(
+    db: Session, engine: Any
+) -> None:
+    """Where scores must be stripped (dev), the migration needs a lock on health_score. A worker
+    still on the old image can hold one; the migration fails fast (and is retried) rather than
+    hold the API start behind it."""
+    _seed_score(db, {"skin_temp_celsius": {"value": 34.0}})
     db.execute(text("SET LOCAL statement_timeout = '30s'"))  # so a missing timeout fails, not hangs
     with engine.connect() as worker:
         worker.execute(text("BEGIN"))

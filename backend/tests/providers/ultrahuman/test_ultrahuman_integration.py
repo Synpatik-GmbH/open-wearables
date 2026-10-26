@@ -424,6 +424,15 @@ class TestUltrahumanActivitySamplesIntegration:
         sent = [m for m in sample_ultrahuman_api_response["data"]["metric_data"] if m["type"] == "temp"]
         assert sent, "the fixture must carry temperature"
         assert samples == []
+        # Positive control: the same load stored the other series, so the empty list is the filter.
+        stored = (
+            db.query(DataPointSeries)
+            .join(DataSource)
+            .join(SeriesTypeDefinition, DataPointSeries.series_type_definition_id == SeriesTypeDefinition.id)
+            .filter(DataSource.user_id == user.id, SeriesTypeDefinition.code == SeriesType.heart_rate.value)
+            .count()
+        )
+        assert stored > 0
 
     def test_timestamps_are_utc_with_mocked_api(self, db: Session, sample_ultrahuman_api_response: dict) -> None:
         """Verify all activity sample timestamps are in UTC timezone."""
