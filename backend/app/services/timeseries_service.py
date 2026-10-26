@@ -6,6 +6,7 @@ from logging import Logger, getLogger
 from typing import Any
 from uuid import UUID
 
+from app.constants.series_types.not_kept import drop_not_kept
 from app.database import DbSession
 from app.models import DataPointSeries, DataSource
 from app.repositories import DataPointSeriesRepository
@@ -142,7 +143,8 @@ class TimeSeriesService(
         batch then holds one batch at a time however slow the send is (Codex on #43); every other
         caller keeps the thread.
         """
-        samples = WearableHistoryIngressRepository(db_session).filter_samples(samples)
+        # FORK (R-2026-10-23-f): skin temperature is neither stored nor announced.
+        samples = WearableHistoryIngressRepository(db_session).filter_samples(drop_not_kept(samples))
         counts = self.crud.bulk_create(db_session, samples)
         written = getattr(counts, "written_ids", None)
         if emit_only_written and written is not None:

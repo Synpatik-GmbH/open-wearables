@@ -36,6 +36,7 @@ from sqlalchemy.exc import IntegrityError as SQLAIntegrityError
 from sqlalchemy.orm import Query
 from sqlalchemy.schema import CreateTable
 
+from app.constants.series_types.not_kept import drop_not_kept, is_kept
 from app.database import DbSession
 from app.models import DataPointSeries, DataPointSeriesArchive, DataSource, DeviceTypePriority, ProviderPriority
 from app.models.series_type_definition import SeriesTypeDefinition
@@ -178,12 +179,17 @@ class DataPointSeriesRepository(
         self.data_source_repo = DataSourceRepository()
 
     @handle_exceptions
-    def create(self, db_session: DbSession, creator: TimeSeriesSampleCreate) -> DataPointSeries:
+    def create(self, db_session: DbSession, creator: TimeSeriesSampleCreate) -> DataPointSeries | None:
         """Create a data point sample, or return existing if duplicate.
 
         Handles duplicate records gracefully by catching IntegrityError and
         returning the existing record instead.
+
+        FORK (R-2026-10-23-f): a sample of a series that is never stored
+        (``NOT_KEPT_SERIES``) is not written, and None is returned.
         """
+        if not is_kept(creator):
+            return None
         data_source = self.create_data_source(db_session, creator)
 
         creation_data = creator.model_dump()
@@ -220,7 +226,8 @@ class DataPointSeriesRepository(
         Returns the number of rows actually written, split into inserted (new)
         vs updated (refreshed in place via ON CONFLICT).
         """
-        creators = WearableHistoryIngressRepository(db_session).filter_samples(creators)
+        # FORK (R-2026-10-23-f): skin temperature is never stored, whoever calls.
+        creators = WearableHistoryIngressRepository(db_session).filter_samples(drop_not_kept(creators))
         if not creators:
             return WriteCounts(0, 0)
 
