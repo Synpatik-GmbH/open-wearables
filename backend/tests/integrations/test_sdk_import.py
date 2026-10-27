@@ -486,6 +486,35 @@ class TestAppleSDKImport:
         assert response.types == [SeriesType.steps.value]
         assert response.model_dump()["types"] == [SeriesType.steps.value]
 
+    @pytest.mark.parametrize(
+        "temperature",
+        ["HKQuantityTypeIdentifierAppleSleepingWristTemperature", "HKQuantityTypeIdentifierBasalBodyTemperature"],
+    )
+    def test_a_dropped_temperature_is_not_reported_as_written(
+        self,
+        db: Session,
+        import_service: ImportService,
+        sample_sdk_payload: dict[str, Any],
+        temperature: str,
+    ) -> None:
+        """FORK (R-2026-10-26-d): body temperature is never stored, so the response does not list
+        it or count it, and no sync status reports it arrived."""
+        user = UserFactory()
+        steps = sample_sdk_payload["data"]["records"][0]
+        dropped = {
+            **steps,
+            "id": "99998888-7777-6666-5555-444433332222",
+            "type": temperature,
+            "unit": "degC",
+            "value": 36.4,
+        }
+        payload = {**SDK_ENVELOPE, "data": {"records": [steps, dropped]}}
+
+        response = import_service.import_data_from_request(db, json.dumps(payload), "application/json", str(user.id))
+
+        assert response.types == [SeriesType.steps.value]
+        assert response.records_saved == 1
+
     def test_insert_update_split_reaches_the_response(
         self,
         db: Session,

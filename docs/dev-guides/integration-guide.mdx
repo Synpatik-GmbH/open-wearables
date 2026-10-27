@@ -670,8 +670,8 @@ To page through results, pass `cursor=<next_cursor>` until `has_more` is `false`
         "period_end": "2025-01-15T00:00:00Z"
       },
       "latest": {
-        "body_temperature_celsius": 36.6,
-        "body_temperature_measured_at": "2025-01-15T08:00:00Z",
+        "body_temperature_celsius": null,
+        "body_temperature_measured_at": null,
         "skin_temperature_celsius": null,
         "skin_temperature_measured_at": null,
         "blood_pressure": {
@@ -684,7 +684,7 @@ To page through results, pass `cursor=<next_cursor>` until `has_more` is `false`
       }
     }
     ```
-    Returns `null` (not a `data: []` wrapper) if no body data exists for the user. Controlled by `average_period` (1-7 days, default 7) and `latest_window_hours` (1-24, default 4).
+    Returns `null` (not a `data: []` wrapper) if no body data exists for the user. Controlled by `average_period` (1-7 days, default 7) and `latest_window_hours` (1-24, default 4). In this deployment `body_temperature_*` and `skin_temperature_*` are always `null`: skin and body temperature are not stored.
   </Tab>
   <Tab title="TimeSeriesSample">
     ```json

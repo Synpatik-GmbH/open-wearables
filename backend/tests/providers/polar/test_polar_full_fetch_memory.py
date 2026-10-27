@@ -32,8 +32,6 @@ from app.services.timeseries_service import timeseries_service
 from tests.providers.polar.test_polar_no_lost_nights import TODAY, FakePolar, _polar_user
 
 CONTINUOUS_HR = "/v3/users/continuous-heart-rate"
-BODY_TEMPERATURE = "/v3/users/body-temperature"
-SKIN_TEMPERATURE = "/v3/users/sleep-skin-temperature"
 SPO2 = "/v3/users/spo2"
 WRIST_ECG = "/v3/users/wrist-ecg"
 ACTIVITIES = "/v3/users/activities"
@@ -65,16 +63,6 @@ class DensePolar(FakePolar):
         if self.serve is not None and endpoint not in self.serve:
             return super().__call__(db, user_id, endpoint, params, headers)
         days = [TODAY - timedelta(days=d) for d in range(1, DAYS + 1)]
-        if endpoint == SKIN_TEMPERATURE:
-            self.calls.append((endpoint, params))
-            return [
-                {
-                    "sleep_date": d.isoformat(),
-                    "sleep_time_skin_temperature_celsius": 33.5,
-                    "deviation_from_baseline_celsius": 0.1,
-                }
-                for d in days
-            ]
         if endpoint in (SPO2, WRIST_ECG):
             self.calls.append((endpoint, params))
             stamp = [int(datetime(d.year, d.month, d.day, 6, tzinfo=timezone.utc).timestamp()) for d in days]
@@ -103,19 +91,6 @@ class DensePolar(FakePolar):
                     for d in range(1, DAYS + 1)
                 ]
             }
-        if endpoint == BODY_TEMPERATURE:
-            self.calls.append((endpoint, params))
-            return [
-                {
-                    "measurement_type": "TM_SKIN_TEMPERATURE",
-                    "start_time": f"{(TODAY - timedelta(days=d)).isoformat()}T00:00:00+00:00",
-                    "samples": [
-                        {"temperature_celsius": 33.0 + i / 1000, "recording_time_delta_milliseconds": i * 60_000}
-                        for i in range(PER_DAY)
-                    ],
-                }
-                for d in range(1, DAYS + 1)
-            ]
         if endpoint == ACTIVITIES and params is not None:
             self.calls.append((endpoint, params))
             first, last = date.fromisoformat(params["from"]), date.fromisoformat(params["to"])
@@ -182,7 +157,8 @@ def _connection_id(db: Session, data_247: Polar247Data, user_id: UUID) -> UUID:
 
 
 class TestAFullFetchHoldsOneBatch:
-    @pytest.mark.parametrize("data_type", ["continuous_hr", "body_temperature"])
+    # body_temperature is no longer fetched (R-2026-10-26-d): continuous_hr is the dense type.
+    @pytest.mark.parametrize("data_type", ["continuous_hr"])
     def test_a_dense_type_never_holds_more_than_a_batch_and_a_day(
         self, db: Session, data_247: Polar247Data, live_at_save: list[int], data_type: str
     ) -> None:
@@ -199,15 +175,15 @@ class TestAFullFetchHoldsOneBatch:
         self, db: Session, data_247: Polar247Data, polar: DensePolar, live_at_save: list[int]
     ) -> None:
         # Only the types counted below: the others' samples share timestamps and series with these.
-        polar.serve = {CONTINUOUS_HR, BODY_TEMPERATURE, ACTIVITIES}
+        polar.serve = {CONTINUOUS_HR, ACTIVITIES}
         user_id = _polar_user(db)
         with patch.object(Polar247Data, "_save_missing_sleep", return_value=0):
             result = data_247.load_and_save_all(db, user_id)
 
-        # continuous_hr + body_temperature, 11,200 each, and 90 days of three activity series.
+        # continuous_hr, 11,200, and 90 days of three activity series.
         activity = result["daily_activity"]
         assert activity == 91 * 3
-        assert _stored(db, user_id) == 2 * DAYS * PER_DAY + activity
+        assert _stored(db, user_id) == DAYS * PER_DAY + activity
 
     def test_ninety_days_of_daily_activity_are_saved_in_batches(
         self, db: Session, data_247: Polar247Data, live_at_save: list[int], monkeypatch: pytest.MonkeyPatch
@@ -217,7 +193,6 @@ class TestAFullFetchHoldsOneBatch:
         with (
             patch.object(Polar247Data, "_save_missing_sleep", return_value=0),
             patch.object(Polar247Data, "normalize_continuous_hr", return_value=[]),
-            patch.object(Polar247Data, "normalize_body_temperature", return_value=[]),
         ):
             result = data_247.load_and_save_all(db, user_id)
 
@@ -234,8 +209,6 @@ FULL_FETCH_ENTRY = {
     "cardio_load": "get_cardio_load_data",
     "alertness": "get_alertness_data",
     "circadian_bedtime": "get_circadian_bedtime_data",
-    "body_temperature": "get_body_temperature_data",
-    "sleep_skin_temperature": "get_sleep_skin_temperature_data",
     "spo2": "get_spo2_data",
     "wrist_ecg": "get_wrist_ecg_data",
 }
@@ -243,8 +216,6 @@ FULL_FETCH_ENTRY = {
 # Every series type a full fetch saves in batches, by endpoint and how many samples one record makes.
 BATCHED = {
     "continuous_hr": (CONTINUOUS_HR, PER_DAY),
-    "body_temperature": (BODY_TEMPERATURE, PER_DAY),
-    "sleep_skin_temperature": (SKIN_TEMPERATURE, 2),
     "spo2": (SPO2, 2),
     "wrist_ecg": (WRIST_ECG, 2),
     "daily_activity": (ACTIVITIES, 3),

@@ -121,9 +121,10 @@ POLAR_WINDOW_DAYS = 90
 # a type is fetched in full is set by pull_budget (spec R1, see _FULL_FORM_TYPES). Unchanged rows
 # are not re-emitted (emit_only_written). Per Polar AccessLink v3:
 # - activities accept a ``from`` up to 365 days back in 28-day ranges: the 90-day cap applies;
-# - SleepWise, body and skin temperature, SpO2 and wrist ECG serve "the last 28 days" with a
-#   28-day maximum range; continuous heart rate and cardio load document no older history,
-#   so they get the same 28 days. Widening one is a change to this table only.
+# - SleepWise, SpO2 and wrist ECG serve "the last 28 days" with a 28-day maximum range (so do
+#   body and skin temperature, which are not fetched: R-2026-10-23-f, R-2026-10-26-d);
+#   continuous heart rate and cardio load document no older history, so they get the same 28
+#   days. Widening one is a change to this table only.
 # Sleep and Nightly Recharge are not here: both are listed by Polar for its last 28 days
 # (``/sleep/available``, ``/nightly-recharge``) and filtered to POLAR_WINDOW_DAYS.
 _RANGE_WINDOW_DAYS: dict[str, int] = {
@@ -132,8 +133,8 @@ _RANGE_WINDOW_DAYS: dict[str, int] = {
     "cardio_load": 27,
     "alertness": 27,
     "circadian_bedtime": 27,
-    "body_temperature": 27,
-    "sleep_skin_temperature": 27,
+    # FORK (Calibra rulings R-2026-10-23-f, R-2026-10-26-d): no body_temperature and no
+    # sleep_skin_temperature. Neither is kept, so neither is asked for.
     "spo2": 27,
     "wrist_ecg": 27,
 }
@@ -142,7 +143,7 @@ _RANGE_WINDOW_DAYS: dict[str, int] = {
 # FORK (2.96.6.1, spec R1, AC2, AC17): the data types pull_budget fetches in full at most once per
 # FULL_INTERVAL. Between full fetches a pull fetches the short form of sleep (the newest night
 # Polar lists, when it is not stored) and of daily activity (yesterday and today), and nothing
-# of the other eight. Nightly Recharge is one call for everything Polar serves, so it is fetched
+# of the other six. Nightly Recharge is one call for everything Polar serves, so it is fetched
 # whole on every pull (spec cause 8, AC11), as are workouts (one call, see PolarWorkouts).
 _FULL_FORM_TYPES: tuple[str, ...] = (
     "sleep",
@@ -1411,18 +1412,6 @@ class Polar247Data(Base247DataTemplate):
                 self.normalize_circadian_bedtime(
                     self.get_circadian_bedtime_data(db, user_id, since("circadian_bedtime"), now), user_id
                 ),
-            ),
-            "body_temperature": lambda: self._save_timeseries_in_batches(
-                db,
-                self.get_body_temperature_data(db, user_id, since("body_temperature"), now),
-                self.normalize_body_temperature,
-                user_id,
-            ),
-            "sleep_skin_temperature": lambda: self._save_timeseries_in_batches(
-                db,
-                self.get_sleep_skin_temperature_data(db, user_id, since("sleep_skin_temperature"), now),
-                self.normalize_sleep_skin_temperature,
-                user_id,
             ),
             "spo2": lambda: self._save_timeseries_in_batches(
                 db, self.get_spo2_data(db, user_id, since("spo2"), now), self.normalize_spo2, user_id

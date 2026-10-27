@@ -41,6 +41,10 @@ This guide gives an overview of data type support across the integrated wearable
 
 ---
 
+<Warning>
+**This deployment does not store skin or body temperature.** `body_temperature`, `skin_temperature`, `skin_temperature_deviation`, `skin_temperature_trend_deviation` and `garmin_skin_temperature` are dropped at ingestion from every provider, held values have been deleted, and no webhook is emitted for them; provider score components carrying a temperature (WHOOP recovery `skin_temp_celsius`, Oura readiness `body_temperature`) are not stored either. They are therefore left out of the coverage below and of `GET /v1/meta/coverage`, even where a provider sends them. Environmental temperatures (water, weather, air) are unaffected.
+</Warning>
+
 {/* GENERATED:COVERAGE:START */}
 
 {/* Auto-generated from ProviderCoverage by scripts/generate_coverage_docs.py — do not edit by hand. */}
@@ -55,7 +59,7 @@ This guide gives an overview of data type support across the integrated wearable
 | `heart_rate_recovery_one_minute` | bpm | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `heart_rate_variability_rmssd` | ms | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ |
 | `heart_rate_variability_sdnn` | ms | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
-| `resting_heart_rate` | bpm | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ |
+| `resting_heart_rate` | bpm | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ |
 | `walking_heart_rate_average` | bpm | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ### Blood & Respiratory
@@ -72,7 +76,7 @@ This guide gives an overview of data type support across the integrated wearable
 | `oxygen_saturation` | percent | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ✅ |
 | `peak_expiratory_flow_rate` | L/min | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `peripheral_perfusion_index` | score | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `respiratory_rate` | brpm | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `respiratory_rate` | brpm | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
 | `sleeping_breathing_disturbances` | count | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ### Body Composition
@@ -82,15 +86,11 @@ This guide gives an overview of data type support across the integrated wearable
 | `body_fat_mass` | kg | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `body_fat_percentage` | percent | ✅ | ❌ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `body_mass_index` | kg_m2 | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `body_temperature` | celsius | ✅ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `body_water_mass` | kg | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `bone_mass` | kg | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `height` | cm | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
 | `lean_body_mass` | kg | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 | `skeletal_muscle_mass` | kg | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| `skin_temperature` | celsius | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ |
-| `skin_temperature_deviation` | celsius | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `skin_temperature_trend_deviation` | celsius | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `waist_circumference` | cm | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | `weight` | kg | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
 
@@ -311,7 +311,7 @@ Key differences and limitations to be aware of when working with each provider:
   - Full sleep processing with stages (deep, light, REM, awake), duration, efficiency score, and heart rate biometrics
   - Continuous 24/7 timeseries data: heart rate, steps, energy, HRV (RMSSD, overnight sleep window), stress levels, body battery, respiratory rate, SpO2, and more
   - Body composition from Garmin Index scale: weight, body fat %, BMI
-  - Garmin-specific metrics: stress level, body battery, fitness age, skin temperature
+  - Garmin-specific metrics: stress level, body battery, fitness age, skin temperature (not stored)
   - 135+ workout type mappings to unified taxonomy
   - Workout details include distance, calories, avg/max heart rate, elevation gain, and average speed
   - Backfill orchestration for historical data retrieval (up to 5 years)
@@ -329,7 +329,7 @@ Key differences and limitations to be aware of when working with each provider:
   - Daily activity: steps, active calories, and walking/running distance from `/v3/users/activities`
   - Health scores: sleep score, Nightly Recharge (recovery), Cardio Load (strain)
   - Sleepwise Alertness and Circadian Bedtime scores require an active **Polar Sleepwise** subscription
-  - Body temperature, sleep skin temperature, SpO2, and wrist ECG (HRV RMSSD) require a **Polar Elixir** device
+  - Body temperature, sleep skin temperature (neither fetched nor stored by this deployment), SpO2, and wrist ECG (HRV RMSSD) require a **Polar Elixir** device
   - HRV RMSSD available from Elixir SpO2 spot tests and wrist ECG measurements; not available from standard devices; SDNN not provided
   - 75+ workout type mappings to unified taxonomy
   - Exercises fetched from `/v3/exercises` (all exercises in Polar Flow for the connected user; no date filter)
@@ -354,7 +354,7 @@ Key differences and limitations to be aware of when working with each provider:
   - Full sleep processing with stages (deep, light, REM, awake), duration, time in bed, efficiency score, stage timestamps, and nap detection
   - Sleep biometrics: lowest heart rate persisted as a daily `resting_heart_rate` sample and average breathing rate persisted as `respiratory_rate`; average HR and average HRV are available from the API but not yet persisted per sleep record
   - Continuous 24/7 timeseries: heart rate (5-min intervals), HRV (RMSSD, 5-min intervals), daily SpO2, steps, active calories, walking distance
-  - Recovery data from daily readiness: recovery score, skin temperature deviation, and skin temperature trend deviation
+  - Recovery data from daily readiness: recovery score, skin temperature deviation, and skin temperature trend deviation (the two temperature deviations are not stored)
   - Fitness metrics: VO2 max (daily estimate) and cardiovascular age — both require the `heart_health` OAuth scope
   - Personal info sync: height and weight from user profile
   - Oura does **not** expose heart rate data during workouts via API; workout records include only duration, type, calories, and distance
@@ -372,7 +372,7 @@ Key differences and limitations to be aware of when working with each provider:
   - Continuous heart rate data is **not available** via API (only during workouts)
   - Does not track steps (device limitation)
   - Sleep data fully implemented with all stages and efficiency
-  - Recovery data fully implemented: recovery score, resting heart rate, HRV (RMSSD), SpO2, skin temperature
+  - Recovery data fully implemented: recovery score, resting heart rate, HRV (RMSSD), SpO2, skin temperature (not stored)
   - Body measurements (height, weight) synced from user profile
   - Strain scores: daily (from scored cycles) and per workout
 </Accordion>
@@ -381,13 +381,13 @@ Key differences and limitations to be aware of when working with each provider:
   **Integration Method:** OAuth 2.0 (pull-based polling)
 
   - Data synced via periodic polling (default: every hour); Ultrahuman does not support webhooks
-  - Daily metrics endpoint returns all data types for a single day: sleep, HR, HRV, skin temperature, steps, VO2 max, recovery indices
+  - Daily metrics endpoint returns all data types for a single day: sleep, HR, HRV, skin temperature (not stored), steps, VO2 max, recovery indices
   - Full sleep processing with stages (deep, light, REM, awake), duration, time in bed, and efficiency score
-  - Continuous 24/7 timeseries: heart rate, HRV (SDNN), skin temperature, steps
+  - Continuous 24/7 timeseries: heart rate, HRV (SDNN), skin temperature (not stored), steps
   - VO2 max as a daily aggregate value
   - Recovery metrics (recovery index, movement index, metabolic score) are normalized but not yet persisted
   - No workout/activity data available via the Partnership API
-  - Skin temperature values are typically lower than core body temperature (~29-37°C)
+  - Skin temperature values are typically lower than core body temperature (~29-37°C) Not stored by this deployment.
   - Backfill defaults to 30 days when no date range is specified
 </Accordion>
 

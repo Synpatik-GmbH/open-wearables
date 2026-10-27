@@ -767,7 +767,8 @@ class Whoop247Data(Base247DataTemplate):
             return None
         components = {
             k: ScoreComponent(value=normalized.get(k))
-            for k in ("resting_heart_rate", "hrv_rmssd_milli", "spo2_percentage", "skin_temp_celsius")
+            # FORK (R-2026-10-23-f): skin_temp_celsius is not a component; skin temperature is not kept.
+            for k in ("resting_heart_rate", "hrv_rmssd_milli", "spo2_percentage")
             if normalized.get(k) is not None
         }
         return HealthScoreCreate(

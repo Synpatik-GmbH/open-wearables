@@ -210,6 +210,10 @@ Fired once when a complete session is saved or merged.
 
 ### Timeseries Events
 
+<Warning>
+This deployment does not store skin or body temperature, so no event carries them: `body_temperature.created` and the `series.body_temperature.created`, `series.skin_temperature.created`, `series.skin_temperature_deviation.created`, `series.skin_temperature_trend_deviation.created` and `series.garmin_skin_temperature.created` events are never emitted.
+</Warning>
+
 Fired per ingestion batch — one event per distinct `(user, provider, series_type)` combination in a sync run. Each event carries the full `samples` array, so consumers can store data directly from the webhook without issuing follow-up API calls.
 
 | Event | Series types included |
@@ -220,7 +224,7 @@ Fired per ingestion batch — one event per distinct `(user, provider, series_ty
 | `calories.created` | `energy`, `basal_energy` |
 | `spo2.created` | `oxygen_saturation`, `peripheral_perfusion_index` |
 | `respiratory_rate.created` | `respiratory_rate`, `sleeping_breathing_disturbances` |
-| `body_temperature.created` | `body_temperature`, `skin_temperature`, `skin_temperature_deviation` |
+| `body_temperature.created` | Not emitted by this deployment: `body_temperature`, `skin_temperature` and `skin_temperature_deviation` are not stored |
 | `stress.created` | `garmin_stress_level`, `electrodermal_activity` |
 | `blood_glucose.created` | `blood_glucose`, `blood_alcohol_content`, `insulin_delivery` |
 | `blood_pressure.created` | `blood_pressure_systolic`, `blood_pressure_diastolic` |

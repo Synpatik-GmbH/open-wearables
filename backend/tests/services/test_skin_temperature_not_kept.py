@@ -1,0 +1,173 @@
+"""FORK (Calibra rulings R-2026-10-23-f and R-2026-10-26-d): skin and body temperature are not kept.
+
+No skin-temperature series (the night's value, its deviation from the member's baseline, its
+trend deviation, Garmin's) and no body-temperature series (Polar core, Apple wrist and basal,
+Withings, Google Health), from any provider, is stored or announced. Every write path into
+``data_point_series`` drops them, and a batch that also carries other series keeps the rest.
+Neither is kept as a score component either. Environmental temperatures are not the member's
+and stay.
+"""
+
+from collections.abc import Iterator
+from datetime import datetime, timezone
+from typing import Any
+from unittest.mock import patch
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.api.routes.v1.meta import _build_coverage
+from app.constants.series_types.not_kept import NOT_KEPT_SERIES
+from app.models import DataPointSeries, DataSource, HealthScore, SeriesTypeDefinition
+from app.repositories.data_point_series_repository import DataPointSeriesRepository
+from app.repositories.health_score_repository import HealthScoreRepository
+from app.schemas.enums import ProviderName, SeriesType
+from app.schemas.enums.health_score_category import HealthScoreCategory
+from app.schemas.model_crud.activities import TimeSeriesSampleCreate
+from app.schemas.model_crud.activities.health_score import HealthScoreCreate, ScoreComponent
+from app.services.timeseries_service import timeseries_service
+from tests.factories import UserFactory
+
+T0 = datetime(2026, 10, 11, 3, 0, tzinfo=timezone.utc)
+
+SKIN = [
+    SeriesType.skin_temperature,
+    SeriesType.skin_temperature_deviation,
+    SeriesType.skin_temperature_trend_deviation,
+    SeriesType.garmin_skin_temperature,
+    SeriesType.body_temperature,
+]
+ENVIRONMENT = [SeriesType.water_temperature, SeriesType.weather_temperature, SeriesType.air_temperature]
+
+
+def _sample(user_id: Any, series: SeriesType, value: float) -> TimeSeriesSampleCreate:
+    return TimeSeriesSampleCreate(
+        id=uuid4(),
+        user_id=user_id,
+        provider=ProviderName.POLAR,
+        source=ProviderName.POLAR,
+        recorded_at=T0,
+        value=value,
+        series_type=series,
+    )
+
+
+def _stored(db: Session, user_id: Any) -> list[str]:
+    rows = db.execute(
+        select(SeriesTypeDefinition.code)
+        .join(DataPointSeries, DataPointSeries.series_type_definition_id == SeriesTypeDefinition.id)
+        .join(DataSource, DataSource.id == DataPointSeries.data_source_id)
+        .where(DataSource.user_id == user_id)
+    )
+    return sorted(code for (code,) in rows)
+
+
+class _SyncThread:
+    """Runs the webhook thread's target inline, so the test sees what it emitted."""
+
+    def __init__(self, target: Any, args: tuple, daemon: bool) -> None:  # noqa: ARG002
+        self._target, self._args = target, args
+
+    def start(self) -> None:
+        self._target(*self._args)
+
+
+@pytest.fixture
+def emitted() -> Iterator[list[dict]]:
+    calls: list[dict] = []
+    with (
+        patch("app.services.timeseries_service.svix_service.is_enabled", return_value=True),
+        patch("app.services.timeseries_service.threading.Thread", _SyncThread),
+        patch("app.services.timeseries_service.on_timeseries_batch_saved", side_effect=lambda **kw: calls.append(kw)),
+    ):
+        yield calls
+
+
+def test_the_not_kept_set_is_every_temperature_series_but_the_environments() -> None:
+    assert frozenset(SKIN) == NOT_KEPT_SERIES
+    assert {s for s in SeriesType if "temp" in s.value} == set(SKIN) | set(ENVIRONMENT)
+
+
+@pytest.mark.parametrize("series", ENVIRONMENT)
+def test_an_environmental_temperature_is_still_stored(db: Session, series: SeriesType) -> None:
+    user = UserFactory()
+
+    DataPointSeriesRepository(DataPointSeries).bulk_create(db, [_sample(user.id, series, 18.0)])
+
+    assert _stored(db, user.id) == [series.value]
+
+
+@pytest.mark.parametrize("series", SKIN)
+def test_bulk_create_stores_no_skin_temperature_and_keeps_the_rest(db: Session, series: SeriesType) -> None:
+    user = UserFactory()
+    repo = DataPointSeriesRepository(DataPointSeries)
+
+    counts = repo.bulk_create(db, [_sample(user.id, series, 33.6), _sample(user.id, SeriesType.resting_heart_rate, 52)])
+
+    assert (counts.inserted, counts.updated) == (1, 0)
+    assert _stored(db, user.id) == ["resting_heart_rate"]
+
+
+@pytest.mark.parametrize("series", SKIN)
+def test_create_stores_no_skin_temperature(db: Session, series: SeriesType) -> None:
+    user = UserFactory()
+    repo = DataPointSeriesRepository(DataPointSeries)
+
+    assert repo.create(db, _sample(user.id, series, 33.6)) is None
+    assert _stored(db, user.id) == []
+
+
+@pytest.mark.parametrize("series", SKIN)
+def test_the_service_neither_stores_nor_announces_skin_temperature(
+    db: Session, emitted: list[dict], series: SeriesType
+) -> None:
+    user = UserFactory()
+
+    timeseries_service.bulk_create_samples(
+        db, [_sample(user.id, series, 33.6), _sample(user.id, SeriesType.resting_heart_rate, 52)]
+    )
+    db.commit()
+
+    assert _stored(db, user.id) == ["resting_heart_rate"]
+    assert [s["type"] for call in emitted for s in call["samples"]] == ["resting_heart_rate"]
+
+
+@pytest.mark.parametrize("series", SKIN)
+def test_the_service_create_of_a_skin_sample_stores_nothing_and_does_not_raise(db: Session, series: SeriesType) -> None:
+    user = UserFactory()
+
+    assert timeseries_service.create(db, _sample(user.id, series, 33.6)) is None
+    assert _stored(db, user.id) == []
+
+
+@pytest.mark.parametrize("path", ["bulk_create", "create"])
+@pytest.mark.parametrize("key", ["skin_temp_celsius", "body_temperature"])
+def test_a_health_score_keeps_its_other_components_and_no_temperature(db: Session, key: str, path: str) -> None:
+    user = UserFactory()
+    db.flush()
+    score = HealthScoreCreate(
+        id=uuid4(),
+        user_id=user.id,
+        provider=ProviderName.OURA,
+        category=HealthScoreCategory.READINESS,
+        value=80,
+        recorded_at=T0,
+        components={key: ScoreComponent(value=60), "hrv_balance": ScoreComponent(value=75)},
+    )
+    repo = HealthScoreRepository(HealthScore)
+    if path == "create":
+        repo.create(db, score)
+    else:
+        repo.bulk_create(db, [score])
+
+    stored = db.scalar(select(HealthScore.components).where(HealthScore.user_id == user.id))
+    assert set(stored or {}) == {"hrv_balance"}
+
+
+def test_the_coverage_endpoint_offers_no_series_that_is_never_stored() -> None:
+    """/v1/meta/coverage (and the docs generated from it) must not advertise a temperature."""
+    offered = {metric.code for category in _build_coverage().timeseries for metric in category.metrics}
+    assert offered.isdisjoint(s.value for s in NOT_KEPT_SERIES)
+    assert {s.value for s in ENVIRONMENT} & offered, "environmental temperatures stay on offer"

@@ -314,7 +314,8 @@ class TestUltrahumanActivitySamplesIntegration:
                     type_id_to_code[sample.series_type_definition_id] = std.code if std else None
 
             synced_codes = set(type_id_to_code.values())
-            expected_codes = {"heart_rate", "heart_rate_variability_sdnn", "skin_temperature", "steps"}
+            # Ultrahuman sends temperature too; skin temperature is never stored (R-2026-10-23-f).
+            expected_codes = {"heart_rate", "heart_rate_variability_sdnn", "steps"}
 
             for code in expected_codes:
                 assert code in synced_codes, f"{code} missing from synced samples"
@@ -389,10 +390,10 @@ class TestUltrahumanActivitySamplesIntegration:
             value = float(sample.value)
             assert 40 <= value <= 200, f"Heart rate {value} is outside realistic range"
 
-    def test_temperature_values_are_reasonable_with_mocked_api(
+    def test_skin_temperature_sent_by_ultrahuman_is_not_stored_with_mocked_api(
         self, db: Session, sample_ultrahuman_api_response: dict
     ) -> None:
-        """Verify skin temperature values are within realistic range."""
+        """FORK (Calibra ruling R-2026-10-23-f): the fixture carries temperature; none is stored."""
         user = UserFactory()
         UserConnectionFactory(user=user, provider="ultrahuman", status="active", access_token="test_token")
         DataSourceFactory(user_id=user.id, provider="ultrahuman")
@@ -420,10 +421,18 @@ class TestUltrahumanActivitySamplesIntegration:
             .all()
         )
 
-        assert len(samples) > 0, "No temperature samples found"
-        for sample in samples:
-            value = float(sample.value)
-            assert 29 <= value <= 42, f"Temperature {value} is outside realistic range"
+        sent = [m for m in sample_ultrahuman_api_response["data"]["metric_data"] if m["type"] == "temp"]
+        assert sent, "the fixture must carry temperature"
+        assert samples == []
+        # Positive control: the same load stored the other series, so the empty list is the filter.
+        stored = (
+            db.query(DataPointSeries)
+            .join(DataSource)
+            .join(SeriesTypeDefinition, DataPointSeries.series_type_definition_id == SeriesTypeDefinition.id)
+            .filter(DataSource.user_id == user.id, SeriesTypeDefinition.code == SeriesType.heart_rate.value)
+            .count()
+        )
+        assert stored > 0
 
     def test_timestamps_are_utc_with_mocked_api(self, db: Session, sample_ultrahuman_api_response: dict) -> None:
         """Verify all activity sample timestamps are in UTC timezone."""

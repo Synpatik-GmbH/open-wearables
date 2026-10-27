@@ -30,6 +30,9 @@ Three rules, all read and written here, all keyed on the Polar connection:
   sleep listing its offsets come from. At most ``WEBHOOK_HR_DAILY_CAP`` of them call Polar in any
   24 hours (``claim_continuous_hr_webhook``), so they add at most 18: 146 + 36 + 18 = 200. Past
   the cap a webhook calls nothing and the day is stored by the next full fetch.
+- The 136 and 146 figures were measured with the body- and sleep-skin-temperature endpoints in the
+  pull. Those are no longer fetched (Calibra rulings R-2026-10-23-f, R-2026-10-26-d), so each day
+  now costs fewer calls and the figures remain upper bounds.
 
 The state is one ``PolarPullState`` row. Writes commit at once: the claim has to be visible to
 a pull starting in another worker, and a fetch already stored must not be forgotten when a
