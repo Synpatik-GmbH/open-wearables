@@ -901,7 +901,7 @@ class TestOutgoingWebhooksAPI:
 
 
 class TestWebhookPrioritySettings:
-    def test_default_set_contains_the_nine_calibra_events(self) -> None:
+    def test_default_set_contains_the_ten_calibra_events(self) -> None:
         from app.config import Settings
 
         s = Settings()
@@ -910,6 +910,7 @@ class TestWebhookPrioritySettings:
                 "workout.created",
                 "sleep.created",
                 "series.heart_rate_variability_rmssd.created",
+                "series.garmin_hrv_rmssd_nightly.created",
                 "series.heart_rate_variability_sdnn.created",
                 "series.respiratory_rate.created",
                 "series.resting_heart_rate.created",

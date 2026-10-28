@@ -43,6 +43,7 @@ TIMESERIES: frozenset[SeriesType] = frozenset(
         SeriesType.body_mass_index,  # /wellness-api/rest/bodyComps
         SeriesType.skeletal_muscle_mass,  # /wellness-api/rest/bodyComps
         SeriesType.heart_rate_variability_rmssd,  # /wellness-api/rest/hrv + healthSnapshot
+        SeriesType.garmin_hrv_rmssd_nightly,  # /wellness-api/rest/hrv (FORK Calibra 2.71.3.2: lastNightAvg)
         SeriesType.heart_rate_variability_sdnn,  # /wellness-api/rest/healthSnapshot
         SeriesType.garmin_stress_level,  # /wellness-api/rest/stressDetails + healthSnapshot
         SeriesType.garmin_body_battery,  # /wellness-api/rest/stressDetails

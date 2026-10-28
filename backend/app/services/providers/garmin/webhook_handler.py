@@ -62,6 +62,31 @@ WELLNESS_TYPES: list[str] = [
     "activityFiles",
 ]
 
+# FORK (Calibra 2.71.3.2, spec 2.71.3 v0.3 section 2.2; delivers 2.71.1): the Garmin types kept.
+# Every other key a push carries (Women's Health ``mct``, stress, pulse oximetry, blood
+# pressure, body composition, user metrics, health snapshot, skin temperature, Move IQ,
+# activity files) is stripped before the payload is archived or queued, and again before the
+# worker processes it. The portal's endpoint settings are not the control: this is.
+GARMIN_KEPT_TYPES: frozenset[str] = frozenset(
+    {
+        "dailies",
+        "epochs",
+        "sleeps",
+        "hrv",
+        "allDayRespiration",
+        "activities",
+        "activityDetails",
+        "userPermissionsChange",
+        "deregistrations",
+    }
+)
+
+
+def kept_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """The payload with only the kept Garmin types."""
+    return {key: value for key, value in payload.items() if key in GARMIN_KEPT_TYPES}
+
+
 # Celery task paths — used with send_task() to avoid circular imports
 _TRIGGER_NEXT_TASK = "app.integrations.celery.tasks.garmin.backfill_task.trigger_next_pending_type"
 _PROCESS_PUSH_TASK = "app.integrations.celery.tasks.webhook_push_task.process_webhook_push"
@@ -167,6 +192,9 @@ class GarminWebhookHandler(BaseWebhookHandler):
             garmin_user_ids=garmin_user_ids,
         )
 
+        # FORK (Calibra 2.71.3.2): the log above counts what arrived; nothing past this line sees a
+        # type Calibra does not keep.
+        payload = kept_payload(payload)
         store_raw_payload(source="webhook", provider="garmin", payload=payload, trace_id=request_trace_id)
 
         # garmin_sync is isolated from the default queue so high-volume live-push
@@ -189,6 +217,9 @@ class GarminWebhookHandler(BaseWebhookHandler):
         Called by the ``process_webhook_push`` Celery task with its own DB session.
         Raises on infrastructure errors so the task can retry.
         """
+        # FORK (Calibra 2.71.3.2): a payload queued before the receive path stripped it is held to
+        # the same set.
+        payload = kept_payload(payload)
         errors: list[str] = []
         synced_user_ids: set[UUID] = set()
         users_with_new_success: set[str] = set()
@@ -383,4 +414,9 @@ class GarminWebhookHandler(BaseWebhookHandler):
         return backfill_triggered
 
     def supported_event_types(self) -> list[str]:
-        return ["activities", *WELLNESS_TYPES, "userPermissionsChange", "deregistrations"]
+        # FORK (Calibra 2.71.3.2): the kept set, which the documented enable-list derives from.
+        return [
+            t
+            for t in ["activities", *WELLNESS_TYPES, "userPermissionsChange", "deregistrations"]
+            if t in GARMIN_KEPT_TYPES
+        ]

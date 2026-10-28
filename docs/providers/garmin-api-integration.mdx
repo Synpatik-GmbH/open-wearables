@@ -97,7 +97,7 @@ Once you get access to the Developer Portal, you’ll find the full docs, includ
     - Create an app and set the type to **Connect Developer - Evaluation**
     - Set the **OAuth redirect URL** (where the user is sent after Garmin login in the 3-legged OAuth flow)
     - Provide legal company details and describe how you will use Garmin data (aggregated/anonymous vs linked to identifiable users)
-    - Select the APIs your deployment's purpose covers. For the endpoint list in the next step that is **Health** and **Activity**. **Women’s Health** is a separate API product covering menstrual cycle and pregnancy tracking; select it only if your deployment's purpose and legal basis cover that data (see **Why `mct` is left off by default** in the next step)
+    - Select the APIs your deployment's purpose covers. For the endpoint list in the next step that is **Health** and **Activity**. **Women’s Health** is a separate API product covering menstrual cycle and pregnancy tracking; do not select it: this fork drops its data (see **What this fork does not keep from Garmin** in the next step)
 
     <Note>
     One company account can manage multiple apps (e.g., if you run separate apps for different clients).
@@ -134,41 +134,30 @@ Once you get access to the Developer Portal, you’ll find the full docs, includ
 
     **Which endpoints to enable:**
 
-    Enable these endpoints. The list deliberately leaves out **`mct`** (Menstrual Cycle Tracking); read the warning below before enabling it:
+    Enable these endpoints, and no others:
 
     ```
     activities
+    activityDetails
     dailies
     epochs
     sleeps
-    bodyComps
     hrv
-    stressDetails
     allDayRespiration
-    pulseox
-    healthSnapshot
-    skinTemp
-    moveIQActivities
-    userMetrics
-    bloodPressures
-    activityDetails
-    activityFiles
     userPermissionsChange
     deregistrations
     ```
 
-    This is `WELLNESS_TYPES` in `backend/app/services/providers/garmin/webhook_handler.py`, minus `mct`, plus the three types handled outside that list: `activities`, `userPermissionsChange` and `deregistrations`. `WELLNESS_TYPES` is the list the wellness processing loop iterates, so it is what actually gates ingestion. Anything Garmin pushes that is neither in it nor one of those three is not processed.
+    This is `GARMIN_KEPT_TYPES` in `backend/app/services/providers/garmin/webhook_handler.py`, which `supported_event_types()` returns. The webhook strips every other type from a push before it is archived or queued, and the worker strips it again, so an endpoint enabled beyond this list costs Garmin traffic and stores nothing.
 
-    These are internal names, so if a row on Garmin’s page is labelled differently — `userPermissionsChange` and `deregistrations` especially — match it by meaning and enable the equivalent row. Leave `mct` off, whatever Garmin calls it, unless your deployment has deliberately decided to process that data.
+    These are internal names, so if a row on Garmin’s page is labelled differently — `userPermissionsChange` and `deregistrations` especially — match it by meaning and enable the equivalent row.
 
     <Warning>
-    **Why `mct` (Menstrual Cycle Tracking) is left off by default.**
+    **What this fork does not keep from Garmin, and why.**
 
-    **Every data endpoint in the list above also carries data concerning health.** Sleep, HRV, stress, respiration, blood pressure, activity and the rest are special categories of personal data under **Art. 9 GDPR**; the two lifecycle notifications, `userPermissionsChange` and `deregistrations`, carry only a Garmin user id with its permission or revocation state. Processing the health data needs your deployment's own lawful basis and compliance assessment — this list does not establish one, and enabling only these endpoints does not make a deployment compliant.
+    **Every data endpoint in the list above also carries data concerning health.** Sleep, HRV, respiration, activity and the rest are special categories of personal data under **Art. 9 GDPR**; the two lifecycle notifications, `userPermissionsChange` and `deregistrations`, carry only a Garmin user id with its permission or revocation state. Processing the health data needs your deployment's own lawful basis and compliance assessment — this list does not establish one, and enabling only these endpoints does not make a deployment compliant.
 
-    `mct` is left out on **purpose limitation and data minimisation**, not because the other endpoints are exempt: menstrual cycle and pregnancy data is a further, more intimate category that a deployment should process only if its purpose requires it.
-
-    Enabling it is not a passive choice. Garmin pushes the data, Open Wearables writes it to the `menstrual_cycle_details` table, and it dispatches a `menstrual_cycle.created` outgoing webhook whose payload carries a `pregnancy_snapshot`, so the data reaches your database and every downstream subscriber. If your deployment's purpose does cover it, select **Women’s Health**, enable `mct`, and make sure your lawful basis, consent and impact assessment cover this category explicitly — as a separate decision, not as part of “enable everything”.
+    Everything else Garmin offers is dropped on purpose limitation and data minimisation: stress, body battery, pulse oximetry, blood pressure, body composition, user metrics, health snapshot, skin temperature, Move IQ, activity files and **`mct`** (Menstrual Cycle Tracking, Women’s Health). Menstrual cycle and pregnancy data is the most intimate of these, and in this fork enabling `mct` has no effect: the push is stripped before anything is written. A deployment whose purpose covers any of these types has to change `GARMIN_KEPT_TYPES` deliberately, with its lawful basis, consent and impact assessment covering each one.
     </Warning>
 
     A subset of these types is actively requested during historical backfill — which ones is determined by `BACKFILL_DATA_TYPES` in `backend/app/services/providers/garmin/backfill_config.py`. All other enabled endpoints will passively receive data whenever Garmin pushes new updates.

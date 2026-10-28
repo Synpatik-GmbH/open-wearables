@@ -21,6 +21,7 @@ SERIES_TYPE_TO_GROUP_EVENT: dict[str, str] = {
     "atrial_fibrillation_burden": WebhookEventType.HEART_RATE_CREATED,
     "heart_rate_variability_sdnn": WebhookEventType.HEART_RATE_VARIABILITY_CREATED,
     "heart_rate_variability_rmssd": WebhookEventType.HEART_RATE_VARIABILITY_CREATED,
+    "garmin_hrv_rmssd_nightly": WebhookEventType.HEART_RATE_VARIABILITY_CREATED,
     "garmin_body_battery": WebhookEventType.RECOVERY_SCORE_CREATED,
     # Blood & Respiratory
     "oxygen_saturation": WebhookEventType.SPO2_CREATED,
@@ -126,6 +127,7 @@ SERIES_TYPE_TO_GRANULAR_EVENT: dict[str, str] = {
     "atrial_fibrillation_burden": WebhookEventType.SERIES_ATRIAL_FIBRILLATION_BURDEN,
     "heart_rate_variability_sdnn": WebhookEventType.SERIES_HEART_RATE_VARIABILITY_SDNN,
     "heart_rate_variability_rmssd": WebhookEventType.SERIES_HEART_RATE_VARIABILITY_RMSSD,
+    "garmin_hrv_rmssd_nightly": WebhookEventType.SERIES_GARMIN_HRV_RMSSD_NIGHTLY,
     "garmin_body_battery": WebhookEventType.SERIES_GARMIN_BODY_BATTERY,
     "oxygen_saturation": WebhookEventType.SERIES_OXYGEN_SATURATION,
     "peripheral_perfusion_index": WebhookEventType.SERIES_PERIPHERAL_PERFUSION_INDEX,

@@ -159,6 +159,7 @@ class SeriesType(str, Enum):
     garmin_skin_temperature = "garmin_skin_temperature"  # Skin temp deviation from baseline
     garmin_fitness_age = "garmin_fitness_age"  # Garmin fitness age estimate
     garmin_body_battery = "garmin_body_battery"  # Garmin body battery (0-100)
+    garmin_hrv_rmssd_nightly = "garmin_hrv_rmssd_nightly"  # FORK: HRV summary lastNightAvg, ms
 
     # =========================================================================
     # WITHINGS-SPECIFIC METRICS (IDs 240-249)
@@ -316,6 +317,8 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     (221, SeriesType.garmin_skin_temperature, "celsius"),  # kept for backwards compatibility
     (222, SeriesType.garmin_fitness_age, "years"),
     (223, SeriesType.garmin_body_battery, "percent"),
+    # FORK (Calibra 2.71.3.2): the last ID of the range, the one an upstream addition reaches last.
+    (239, SeriesType.garmin_hrv_rmssd_nightly, "ms"),
     # -------------------------------------------------------------------------
     # WITHINGS-SPECIFIC METRICS (IDs 240-249)
     # -------------------------------------------------------------------------
@@ -347,6 +350,7 @@ SERIES_TYPE_UNIT_BY_ENUM: dict[SeriesType, str] = {enum: unit for _, enum, unit 
 # Only series types that need a meaningful clarification have an entry here;
 SERIES_TYPE_DESCRIPTION_BY_ENUM: dict[SeriesType, str] = {
     SeriesType.garmin_body_battery: "Intraday body battery readings (0-100), one sample per measurement",
+    SeriesType.garmin_hrv_rmssd_nightly: "Garmin's own overnight HRV (RMSSD) from its HRV summary, one per night",
 }
 
 
