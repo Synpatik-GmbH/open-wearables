@@ -20,6 +20,14 @@ from tests.factories import UserFactory
 
 START = date(2026, 10, 1)
 
+# A provisional source frozen mid-test becomes the frozen member's state: connected on START,
+# frozen a week later. The connection day moves with the start date, or the window check
+# (start_date within 28 days of connection_day) rejects a source connected "now + 2 days" once
+# that is more than 28 days after START.
+FREEZE_AS_CONNECTED_ON_START = text(
+    "UPDATE wearable_history_sources SET freeze_at=:f, start_date=:s, connection_day=:s WHERE user_id=:m"
+)
+
 
 def frozen_member(db: Session, *, frozen: bool = True) -> str:
     member = UserFactory()
@@ -148,10 +156,7 @@ def test_an_import_crossing_the_freeze_switches_at_its_next_chunk(db: Session, p
 
     def chunks():  # noqa: ANN202
         yield chunk(user_id)
-        db.execute(
-            text("UPDATE wearable_history_sources SET freeze_at=:f, start_date=:s WHERE user_id=:m"),
-            {"f": datetime(2026, 10, 8, tzinfo=UTC), "s": START, "m": user_id},
-        )
+        db.execute(FREEZE_AS_CONNECTED_ON_START, {"f": datetime(2026, 10, 8, tzinfo=UTC), "s": START, "m": user_id})
         yield chunk(user_id)
 
     service = MagicMock()
@@ -178,10 +183,7 @@ def test_a_sleep_rejection_after_a_freeze_inside_the_chunk_counts_as_skipped(db:
     user_id = frozen_member(db, frozen=False)
     skipper = PrestartSkipper.for_member(db, user_id)
     assert skipper.start_date is None
-    db.execute(
-        text("UPDATE wearable_history_sources SET freeze_at=:f, start_date=:s WHERE user_id=:m"),
-        {"f": datetime(2026, 10, 8, tzinfo=UTC), "s": START, "m": user_id},
-    )
+    db.execute(FREEZE_AS_CONNECTED_ON_START, {"f": datetime(2026, 10, 8, tzinfo=UTC), "s": START, "m": user_id})
     assert skipper.rejected_sleep_batch(db, 2)
     assert skipper.skipped == 2
 
