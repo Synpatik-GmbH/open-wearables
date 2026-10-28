@@ -95,6 +95,12 @@ def engine(_postgres_url: str) -> Any:
         purge_spec.loader.exec_module(purge_migration)
         Operations(MigrationContext.configure(connection)).drop_table("xml_uploads")
         purge_migration.upgrade()
+        # Calibra 2.71.3.2: Garmin's nightly HRV joins the night-metric list of the two functions.
+        nightly_path = migration_path.parent / "2026_10_28_1900-7c2f4e9a1b30_garmin_nightly_hrv_is_night_physiology.py"
+        nightly_spec = importlib.util.spec_from_file_location("garmin_nightly_schema", nightly_path)
+        nightly_migration = importlib.util.module_from_spec(nightly_spec)
+        nightly_spec.loader.exec_module(nightly_migration)
+        nightly_migration.upgrade()
 
     # Seed series type definitions (these need to exist for foreign key constraints)
     with Session(bind=test_engine) as session:

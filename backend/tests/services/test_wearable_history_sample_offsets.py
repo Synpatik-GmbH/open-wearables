@@ -28,6 +28,7 @@ METRICS = [
     SeriesType.heart_rate,
     SeriesType.heart_rate_variability_sdnn,
     SeriesType.heart_rate_variability_rmssd,
+    SeriesType.garmin_hrv_rmssd_nightly,  # Calibra 2.71.3.2
     SeriesType.resting_heart_rate,
     SeriesType.respiratory_rate,
     SeriesType.oxygen_saturation,
@@ -121,6 +122,25 @@ def test_first_night_sample_offset_is_rejected_until_its_own_night_is_stored(
     )
     db.commit()
     assert db.get(DataPointSeries, sample.id).zone_offset == offset
+
+
+def test_garmins_nightly_value_is_admitted_by_its_own_night_in_both_database_functions(db: Session) -> None:
+    """Calibra 2.71.3.2 (migration 7c2f4e9a1b30): the write and read gates both place Garmin's
+    nightly HRV value by the recorded night that contains it, as they place RMSSD. Asked
+    directly: the sample tests above prove the Python gate, and their database insert after the
+    night is deferred past the end of the test transaction."""
+    _member, source = source_setup(db)
+    metric = get_series_type_id(SeriesType.garmin_hrv_rmssd_nightly)
+    written = text("SELECT wh_sample_admitted(:source,:metric,:instant,:zone)")
+    read = text("SELECT wh_read_sample(:source,:metric,:instant)")
+    args = dict(source=source.id, metric=metric, instant=INSTANT)
+
+    assert db.scalar(written, {**args, "zone": "+04:00"}) is False
+    own_night(db, source, "+04:00")
+    db.commit()
+
+    assert db.scalar(written, {**args, "zone": "+04:00"}) is True
+    assert db.scalar(read, args) is True
 
 
 @pytest.mark.parametrize("metric", SDK_METRICS)

@@ -21,6 +21,7 @@ NIGHT_PHYSIOLOGY = frozenset(
         "heart_rate",
         "heart_rate_variability_sdnn",
         "heart_rate_variability_rmssd",
+        "garmin_hrv_rmssd_nightly",  # FORK (Calibra 2.71.3.2), migration 7c2f4e9a1b30
         "skin_temperature",
         "body_temperature",
         "resting_heart_rate",
