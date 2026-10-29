@@ -79,6 +79,7 @@ class WebhookEventType(StrEnum):
     SERIES_HEART_RATE_VARIABILITY_SDNN = "series.heart_rate_variability_sdnn.created"
     SERIES_HEART_RATE_VARIABILITY_RMSSD = "series.heart_rate_variability_rmssd.created"
     SERIES_GARMIN_HRV_RMSSD_NIGHTLY = "series.garmin_hrv_rmssd_nightly.created"  # FORK (Calibra 2.71.3.2)
+    SERIES_GOOGLE_HRV_RMSSD_DAILY = "series.google_hrv_rmssd_daily.created"  # FORK (Calibra 2.72.2)
 
     # Recovery
     SERIES_GARMIN_BODY_BATTERY = "series.garmin_body_battery.created"
@@ -242,6 +243,7 @@ EVENT_TYPE_DESCRIPTIONS: dict[WebhookEventType, str] = {
     WebhookEventType.SERIES_HEART_RATE_VARIABILITY_SDNN: "HRV SDNN samples were ingested.",
     WebhookEventType.SERIES_HEART_RATE_VARIABILITY_RMSSD: "HRV RMSSD samples were ingested.",
     WebhookEventType.SERIES_GARMIN_HRV_RMSSD_NIGHTLY: "Garmin nightly HRV values were ingested.",
+    WebhookEventType.SERIES_GOOGLE_HRV_RMSSD_DAILY: "Google Health daily HRV values were ingested.",
     WebhookEventType.SERIES_GARMIN_BODY_BATTERY: "Garmin body battery samples were ingested.",
     WebhookEventType.SERIES_OXYGEN_SATURATION: "Blood oxygen saturation (SpO2) samples were ingested.",
     WebhookEventType.SERIES_PERIPHERAL_PERFUSION_INDEX: "Peripheral perfusion index samples were ingested.",
@@ -344,6 +346,7 @@ EVENT_TYPE_GROUPS: dict[str, list[str]] = {
         WebhookEventType.SERIES_HEART_RATE_VARIABILITY_SDNN,
         WebhookEventType.SERIES_HEART_RATE_VARIABILITY_RMSSD,
         WebhookEventType.SERIES_GARMIN_HRV_RMSSD_NIGHTLY,
+        WebhookEventType.SERIES_GOOGLE_HRV_RMSSD_DAILY,
     ],
     WebhookEventType.RECOVERY_SCORE_CREATED: [
         WebhookEventType.SERIES_GARMIN_BODY_BATTERY,

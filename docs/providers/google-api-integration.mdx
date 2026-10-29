@@ -34,12 +34,20 @@ The Google Health API is an **aggregation layer**: it surfaces data from *every*
 
 | Data type | Path |
 |-----------|------|
-| Steps, distance, calories, hydration | 24/7 metrics |
-| Heart rate, resting heart rate, HRV (RMSSD + SDNN) | 24/7 metrics |
-| VO₂ max, respiratory rate, SpO₂ | 24/7 metrics |
-| Weight, body fat, core body temperature (not stored), blood glucose | 24/7 metrics |
+| Steps | 24/7 metrics |
+| Heart rate, daily resting heart rate, HRV samples (RMSSD), daily HRV (RMSSD, its own series `google_hrv_rmssd_daily`) | 24/7 metrics |
+| Daily respiratory rate | 24/7 metrics |
 | Workouts (Exercise sessions) | Sessions |
 | Sleep (with stages) | Sessions |
+
+<Note>
+**Fork (Calibra 2.72.2):** only the types above are read. Distance, calories, hydration, SDNN,
+VO₂ max, SpO₂, weight, body fat, core body temperature and blood glucose are not requested and
+not stored, and no basal energy is derived. On connect it imports at most 28 days, from 00:00
+Europe/Berlin, and nothing before the member's history floor (the first connection day less 28) is
+stored. A date-filtered request (daily types, exercise) asks one day further back, and what lies
+outside the window is discarded.
+</Note>
 
 ### Data delivery
 
@@ -60,10 +68,8 @@ The Health API exposes the same underlying data through three different operatio
 <Warning>
 Windowed `dataPoints:rollUp` aggregates are currently disabled. A rollUp window starts wherever the requested range does, so the same reading came back under a different timestamp on a later sync and was inserted as a duplicate rather than updated.
 
-Because `hourly` and `daily` cannot be honoured without it, Google Health **refuses** them rather than storing raw data under an aggregating setting: a scheduled pull is reported as a failed `data_247` sync, and a webhook notification is reported to the error tracker and dropped (it is not answered with a 5xx, which Google would only retry). Sleep sessions and derived daily totals are unaffected and keep syncing. Set the provider's granularity to `raw` to resume the rest.
+Because `hourly` and `daily` cannot be honoured without it, Google Health **refuses** them rather than storing raw data under an aggregating setting: a scheduled pull is reported as a failed `data_247` sync, and a webhook notification is reported to the error tracker and dropped (it is not answered with a 5xx, which Google would only retry). Sleep sessions are unaffected and keep syncing. Set the provider's granularity to `raw` to resume the rest.
 </Warning>
-
-Daily basal energy is the one exception: it is derived from `dataPoints:dailyRollUp`, whose windows are anchored to civil days and so do not drift.
 
 ### Reconcile vs. list — why it matters
 
@@ -331,10 +337,9 @@ curl -X DELETE \
 
 <Note>
 `dataTypes` above is an abbreviated example — use the set the app supports for webhooks
-(steps, distance, hydration-log, heart-rate, run-vo2-max, daily-resting-heart-rate,
-heart-rate-variability, daily-heart-rate-variability, weight, body-fat, blood-glucose,
-daily-respiratory-rate, daily-oxygen-saturation, sleep, exercise). Registering a data type
-the app doesn't handle just means its notifications are ignored.
+(steps, heart-rate, daily-resting-heart-rate, heart-rate-variability,
+daily-heart-rate-variability, daily-respiratory-rate, sleep, exercise). Registering a data type
+the app doesn't handle just means its notifications are ignored and nothing is fetched.
 </Note>
 
 ## Next Steps

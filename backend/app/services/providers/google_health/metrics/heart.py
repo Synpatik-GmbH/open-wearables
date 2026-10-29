@@ -1,19 +1,20 @@
 """Heart-family metrics.
 
-heart-rate / run-vo2-max support rollUp + list; daily-resting-heart-rate (Daily),
-heart-rate-variability (Sample), daily-heart-rate-variability (Daily) and vo2-max (Sample)
-are list only. The sample HRV type emits RMSSD plus SDNN; the daily one is RMSSD only —
-Google documents its average as an RMSSD, and its deep-sleep field is a second RMSSD that
-has no series of its own yet (writing both as rmssd would collide on source+type+date).
-vo2-max is the generic counterpart of run-vo2-max, which only Fitbit-style running
-estimates populate.
+heart-rate supports rollUp + list; daily-resting-heart-rate (Daily), heart-rate-variability
+(Sample) and daily-heart-rate-variability (Daily) are list only. The sample HRV type is read
+for its RMSSD only; the daily one is RMSSD only — Google documents its average as an RMSSD,
+and its deep-sleep field is a second RMSSD that has no series of its own yet. FORK (Calibra
+2.72.2, design D-01): the daily value is written to google_hrv_rmssd_daily, not to RMSSD.
 
-heart-rate and run-vo2-max rollUp values also carry Min/Max alongside the Avg we take;
-capturing those would use the same `extra` mechanism once dedicated SeriesTypes exist.
+FORK (Calibra 2.72.2, design D-02): only the spec 2.2 heart types are kept. run-vo2-max,
+vo2-max and the sample's SDNN are not read.
+
+heart-rate rollUp values also carry Min/Max alongside the Avg we take; capturing those
+would use the `extra` mechanism once dedicated SeriesTypes exist.
 """
 
 from app.schemas.enums import SeriesType
-from app.schemas.providers.google import DataTypeMetric, ListSpec, RollupSpec, SeriesField, TimeShape
+from app.schemas.providers.google import DataTypeMetric, ListSpec, RollupSpec, TimeShape
 
 HEART_METRICS: tuple[DataTypeMetric, ...] = (
     DataTypeMetric(
@@ -22,13 +23,6 @@ HEART_METRICS: tuple[DataTypeMetric, ...] = (
         value_key="heartRate",
         rollup_spec=RollupSpec("beatsPerMinuteAvg", max_range_days=14),
         list_spec=ListSpec("beatsPerMinute", TimeShape.SAMPLE),
-    ),
-    DataTypeMetric(
-        "run-vo2-max",
-        SeriesType.vo2_max,
-        value_key="runVo2Max",
-        rollup_spec=RollupSpec("rateAvg"),
-        list_spec=ListSpec("runVo2Max", TimeShape.SAMPLE),
     ),
     DataTypeMetric(
         "daily-resting-heart-rate",
@@ -40,26 +34,18 @@ HEART_METRICS: tuple[DataTypeMetric, ...] = (
         "heart-rate-variability",
         SeriesType.heart_rate_variability_rmssd,
         value_key="heartRateVariability",
-        list_spec=ListSpec(
-            "rootMeanSquareOfSuccessiveDifferencesMilliseconds",
-            TimeShape.SAMPLE,
-            extra=(SeriesField(SeriesType.heart_rate_variability_sdnn, "standardDeviationMilliseconds"),),
-        ),
+        # FORK (Calibra 2.72.2, design D-02): RMSSD only; the sample's SDNN is not kept.
+        list_spec=ListSpec("rootMeanSquareOfSuccessiveDifferencesMilliseconds", TimeShape.SAMPLE),
     ),
     DataTypeMetric(
         "daily-heart-rate-variability",
-        SeriesType.heart_rate_variability_rmssd,
+        # FORK (Calibra 2.72.2, design D-01): its own series, so no sample at its instant can replace it.
+        SeriesType.google_hrv_rmssd_daily,
         value_key="dailyHeartRateVariability",
         list_spec=ListSpec(
             "averageHeartRateVariabilityMilliseconds",
             TimeShape.DATE,
             is_daily_total=True,
         ),
-    ),
-    DataTypeMetric(
-        "vo2-max",
-        SeriesType.vo2_max,
-        value_key="vo2Max",
-        list_spec=ListSpec("vo2Max", TimeShape.SAMPLE),
     ),
 )

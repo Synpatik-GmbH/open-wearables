@@ -4,6 +4,7 @@ A malformed page must fail its own metric loudly instead of reading as an exhaus
 window, which is what let a failed fetch pass as "no data" (#1545).
 """
 
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -12,8 +13,13 @@ import pytest
 from app.schemas.providers.google import DataPointsPage
 from app.services.providers.google_health.data_247 import GoogleHealth247Data
 from app.services.providers.google_health.helpers import parse_page
+from tests.providers.google_health.history import open_window  # noqa: F401  (fixture)
+
+pytestmark = pytest.mark.usefixtures("open_window")
 
 USER_ID = uuid4()
+START = datetime(2026, 10, 20, tzinfo=UTC)
+END = datetime(2026, 10, 21, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -87,7 +93,7 @@ class TestFailureIsolation:
             patch.object(data_247.settings_repo, "get_data_granularity", return_value=None),
             patch("app.services.providers.google_health.data_247.store_raw_payload"),
         ):
-            results = data_247.load_and_save_all(db, USER_ID, MagicMock(), MagicMock())
+            results = data_247.load_and_save_all(db, USER_ID, START, END)
 
         assert results == {}  # nothing had samples, but the run completed
         assert any("heart-rate/" in c for c in calls)
@@ -114,7 +120,7 @@ class TestPerMetricTransactions:
             patch.object(data_247.settings_repo, "get_data_granularity", return_value=None),
             patch("app.services.providers.google_health.data_247.store_raw_payload"),
         ):
-            return data_247.load_and_save_all(db, USER_ID, MagicMock(), MagicMock())
+            return data_247.load_and_save_all(db, USER_ID, START, END)
 
     def test_a_failing_type_rolls_back_and_the_rest_continue(self, data_247: GoogleHealth247Data) -> None:
         db = MagicMock()

@@ -108,6 +108,7 @@ AGGREGATION_METHOD_BY_TYPE: dict[SeriesType, AggregationMethod] = {
     SeriesType.garmin_fitness_age: AggregationMethod.AVG,
     SeriesType.garmin_body_battery: AggregationMethod.AVG,
     SeriesType.garmin_hrv_rmssd_nightly: AggregationMethod.AVG,
+    SeriesType.google_hrv_rmssd_daily: AggregationMethod.AVG,  # FORK (Calibra 2.72.2)
     # ── Withings-specific ──
     SeriesType.withings_pulse_wave_velocity: AggregationMethod.AVG,
     SeriesType.withings_metabolic_age: AggregationMethod.AVG,

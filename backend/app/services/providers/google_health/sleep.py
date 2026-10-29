@@ -32,6 +32,7 @@ from app.services.providers.google_health.helpers import (
     read_number,
     zone_offset_from,
 )
+from app.services.providers.google_health.history_window import history_window
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.raw_payload_storage import store_raw_payload
 from app.utils.conversion import as_int, to_decimal
@@ -56,6 +57,11 @@ class GoogleHealthApiSleep:
         Keyed on the end, like the fetch filter: an overnight session starts before any
         morning window and would never be kept if the start were tested.
         """
+        # FORK (Calibra 2.72.2, design D-03): requested and kept from the history window's cut, on
+        # the session's end as before; a window that ends before its cut asks nothing.
+        start_time = history_window(db, user_id, self.connection_repo).instant_cut(start_time)
+        if start_time >= end_time:
+            return 0
         count = 0
         for point in self._fetch(db, user_id, start_time, end_time):
             sleep = point.get("sleep")

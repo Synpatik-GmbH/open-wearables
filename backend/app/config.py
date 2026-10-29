@@ -350,6 +350,7 @@ class Settings(BaseSettings):
         "sleep.created,"
         "series.heart_rate_variability_rmssd.created,"
         "series.garmin_hrv_rmssd_nightly.created,"  # FORK (Calibra 2.71.3.2)
+        "series.google_hrv_rmssd_daily.created,"  # FORK (Calibra 2.72.2)
         "series.heart_rate_variability_sdnn.created,"
         "series.respiratory_rate.created,"
         "series.resting_heart_rate.created,"

@@ -179,6 +179,7 @@ class SeriesType(str, Enum):
     number_of_alcoholic_beverages = "number_of_alcoholic_beverages"
     nike_fuel = "nike_fuel"
     hydration = "hydration"
+    google_hrv_rmssd_daily = "google_hrv_rmssd_daily"  # FORK: Google Health daily HRV (RMSSD), ms
 
     # TEMPORARY until 1.0: lookup only, so `.value` stays current and responses carry the new name.
     @classmethod
@@ -335,6 +336,8 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     (505, SeriesType.number_of_alcoholic_beverages, "count"),
     (506, SeriesType.nike_fuel, "count"),
     (507, SeriesType.hydration, "mL"),
+    # FORK (Calibra 2.72.2): the last ID of the range, the one an upstream addition reaches last.
+    (599, SeriesType.google_hrv_rmssd_daily, "ms"),
 ]
 
 
@@ -351,6 +354,7 @@ SERIES_TYPE_UNIT_BY_ENUM: dict[SeriesType, str] = {enum: unit for _, enum, unit 
 SERIES_TYPE_DESCRIPTION_BY_ENUM: dict[SeriesType, str] = {
     SeriesType.garmin_body_battery: "Intraday body battery readings (0-100), one sample per measurement",
     SeriesType.garmin_hrv_rmssd_nightly: "Garmin's own overnight HRV (RMSSD) from its HRV summary, one per night",
+    SeriesType.google_hrv_rmssd_daily: "Google Health's own daily HRV (RMSSD), one per date, stamped at 00:00 UTC",
 }
 
 

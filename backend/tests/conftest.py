@@ -101,6 +101,12 @@ def engine(_postgres_url: str) -> Any:
         nightly_migration = importlib.util.module_from_spec(nightly_spec)
         nightly_spec.loader.exec_module(nightly_migration)
         nightly_migration.upgrade()
+        # Calibra 2.72.2: Google's daily HRV joins the night-metric list of the two functions.
+        google_path = migration_path.parent / "2026_10_29_1200-9d3b6f2e8a41_google_hrv_daily_is_night_physiology.py"
+        google_spec = importlib.util.spec_from_file_location("google_daily_schema", google_path)
+        google_migration = importlib.util.module_from_spec(google_spec)
+        google_spec.loader.exec_module(google_migration)
+        google_migration.upgrade()
 
     # Seed series type definitions (these need to exist for foreign key constraints)
     with Session(bind=test_engine) as session:

@@ -37,6 +37,7 @@ from app.schemas.providers.google import (
     RollupSpec,
     TimeShape,
 )
+from app.schemas.sync_status import DataTypeFailure
 from app.services.providers.api_client import make_authenticated_request
 from app.services.providers.google_health.helpers import (
     GOOGLE_HEALTH_API_SOURCE,
@@ -49,14 +50,17 @@ from app.services.providers.google_health.helpers import (
     read_number,
     zone_offset_from,
 )
+from app.services.providers.google_health.history_window import HistoryWindow, berlin_midnight, history_window
 from app.services.providers.google_health.metrics import DERIVED_DAILY_METRICS, METRICS
 from app.services.providers.google_health.sleep import GoogleHealthApiSleep
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.raw_payload_storage import store_raw_payload
+from app.services.sync_error_code import UNKNOWN, error_code
 from app.services.timeseries_service import timeseries_service
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
+from app.utils.wearable_history_ingress import is_history_retriable
 
 
 class UnsupportedGranularityError(RuntimeError):
@@ -92,12 +96,12 @@ class GoogleHealth247Data(Base247DataTemplate):
         start_time: datetime,
         end_time: datetime,
         is_first_sync: bool = False,
-    ) -> dict[str, WriteCounts]:
+    ) -> dict[str, WriteCounts | DataTypeFailure]:
         """Fetch + persist every registered metric; failures are isolated per metric."""
         granularity = (
             self.settings_repo.get_data_granularity(db, self.provider_name) or settings.default_data_granularity
         )
-        results: dict[str, WriteCounts] = {}
+        results: dict[str, WriteCounts | DataTypeFailure] = {}
         failures: dict[str, str] = {}
         succeeded = 0
 
@@ -121,7 +125,7 @@ class GoogleHealth247Data(Base247DataTemplate):
                 except Exception as e:
                     db.rollback()
                     self._log_metric_failure(metric.data_type, user_id, e)
-                    failures[metric.data_type] = str(e)
+                    self._record_failure(results, failures, metric.data_type, e)
                     continue
                 succeeded += 1
                 if counts is not None:
@@ -136,7 +140,7 @@ class GoogleHealth247Data(Base247DataTemplate):
             except Exception as e:
                 db.rollback()
                 self._log_metric_failure(derived.name, user_id, e)
-                failures[derived.name] = str(e)
+                self._record_failure(results, failures, derived.name, e)
                 continue
             succeeded += 1
             if counts is not None:
@@ -150,7 +154,7 @@ class GoogleHealth247Data(Base247DataTemplate):
         except Exception as e:
             db.rollback()
             self._log_metric_failure("sleep", user_id, e)
-            failures["sleep"] = str(e)
+            self._record_failure(results, failures, "sleep", e)
             sleep_count = 0
 
         if not granularity_supported:
@@ -204,6 +208,20 @@ class GoogleHealth247Data(Base247DataTemplate):
         counts = timeseries_service.bulk_create_samples(db, samples)
         db.commit()
         return counts
+
+    @staticmethod
+    def _record_failure(
+        results: dict[str, WriteCounts | DataTypeFailure], failures: dict[str, str], data_type: str, error: Exception
+    ) -> None:
+        """Count a failed type; a retriable history error is also reported, so the cursor holds.
+
+        FORK (Calibra 2.72.2, design D-04): a retriable history error reports ``DataTypeFailure``,
+        which ``sync_vendor_data`` records as FAILED and does not move the cursor past, as Oura
+        does. It still counts as a failure, so a pull in which every type failed raises.
+        """
+        failures[data_type] = str(error)
+        if is_history_retriable(error):
+            results[data_type] = DataTypeFailure(code=error_code(error) or UNKNOWN)
 
     def _log_metric_failure(self, data_type: str, user_id: UUID, error: Exception) -> None:
         log_and_capture_error(
@@ -397,10 +415,22 @@ class GoogleHealth247Data(Base247DataTemplate):
         spec = metric.list_spec
         if spec is None:
             return []
+        # FORK (Calibra 2.72.2, design D-03): every request and its stored points are cut by the
+        # member's history window; a window that ends before its cut asks nothing.
+        window = history_window(db, user_id, self.connection_repo)
+        cut = (
+            berlin_midnight(window.keep_date(start_time))
+            if spec.time is TimeShape.DATE
+            else window.instant_cut(start_time)
+        )
+        if cut >= end_time:
+            return []
         reconcile = settings.google_use_reconcile
         template = RECONCILE_ENDPOINT if reconcile else LIST_ENDPOINT
         endpoint = template.format(data_type=metric.data_type)
-        time_filter = self._time_filter(metric.data_type, spec.time, start_time, end_time, spec.session_interval)
+        time_filter = self._time_filter(
+            metric.data_type, spec.time, start_time, end_time, window, spec.session_interval
+        )
 
         samples: list[TimeSeriesSampleCreate] = []
         for point in self._fetch_points(db, user_id, endpoint, time_filter):
@@ -409,7 +439,7 @@ class GoogleHealth247Data(Base247DataTemplate):
             if not isinstance(value_obj, dict):
                 continue
             recorded_at, zone_offset = self._point_time(value_obj, spec.time)
-            if recorded_at is None or not self._in_window(spec.time, recorded_at, start_time, end_time):
+            if recorded_at is None or not self._in_window(spec.time, recorded_at, start_time, end_time, window):
                 continue
             # Only list points carry a dataSource; reconciled points are already merged.
             device_model = None if reconcile else extract_source(point.get("dataSource"))[1]
@@ -449,38 +479,51 @@ class GoogleHealth247Data(Base247DataTemplate):
                 return parse_date(point.get("date")), None
 
     @staticmethod
-    def _in_window(shape: TimeShape, recorded_at: datetime, start_time: datetime, end_time: datetime) -> bool:
-        """Whether a point belongs to this sync window, matching :meth:`_time_filter`.
+    def _in_window(
+        shape: TimeShape, recorded_at: datetime, start_time: datetime, end_time: datetime, window: HistoryWindow
+    ) -> bool:
+        """Whether a point is stored from this sync window; the request may ask one day further back.
 
         Daily points are stamped midnight, so an intraday window would never contain one;
         they are compared by date instead, reaching back a day for a total published late.
+        FORK (Calibra 2.72.2, design D-03): that day only while it is within the last 28, and
+        nothing before the history floor (``HistoryWindow.keep_date`` and ``instant_cut``).
         """
         if shape is TimeShape.DATE:
-            return (start_time.date() - timedelta(days=1)) <= recorded_at.date() <= end_time.date()
-        return start_time <= recorded_at < end_time
+            return window.keep_date(start_time) <= recorded_at.date() <= end_time.date()
+        return window.instant_cut(start_time) <= recorded_at < end_time
 
     @staticmethod
     def _time_filter(
-        data_type: str, shape: TimeShape, start_time: datetime, end_time: datetime, session_interval: bool = False
+        data_type: str,
+        shape: TimeShape,
+        start_time: datetime,
+        end_time: datetime,
+        window: HistoryWindow,
+        session_interval: bool = False,
     ) -> str:
-        """AIP-160 filter bounding the fetch to [start_time, end_time) for the type's time shape."""
+        """AIP-160 filter bounding the fetch to [start_time, end_time) for the type's time shape.
+
+        FORK (Calibra 2.72.2, design D-03): a date or civil bound asks from one day before its cut
+        (``HistoryWindow.request_date``); a physical bound starts at ``HistoryWindow.instant_cut``.
+        """
         field = data_type.replace("-", "_")
         match shape:
             case TimeShape.INTERVAL if session_interval:
                 # SessionTimeInterval types (excl. sleep/ECG) filter on civil start time, not physical.
                 member = f"{field}.interval.civil_start_time"
-                low = (start_time.date() - timedelta(days=1)).isoformat()
+                low = window.request_date(start_time).isoformat()
                 high = (end_time.date() + timedelta(days=1)).isoformat()
             case TimeShape.DATE:
                 # A daily total is published once its day closes.
                 member = f"{field}.date"
-                low = (start_time.date() - timedelta(days=1)).isoformat()
+                low = window.request_date(start_time).isoformat()
                 high = (end_time.date() + timedelta(days=1)).isoformat()
             case TimeShape.INTERVAL | TimeShape.SAMPLE:
                 suffix = "interval.start_time" if shape is TimeShape.INTERVAL else "sample_time.physical_time"
                 member = f"{field}.{suffix}"
-                window = physical_interval(start_time, end_time)
-                low, high = window["startTime"], window["endTime"]
+                bounds = physical_interval(window.instant_cut(start_time), end_time)
+                low, high = bounds["startTime"], bounds["endTime"]
         return f'{member} >= "{low}" AND {member} < "{high}"'
 
     def _fetch_points(
