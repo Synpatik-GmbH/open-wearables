@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.models import DataPointSeries, DataSource, SeriesTypeDefinition
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.wearable_history_repository import WearableHistoryRepository
+from app.schemas.enums import ProviderName
 from app.services.providers.google_health.data_247 import GoogleHealth247Data
 from app.services.providers.google_health.history_window import (
     HISTORY_DAYS,
@@ -168,7 +169,13 @@ def test_the_google_connect_pull_requests_28_days(client: TestClient, db: Sessio
     assert datetime.fromisoformat(_connect(client, db, "google_health")["start_date"]) == CONNECT_START
 
 
-@pytest.mark.parametrize("provider", ["polar", "oura", "whoop", "ultrahuman", "withings", "strava"])
+# Every provider but Google Health: the route's rule names one provider, so the set is derived.
+OTHER_PROVIDERS = sorted(
+    p.value for p in ProviderName if p not in (ProviderName.GOOGLE_HEALTH, ProviderName.UNKNOWN, ProviderName.INTERNAL)
+)
+
+
+@pytest.mark.parametrize("provider", OTHER_PROVIDERS)
 def test_every_other_providers_connect_pull_keeps_90_days(client: TestClient, db: Session, provider: str) -> None:
     start = datetime.fromisoformat(_connect(client, db, provider)["start_date"])
     assert start == datetime(2026, 10, 29, 8, tzinfo=UTC) - timedelta(days=90)
@@ -391,3 +398,59 @@ def test_the_floor_is_the_earliest_start_date_wearable_history_can_choose() -> N
     day = CONNECT_DAY
     every_night = [day - timedelta(days=i) for i in range(40)]
     assert candidate_start(day, every_night) == HistoryWindow(floor=day - timedelta(days=HISTORY_DAYS), today=day).floor
+
+
+# -- the cuts on a window that starts before the floor, and the boundary --------------
+
+
+def test_an_instant_point_before_the_floor_fetched_by_an_earlier_window_is_not_stored(db: Session) -> None:
+    member = UserFactory()
+    google_source(db, member.id, CONNECTED_AT)
+    data_247 = GoogleHealth247Data(
+        oauth=MagicMock(), connection_repo=UserConnectionRepository(), api_base_url="https://h.test"
+    )
+    with patch("app.services.providers.google_health.data_247.make_authenticated_request", side_effect=_FakeGoogle()):
+        data_247.sync_data_type(db, member.id, "heart-rate", datetime(2026, 9, 25, tzinfo=UTC), CONNECT_END)
+
+    # 21:59 UTC on 30 September is before 00:00 Berlin on 1 October; 22:01 UTC is after it.
+    assert _stored(db, member.id) == [("heart_rate", datetime(2026, 9, 30, 22, 1, tzinfo=UTC))]
+
+
+@freeze_time("2026-10-29T09:00:00Z")
+def test_an_exercise_before_the_floor_fetched_by_an_earlier_window_is_not_kept(db: Session) -> None:
+    member = UserFactory()
+    google_source(db, member.id, CONNECTED_AT)
+    workouts = GoogleHealthApiWorkouts(MagicMock(), UserConnectionRepository(), MagicMock(), "https://h.test")
+    # 23:00 Berlin on 30 September, before the floor; 03:00 Berlin on 1 October, after it.
+    before = _exercise("2026-09-30T21:00:00Z", (2026, 9, 30))
+    inside = _exercise("2026-10-01T01:00:00Z", (2026, 9, 30))
+    with (
+        patch.object(workouts, "_make_api_request", return_value={"dataPoints": [before, inside]}),
+        patch("app.services.providers.google_health.workouts.store_raw_payload"),
+    ):
+        kept = workouts.get_workouts(db, member.id, datetime(2026, 9, 25, tzinfo=UTC), CONNECT_END)
+
+    assert [p["name"] for p in kept] == [inside["name"]]
+
+
+def test_a_window_ending_exactly_at_the_cut_requests_nothing(db: Session) -> None:
+    member = UserFactory()
+    google_source(db, member.id, CONNECTED_AT)
+    window = (datetime(2026, 9, 20, tzinfo=UTC), berlin_midnight(FLOOR))
+    data_247 = GoogleHealth247Data(
+        oauth=MagicMock(), connection_repo=UserConnectionRepository(), api_base_url="https://h.test"
+    )
+    sleep = GoogleHealthApiSleep(MagicMock(), UserConnectionRepository(), "https://h.test")
+    workouts = GoogleHealthApiWorkouts(MagicMock(), UserConnectionRepository(), MagicMock(), "https://h.test")
+    fake = _FakeGoogle()
+    with (
+        patch("app.services.providers.google_health.data_247.make_authenticated_request", side_effect=fake),
+        patch("app.services.providers.google_health.sleep.make_authenticated_request") as sleep_request,
+        patch.object(workouts, "_make_api_request") as exercise_request,
+    ):
+        assert data_247.sync_data_type(db, member.id, "heart-rate", *window) is None
+        assert sleep.load_and_save(db, member.id, *window) == 0
+        assert workouts.get_workouts(db, member.id, *window) == []
+    assert fake.filters == {}
+    sleep_request.assert_not_called()
+    exercise_request.assert_not_called()
