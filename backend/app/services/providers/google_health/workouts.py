@@ -32,6 +32,7 @@ from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
 from app.services.raw_payload_storage import store_raw_payload
 from app.utils.conversion import as_int
 from app.utils.sentry_helpers import log_and_capture_error
+from app.utils.wearable_history_ingress import raise_if_history_retriable
 
 _MM_TO_M = Decimal("0.001")
 
@@ -164,6 +165,9 @@ class GoogleHealthApiWorkouts(BaseWorkoutsTemplate):
                     continue
                 event_record_service.create_detail(db, detail.model_copy(update={"record_id": created.id}))
             except Exception as e:
+                # FORK (Calibra 2.72.2, design D-04): a retriable history error leaves the loader,
+                # so the sync records workouts as failed and holds the cursor; others are skipped.
+                raise_if_history_retriable(e)
                 log_and_capture_error(
                     e,
                     self.logger,
