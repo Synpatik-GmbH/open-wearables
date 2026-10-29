@@ -60,9 +60,9 @@ class TestPullSync:
         with pytest.raises(UnsupportedGranularityError, match=granularity.value):
             _drive(data_247, granularity, calls)
 
-        # The types that lost their rollUp path were not fetched; the civil-day ones still were.
-        assert calls
-        assert all("dailyRollUp" in c for c in calls)
+        # The types that lost their rollUp path were not fetched. FORK (Calibra 2.72.2, design
+        # D-02): the civil-day derived total was the only other fetch, and nothing is derived now.
+        assert calls == []
 
     def test_raw_syncs_every_metric(self, data_247: GoogleHealth247Data) -> None:
         calls: list[str] = []
