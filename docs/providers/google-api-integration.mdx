@@ -44,9 +44,9 @@ The Google Health API is an **aggregation layer**: it surfaces data from *every*
 **Fork (Calibra 2.72.2):** only the types above are read. Distance, calories, hydration, SDNN,
 VO₂ max, SpO₂, weight, body fat, core body temperature and blood glucose are not requested and
 not stored, and no basal energy is derived. On connect it imports at most 28 days, from 00:00
-Europe/Berlin, and no request reaches before the member's history floor (the first connection day
-less 28); a date-filtered request asks one day further back and what lies outside the window is
-discarded.
+Europe/Berlin, and nothing before the member's history floor (the first connection day less 28) is
+stored. A date-filtered request (daily types, exercise) asks one day further back, and what lies
+outside the window is discarded.
 </Note>
 
 ### Data delivery

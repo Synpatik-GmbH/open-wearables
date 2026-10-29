@@ -22,6 +22,7 @@ from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.wearable_history_repository import WearableHistoryRepository
 from app.services.providers.google_health.data_247 import GoogleHealth247Data
 from app.services.providers.google_health.history_window import (
+    HISTORY_DAYS,
     HistoryWindow,
     berlin_midnight,
     connect_pull_start,
@@ -29,7 +30,7 @@ from app.services.providers.google_health.history_window import (
 )
 from app.services.providers.google_health.sleep import GoogleHealthApiSleep
 from app.services.providers.google_health.workouts import GoogleHealthApiWorkouts
-from app.utils.wearable_history_clock import BERLIN
+from app.utils.wearable_history_clock import BERLIN, candidate_start
 from app.utils.wearable_history_ingress import WearableHistoryMetadataUnavailableError
 from tests.factories import UserConnectionFactory, UserFactory
 from tests.providers.google_health.history import google_source
@@ -347,3 +348,46 @@ def test_the_first_night_stored_is_the_one_ending_on_the_first_day(db: Session) 
         'sleep.interval.end_time >= "2026-09-30T22:00:00Z" AND sleep.interval.end_time < "2026-10-29T09:00:00Z"'
     ]
     assert offered == [datetime(2026, 10, 1, 5, tzinfo=UTC)]
+
+
+# -- the empty range, per request kind (design D-03) ------------------------------
+
+_BEFORE_FLOOR = (datetime(2026, 9, 1, tzinfo=UTC), datetime(2026, 9, 2, tzinfo=UTC))
+
+
+@pytest.mark.parametrize("data_type", ["heart-rate", "daily-heart-rate-variability"])
+def test_a_window_wholly_before_the_floor_requests_nothing_for_any_24_7_shape(db: Session, data_type: str) -> None:
+    member = UserFactory()
+    google_source(db, member.id, CONNECTED_AT)
+    data_247 = GoogleHealth247Data(
+        oauth=MagicMock(), connection_repo=UserConnectionRepository(), api_base_url="https://h.test"
+    )
+    fake = _FakeGoogle()
+    with patch("app.services.providers.google_health.data_247.make_authenticated_request", side_effect=fake):
+        assert data_247.sync_data_type(db, member.id, data_type, *_BEFORE_FLOOR) is None
+    assert fake.filters == {}
+
+
+def test_a_sleep_window_wholly_before_the_floor_requests_nothing(db: Session) -> None:
+    member = UserFactory()
+    google_source(db, member.id, CONNECTED_AT)
+    sleep = GoogleHealthApiSleep(MagicMock(), UserConnectionRepository(), "https://h.test")
+    with patch("app.services.providers.google_health.sleep.make_authenticated_request") as request:
+        assert sleep.load_and_save(db, member.id, *_BEFORE_FLOOR) == 0
+    request.assert_not_called()
+
+
+def test_an_exercise_window_wholly_before_the_floor_requests_nothing(db: Session) -> None:
+    member = UserFactory()
+    google_source(db, member.id, CONNECTED_AT)
+    workouts = GoogleHealthApiWorkouts(MagicMock(), UserConnectionRepository(), MagicMock(), "https://h.test")
+    with patch.object(workouts, "_make_api_request") as request:
+        assert workouts.get_workouts(db, member.id, *_BEFORE_FLOOR) == []
+    request.assert_not_called()
+
+
+def test_the_floor_is_the_earliest_start_date_wearable_history_can_choose() -> None:
+    """The 28 here and the 28 in 2.96.9's candidate start must stay the same number."""
+    day = CONNECT_DAY
+    every_night = [day - timedelta(days=i) for i in range(40)]
+    assert candidate_start(day, every_night) == HistoryWindow(floor=day - timedelta(days=HISTORY_DAYS), today=day).floor
