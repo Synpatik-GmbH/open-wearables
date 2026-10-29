@@ -439,44 +439,6 @@ class Garmin247Data(Base247DataTemplate):
         """Fetch daily summaries from Garmin /wellness-api/rest/dailies."""
         return self._fetch_in_chunks(db, user_id, "/wellness-api/rest/dailies", start_time, end_time)
 
-    def _normalize_dailies_health_scores(
-        self,
-        normalized_daily: dict[str, Any],
-        user_id: UUID,
-    ) -> list[HealthScoreCreate]:
-        """Extract stress and body battery health scores from a normalized Garmin daily."""
-        scores: list[HealthScoreCreate] = []
-        start_ts = normalized_daily.get("start_time_seconds")
-        calendar_date = normalized_daily.get("calendar_date")
-        if start_ts:
-            recorded_at = self._from_epoch_seconds(start_ts)
-        elif calendar_date:
-            try:
-                recorded_at = datetime.strptime(calendar_date, "%Y-%m-%d").replace(hour=12, tzinfo=timezone.utc)
-            except ValueError:
-                return scores
-        else:
-            return scores
-
-        avg_stress = normalized_daily.get("avg_stress")
-        raw_qualifier = normalized_daily.get("stress_qualifier")
-        stress_qualifier = raw_qualifier.replace("_", " ").title() if raw_qualifier else None
-        # averageStressLevel is -1 when there is not enough data to calculate
-        if avg_stress is not None and avg_stress != -1:
-            scores.append(
-                HealthScoreCreate(
-                    id=uuid4(),
-                    user_id=user_id,
-                    provider=ProviderName.GARMIN,
-                    category=HealthScoreCategory.STRESS,
-                    value=avg_stress,
-                    qualifier=stress_qualifier,
-                    recorded_at=recorded_at,
-                )
-            )
-
-        return scores
-
     def normalize_dailies(
         self,
         raw_daily: dict[str, Any],
@@ -507,7 +469,9 @@ class Garmin247Data(Base247DataTemplate):
             "heart_rate_samples": raw_daily.get("timeOffsetHeartRateSamples"),
             "garmin_summary_id": raw_daily.get("summaryId"),
         }
-        return normalized, self._normalize_dailies_health_scores(normalized, user_id)
+        # FORK (Calibra 2.71.3.2): Dailies keep no health score. The only one was stress, which
+        # Calibra does not keep (spec 2.71.3 v0.3 section 2.2).
+        return normalized, []
 
     def _build_dailies_samples(
         self,
@@ -907,7 +871,9 @@ class Garmin247Data(Base247DataTemplate):
             )
             return samples
 
-        # Collect lastNightAvg as the main HRV value for the night
+        # FORK (Calibra 2.71.3.2): lastNightAvg is Garmin's own value for the night, kept in its own
+        # series. In the RMSSD series beside the 5-minute values it could not be told apart over
+        # REST, and an hrvValues entry at offset 0 shares this instant and would replace it.
         last_night_avg = raw_hrv.get("lastNightAvg")
         if last_night_avg is not None:
             recorded_at = self._from_epoch_seconds(start_ts)
@@ -919,7 +885,7 @@ class Garmin247Data(Base247DataTemplate):
                     recorded_at=recorded_at,
                     zone_offset=zone_offset,
                     value=Decimal(str(last_night_avg)),
-                    series_type=SeriesType.heart_rate_variability_rmssd,
+                    series_type=SeriesType.garmin_hrv_rmssd_nightly,
                     external_id=summary_id,
                 )
             )
