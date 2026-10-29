@@ -11,6 +11,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from freezegun import freeze_time
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -21,6 +22,7 @@ from app.services.providers.google_health.data_247 import GoogleHealth247Data
 from app.services.providers.google_health.metrics import DERIVED_DAILY_METRICS, METRICS
 from app.services.providers.google_health.webhook_service import GOOGLE_WEBHOOK_DATA_TYPES
 from tests.factories import UserFactory
+from tests.providers.google_health.history import google_source
 
 START = datetime(2026, 10, 20, tzinfo=UTC)
 END = datetime(2026, 10, 21, tzinfo=UTC)
@@ -129,9 +131,10 @@ def test_coverage_and_the_subscriber_list_follow_the_registry() -> None:
     assert set(GOOGLE_WEBHOOK_DATA_TYPES) <= set(KEPT_POINTS) | {"sleep", "exercise"}
 
 
+@freeze_time("2026-10-21T12:00:00Z")
 def test_a_pull_asks_for_and_stores_only_the_kept_types(db: Session, data_247: GoogleHealth247Data) -> None:
     member = UserFactory()
-    db.flush()
+    google_source(db, member.id, datetime(2026, 10, 20, 8, tzinfo=UTC))
 
     fake = _pull(data_247, lambda: data_247.load_and_save_all(db, member.id, START, END))
 

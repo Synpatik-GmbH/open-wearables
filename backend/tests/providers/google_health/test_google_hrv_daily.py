@@ -12,6 +12,7 @@ from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from freezegun import freeze_time
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -24,12 +25,14 @@ from app.schemas.model_crud.activities.data_point_series import TimeSeriesQueryP
 from app.services.providers.google_health.data_247 import GoogleHealth247Data
 from app.services.timeseries_service import timeseries_service
 from tests.factories import UserFactory
+from tests.providers.google_health.history import google_source
 
 DAILY = SeriesType.google_hrv_rmssd_daily
 EVENT = "series.google_hrv_rmssd_daily.created"
 START = datetime(2026, 10, 20, tzinfo=UTC)
 END = datetime(2026, 10, 21, tzinfo=UTC)
 MIDNIGHT = datetime(2026, 10, 20, tzinfo=UTC)
+CONNECTED_AT = datetime(2026, 10, 20, 8, tzinfo=UTC)
 
 
 def _sample(at: str, rmssd: float) -> dict[str, Any]:
@@ -84,9 +87,10 @@ def _stored(db: Session, member_id: Any) -> list[tuple[str, datetime, Decimal, s
     return [tuple(r) for r in rows]
 
 
+@freeze_time("2026-10-21T12:00:00Z")
 def test_the_daily_value_is_its_own_series_and_the_samples_stay_rmssd(db: Session) -> None:
     member = UserFactory()
-    db.flush()
+    google_source(db, member.id, CONNECTED_AT)
 
     _pull(db, member.id)
 
@@ -97,9 +101,10 @@ def test_the_daily_value_is_its_own_series_and_the_samples_stay_rmssd(db: Sessio
     ]
 
 
+@freeze_time("2026-10-21T12:00:00Z")
 def test_the_rest_read_serves_the_daily_value(db: Session) -> None:
     member = UserFactory()
-    db.flush()
+    google_source(db, member.id, CONNECTED_AT)
     _pull(db, member.id)
 
     page = timeseries_service.get_timeseries(

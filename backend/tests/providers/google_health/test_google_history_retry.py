@@ -16,6 +16,9 @@ from app.schemas.sync_status import DataTypeFailure
 from app.services.providers.google_health.data_247 import GoogleHealth247Data
 from app.services.providers.google_health.workouts import GoogleHealthApiWorkouts
 from app.utils.wearable_history_ingress import WearableHistoryMetadataUnavailableError
+from tests.providers.google_health.history import open_window  # noqa: F401  (fixture)
+
+pytestmark = pytest.mark.usefixtures("open_window")
 
 USER_ID = uuid4()
 START = datetime(2026, 10, 20, tzinfo=UTC)

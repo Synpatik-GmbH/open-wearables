@@ -16,6 +16,9 @@ from app.services.providers.google_health.data_247 import (
     UnsupportedGranularityError,
 )
 from app.services.providers.google_health.webhook_handler import GoogleWebhookHandler
+from tests.providers.google_health.history import open_window  # noqa: F401  (fixture)
+
+pytestmark = pytest.mark.usefixtures("open_window")
 
 USER_ID = uuid4()
 END = datetime(2026, 9, 10, tzinfo=timezone.utc)

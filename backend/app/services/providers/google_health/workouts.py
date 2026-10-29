@@ -27,6 +27,7 @@ from app.services.providers.google_health.helpers import (
     read_number,
     zone_offset_from,
 )
+from app.services.providers.google_health.history_window import history_window
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
 from app.services.raw_payload_storage import store_raw_payload
@@ -63,21 +64,32 @@ class GoogleHealthApiWorkouts(BaseWorkoutsTemplate):
     ) -> list[dict[str, Any]]:
         """List Exercise DataPoints and keep those starting within the sync window.
 
-        list has no range parameter, so we filter client-side on the exercise interval.
+        FORK (Calibra 2.72.2, design D-03): the list is filtered on the exercise's civil start date,
+        from one day before the window's cut so a member-local date behind it is still asked for
+        (``HistoryWindow.request_date``); what is kept is decided client-side on the physical start,
+        from the history window's cut. A window that ends before its cut asks nothing.
         """
+        window = history_window(db, user_id, self.connection_repo)
+        start_date = window.instant_cut(start_date)
+        if start_date >= end_date:
+            return []
+        civil_from = window.request_date(start_date).isoformat()
         kept: list[dict[str, Any]] = []
-        for point in self._fetch_points(db, user_id):
+        for point in self._fetch_points(db, user_id, civil_from):
             interval = (point.get("exercise") or {}).get("interval") or {}
             start = parse_rfc3339(interval.get("startTime"))
             if start is not None and start_date <= start < end_date:
                 kept.append(point)
         return kept
 
-    def _fetch_points(self, db: DbSession, user_id: UUID) -> list[dict[str, Any]]:
+    def _fetch_points(self, db: DbSession, user_id: UUID, civil_from: str) -> list[dict[str, Any]]:
         points: list[dict[str, Any]] = []
         page_token: str | None = None
         while True:
-            params: dict[str, Any] = {"pageSize": self.PAGE_SIZE}
+            params: dict[str, Any] = {
+                "pageSize": self.PAGE_SIZE,
+                "filter": f'exercise.interval.civil_start_time >= "{civil_from}"',
+            }
             if page_token:
                 params["pageToken"] = page_token
             response = self._make_api_request(db, user_id, self.LIST_ENDPOINT, method="GET", params=params)

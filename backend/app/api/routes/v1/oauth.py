@@ -19,6 +19,7 @@ from app.services import ApiKeyDep, DeveloperDep, user_connection_service
 from app.services.provider_settings_service import ProviderSettingsService
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
+from app.services.providers.google_health.history_window import connect_pull_start
 from app.services.wearable_history_sources_service import wearable_history_sources_service
 
 router = APIRouter()
@@ -127,6 +128,10 @@ def oauth_callback(
 
             now = datetime.now(timezone.utc)
             start_date = (now - timedelta(days=90)).isoformat()
+            # FORK (Calibra 2.72.2, design D-03; spec 2.72 v0.2 P5): Google Health imports at most
+            # 28 days, from 00:00 Europe/Berlin; every other provider keeps 90.
+            if provider_name is ProviderName.GOOGLE_HEALTH:
+                start_date = connect_pull_start(now).isoformat()
             sync_vendor_data.delay(
                 user_id=str(oauth_state.user_id),
                 start_date=start_date,
