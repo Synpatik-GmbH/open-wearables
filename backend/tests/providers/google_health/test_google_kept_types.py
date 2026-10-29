@@ -65,6 +65,7 @@ KEPT_SERIES = {
     SeriesType.heart_rate,
     SeriesType.resting_heart_rate,
     SeriesType.heart_rate_variability_rmssd,
+    SeriesType.google_hrv_rmssd_daily,
     SeriesType.respiratory_rate,
 }
 

@@ -192,6 +192,9 @@ EXAMPLE_PAYLOADS: dict[str, dict] = {
     WebhookEventType.SERIES_GARMIN_HRV_RMSSD_NIGHTLY: _ts_payload(
         WebhookEventType.SERIES_GARMIN_HRV_RMSSD_NIGHTLY, "garmin_hrv_rmssd_nightly", "garmin", "ms", 52.0
     ),
+    WebhookEventType.SERIES_GOOGLE_HRV_RMSSD_DAILY: _ts_payload(
+        WebhookEventType.SERIES_GOOGLE_HRV_RMSSD_DAILY, "google_hrv_rmssd_daily", "google_health", "ms", 47.0
+    ),
     # Recovery
     WebhookEventType.SERIES_GARMIN_BODY_BATTERY: _ts_payload(
         WebhookEventType.SERIES_GARMIN_BODY_BATTERY, "garmin_body_battery", "garmin", "score", 65.0

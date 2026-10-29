@@ -3,7 +3,8 @@
 heart-rate supports rollUp + list; daily-resting-heart-rate (Daily), heart-rate-variability
 (Sample) and daily-heart-rate-variability (Daily) are list only. The sample HRV type is read
 for its RMSSD only; the daily one is RMSSD only — Google documents its average as an RMSSD,
-and its deep-sleep field is a second RMSSD that has no series of its own yet.
+and its deep-sleep field is a second RMSSD that has no series of its own yet. FORK (Calibra
+2.72.2, design D-01): the daily value is written to google_hrv_rmssd_daily, not to RMSSD.
 
 FORK (Calibra 2.72.2, design D-02): only the spec 2.2 heart types are kept. run-vo2-max,
 vo2-max and the sample's SDNN are not read.
@@ -38,7 +39,8 @@ HEART_METRICS: tuple[DataTypeMetric, ...] = (
     ),
     DataTypeMetric(
         "daily-heart-rate-variability",
-        SeriesType.heart_rate_variability_rmssd,
+        # FORK (Calibra 2.72.2, design D-01): its own series, so no sample at its instant can replace it.
+        SeriesType.google_hrv_rmssd_daily,
         value_key="dailyHeartRateVariability",
         list_spec=ListSpec(
             "averageHeartRateVariabilityMilliseconds",
