@@ -454,3 +454,42 @@ def test_a_window_ending_exactly_at_the_cut_requests_nothing(db: Session) -> Non
     assert fake.filters == {}
     sleep_request.assert_not_called()
     exercise_request.assert_not_called()
+
+
+@freeze_time("2026-11-20T09:00:00Z")
+def test_after_the_first_connection_a_daily_value_before_the_window_is_requested_and_not_stored(db: Session) -> None:
+    """A reconnect on 20 November: the floor stays 1 October, the window starts 23 October. The
+    daily request asks from 22 October, one day of slack; only 23 October is stored."""
+    member = UserFactory()
+    google_source(db, member.id, CONNECTED_AT)
+    data_247 = GoogleHealth247Data(
+        oauth=MagicMock(), connection_repo=UserConnectionRepository(), api_base_url="https://h.test"
+    )
+    points = [
+        {
+            "dailyHeartRateVariability": {
+                "averageHeartRateVariabilityMilliseconds": v,
+                "date": {"year": 2026, "month": 10, "day": d},
+            }
+        }
+        for (d, v) in [(22, 41), (23, 47)]
+    ]
+    filters: list[str] = []
+
+    def fake(*args: object, **kwargs: object) -> dict[str, Any]:
+        filters.append((kwargs.get("params") or {}).get("filter", ""))
+        return {"dataPoints": points}
+
+    with patch("app.services.providers.google_health.data_247.make_authenticated_request", side_effect=fake):
+        data_247.sync_data_type(
+            db,
+            member.id,
+            "daily-heart-rate-variability",
+            datetime(2026, 10, 23, tzinfo=BERLIN),
+            datetime(2026, 11, 20, 9, tzinfo=UTC),
+        )
+
+    assert filters == [
+        'daily_heart_rate_variability.date >= "2026-10-22" AND daily_heart_rate_variability.date < "2026-11-21"'
+    ]
+    assert _stored(db, member.id) == [("google_hrv_rmssd_daily", datetime(2026, 10, 23, tzinfo=UTC))]

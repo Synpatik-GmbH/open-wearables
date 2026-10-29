@@ -128,7 +128,8 @@ def test_the_hrv_sample_type_writes_rmssd_only() -> None:
 
 def test_coverage_and_the_subscriber_list_follow_the_registry() -> None:
     assert TIMESERIES == KEPT_SERIES
-    assert set(GOOGLE_WEBHOOK_DATA_TYPES) <= set(KEPT_POINTS) | {"sleep", "exercise"}
+    # Every kept type Google supports for webhooks, plus the two sessions; all six kept types are supported.
+    assert set(GOOGLE_WEBHOOK_DATA_TYPES) == set(KEPT_POINTS) | {"sleep", "exercise"}
 
 
 @freeze_time("2026-10-21T12:00:00Z")

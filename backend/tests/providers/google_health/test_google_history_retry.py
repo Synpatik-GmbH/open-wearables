@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.schemas.sync_status import DataTypeFailure
 from app.services.providers.google_health.data_247 import GoogleHealth247Data
+from app.services.providers.google_health.metrics import METRICS
 from app.services.providers.google_health.workouts import GoogleHealthApiWorkouts
 from app.utils.wearable_history_ingress import WearableHistoryMetadataUnavailableError
 from tests.providers.google_health.history import open_window  # noqa: F401  (fixture)
@@ -123,3 +124,40 @@ def test_an_ordinary_exercise_failure_is_still_skipped() -> None:
         patch.object(workouts, "_normalize_workout", side_effect=ValueError("bad point")),
     ):
         assert workouts.load_data(MagicMock(), USER_ID, start_date=START, end_date=END) == 0
+
+
+def test_a_boundary_rejection_at_a_metrics_commit_holds_the_cursor_and_the_rest_continue(
+    data_247: GoogleHealth247Data,
+) -> None:
+    """The deferred wh_ingress check raises at commit, after the fetch and the write succeeded."""
+    db = MagicMock()
+    first = METRICS[0].data_type
+    db.commit.side_effect = [_retriable("sql_boundary")] + [None] * 20
+    with (
+        patch(
+            "app.services.providers.google_health.data_247.make_authenticated_request", return_value={"dataPoints": []}
+        ),
+        patch.object(data_247.sleep, "load_and_save", return_value=0),
+        patch.object(data_247.settings_repo, "get_data_granularity", return_value=None),
+        patch("app.services.providers.google_health.data_247.store_raw_payload"),
+    ):
+        results = data_247.load_and_save_all(db, USER_ID, START, END)
+
+    assert isinstance(results[first], DataTypeFailure)
+    assert db.commit.call_count == len(METRICS) + 1  # every other type and sleep still committed
+
+
+def test_a_boundary_rejection_at_the_sleep_commit_holds_the_cursor(data_247: GoogleHealth247Data) -> None:
+    db = MagicMock()
+    db.commit.side_effect = [None] * len(METRICS) + [_retriable("sql_boundary")]
+    with (
+        patch(
+            "app.services.providers.google_health.data_247.make_authenticated_request", return_value={"dataPoints": []}
+        ),
+        patch.object(data_247.sleep, "load_and_save", return_value=1),
+        patch.object(data_247.settings_repo, "get_data_granularity", return_value=None),
+        patch("app.services.providers.google_health.data_247.store_raw_payload"),
+    ):
+        results = data_247.load_and_save_all(db, USER_ID, START, END)
+
+    assert isinstance(results["sleep"], DataTypeFailure)
