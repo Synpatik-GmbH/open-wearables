@@ -11,7 +11,7 @@ from app.database import DbSession
 from app.models import UserConnection
 from app.repositories.repositories import CrudRepository
 from app.schemas.auth import ConnectionStatus
-from app.schemas.enums import SdkConnectionOutcome
+from app.schemas.enums import ProviderName, SdkConnectionOutcome
 from app.schemas.model_crud.user_management import (
     UserConnectionCreate,
     UserConnectionUpdate,
@@ -293,8 +293,17 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         return result.rowcount
 
     def mark_as_revoked(self, db_session: DbSession, connection: UserConnection) -> UserConnection:
-        """Mark connection as revoked (when refresh token fails)."""
+        """Mark connection as revoked (when refresh token fails).
+
+        FORK (Calibra 2.71.3.3, design D-05, INV-05): a revoked Garmin row holds no token, whatever
+        path revoked it. A token kept here would earn a deregistration attempt at account deletion
+        for a connection that had already ended.
+        """
         connection.status = ConnectionStatus.REVOKED
+        if connection.provider == ProviderName.GARMIN.value:
+            connection.access_token = None
+            connection.refresh_token = None
+            connection.token_expires_at = None
         connection.updated_at = datetime.now(timezone.utc)
         db_session.add(connection)
         db_session.commit()
