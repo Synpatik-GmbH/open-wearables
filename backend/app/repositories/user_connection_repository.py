@@ -3,7 +3,7 @@ from logging import getLogger
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import CursorResult, and_, func, or_, select, tuple_, update
+from sqlalchemy import ColumnElement, CursorResult, and_, func, or_, select, tuple_, update
 from sqlalchemy.orm import Query
 from sqlalchemy.orm.exc import MultipleResultsFound
 
@@ -272,26 +272,37 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             .all()
         )
 
-    def get_garmin_refresh_tokens_due(self, db_session: DbSession, due_by: datetime) -> list[UserConnection]:
-        """FORK (Calibra 2.71.3.3, design D-15): every Garmin row whose refresh token needs refreshing.
+    def _garmin_refresh_token_is_due(self, due_by: datetime) -> ColumnElement[bool]:
+        """FORK (Calibra 2.71.3.3, design D-15): the one statement of which Garmin rows are due.
 
         ``status != REVOKED`` is the term ``disconnect`` uses: an expired row still earns a
         deregistration attempt, so its token is kept alive too.
         """
-        return (
-            db_session.query(self.model)
-            .filter(
-                and_(
-                    self.model.provider == ProviderName.GARMIN.value,
-                    self.model.status != ConnectionStatus.REVOKED,
-                    self.model.refresh_token != "",
-                    or_(
-                        self.model.refresh_token_expires_at.is_(None),
-                        self.model.refresh_token_expires_at <= due_by,
-                    ),
-                ),
+        return and_(
+            self.model.provider == ProviderName.GARMIN.value,
+            self.model.status != ConnectionStatus.REVOKED,
+            self.model.refresh_token != "",
+            or_(
+                self.model.refresh_token_expires_at.is_(None),
+                self.model.refresh_token_expires_at <= due_by,
+            ),
+        )
+
+    def get_garmin_refresh_tokens_due(self, db_session: DbSession, due_by: datetime) -> list[UserConnection]:
+        """Every Garmin row whose refresh token needs refreshing."""
+        return db_session.query(self.model).filter(self._garmin_refresh_token_is_due(due_by)).all()
+
+    def get_garmin_refresh_token_if_due(
+        self, db_session: DbSession, connection_id: UUID, due_by: datetime
+    ) -> str | None:
+        """The refresh token this row holds now, or None once it is no longer due.
+
+        Columns, not the entity: the session's identity map would hand back what it already holds.
+        """
+        return db_session.scalar(
+            select(self.model.refresh_token).where(
+                self.model.id == connection_id, self._garmin_refresh_token_is_due(due_by)
             )
-            .all()
         )
 
     def store_refreshed_tokens(

@@ -5,6 +5,7 @@ returns a new one, so without this job the one deregistration attempt is refused
 """
 
 import json
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -24,7 +25,7 @@ from app.services.providers.garmin.strategy import GarminStrategy
 from app.services.providers.garmin.token_keepalive import ACTION, MARGIN, keep_tokens_alive
 from app.services.user_connection_service import user_connection_service
 from tests.factories import UserConnectionFactory, UserFactory
-from tests.providers.garmin.conftest import REGISTRATION_PATH, TOKEN_PATH, FakeGarmin, Reply
+from tests.providers.garmin.conftest import REGISTRATION_PATH, TOKEN_PATH, Call, FakeGarmin, Reply
 
 NOW = datetime(2026, 11, 20, 4, 0, tzinfo=timezone.utc)
 LIFETIME_SECONDS = 7775998
@@ -168,7 +169,7 @@ class TestARefreshedRow:
             rotating.on_call = lambda _: commits_at_the_call.append(commit.call_count)
             keep_tokens_alive(db, now=NOW)
 
-        assert commits_at_the_call == [1]
+        assert commits_at_the_call == [2]  # the sweep's read, then the row's own
 
 
 class TestAFailedRow:
@@ -277,6 +278,53 @@ class TestAFailedRow:
         assert counts == {"failed": 1}
         assert rotating.paths() == []
         assert [line["cause"] for line in lines(capsys.readouterr().out)] == ["ConnectionError"]
+
+
+class TestARowThatChangesAfterTheSweepReadIt:
+    """The sweep reads its rows once and works through them, so a row can move before its turn.
+
+    Each case moves the other row from inside the first row's call to Garmin: a real sequence, with
+    no double of the read. Which row goes first is not known, so the move targets whichever is left.
+    """
+
+    def sweep_moving_the_other_row(
+        self, db: Session, rotating: FakeGarmin, move: Callable[[Session, Any], None]
+    ) -> tuple[dict[str, int], list[UserConnection]]:
+        rows = [connection(refresh_token="first"), connection(refresh_token="second")]
+
+        def move_the_other(call: Call) -> None:
+            if len(rotating.calls) == 1:
+                presented = call.form["refresh_token"][0]
+                move(db, next(row.id for row in rows if row.refresh_token != presented))
+
+        rotating.on_call = move_the_other
+        return keep_tokens_alive(db, now=NOW), rows
+
+    def test_one_refreshed_elsewhere_is_not_presented_again(self, db: Session, rotating: FakeGarmin) -> None:
+        def refreshed_elsewhere(session: Session, row_id: Any) -> None:
+            session.query(UserConnection).filter_by(id=row_id).update(
+                {"refresh_token": "elsewhere", "refresh_token_expires_at": NOW + timedelta(days=90)}
+            )
+
+        counts, _ = self.sweep_moving_the_other_row(db, rotating, refreshed_elsewhere)
+
+        assert counts == {"refreshed": 1, "superseded": 1}
+        assert len(rotating.calls) == 1
+
+    def test_one_revoked_is_not_presented(self, db: Session, rotating: FakeGarmin) -> None:
+        counts, _ = self.sweep_moving_the_other_row(db, rotating, _revoke)
+
+        assert counts == {"refreshed": 1, "superseded": 1}
+        assert len(rotating.calls) == 1
+
+    def test_one_rotated_but_still_due_presents_the_token_it_holds_now(self, db: Session, rotating: FakeGarmin) -> None:
+        def rotated(session: Session, row_id: Any) -> None:
+            _rewrite_refresh_token(session, row_id, "rotated")
+
+        counts, _ = self.sweep_moving_the_other_row(db, rotating, rotated)
+
+        assert counts == {"refreshed": 2}
+        assert rotating.calls[1].form["refresh_token"] == ["rotated"]
 
 
 class TestARowThatChangesDuringTheCall:

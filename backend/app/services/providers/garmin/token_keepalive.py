@@ -8,8 +8,12 @@ Nothing here ends a connection, whatever Garmin answers. A 400 can mean a bad cl
 as a dead token, and treating it as an end would disconnect every Garmin member, and withdraw every
 Garmin consent, on one wrong setting. It is logged and alerted, and the row stays due.
 
-No transaction stays open across a call to Garmin, as in D-05: the read below ends before the first
-call, so the row is written by one conditional update (INV-10) rather than held.
+The sweep's read only says which rows to look at. A row can be refreshed, revoked or reconnected
+before its turn, so each is read again under the lock, and the token presented is the one it holds
+then: an old one would be refused and page on a healthy connection.
+
+No transaction stays open across a call to Garmin, as in D-05: each read ends before the call, so
+the row is written by one conditional update (INV-10) rather than held.
 """
 
 import logging
@@ -65,11 +69,17 @@ class DueRow:
 
     id: UUID
     user_id: UUID
-    refresh_token: str
 
 
-def _refresh(db: Session, oauth: BaseOAuthTemplate, row: DueRow) -> tuple[KeepaliveOutcome, str | None]:
-    response = post_refresh(oauth, row.refresh_token)
+def _refresh(
+    db: Session, oauth: BaseOAuthTemplate, row: DueRow, due_by: datetime
+) -> tuple[KeepaliveOutcome, str | None]:
+    refresh_token = connection_repository.get_garmin_refresh_token_if_due(db, row.id, due_by)
+    db.commit()
+    if refresh_token is None:
+        return KeepaliveOutcome.SUPERSEDED, None
+
+    response = post_refresh(oauth, refresh_token)
     if response.status_code in REFRESH_REJECTED_STATUSES:
         return KeepaliveOutcome.REFRESH_REJECTED, None
     if not response.is_success:
@@ -83,7 +93,7 @@ def _refresh(db: Session, oauth: BaseOAuthTemplate, row: DueRow) -> tuple[Keepal
     stored = connection_repository.store_refreshed_tokens(
         db,
         row.id,
-        presented_refresh_token=row.refresh_token,
+        presented_refresh_token=refresh_token,
         access_token=answer.access_token,
         refresh_token=answer.refresh_token,
         expires_in=answer.expires_in,
@@ -92,7 +102,9 @@ def _refresh(db: Session, oauth: BaseOAuthTemplate, row: DueRow) -> tuple[Keepal
     return (KeepaliveOutcome.REFRESHED if stored else KeepaliveOutcome.SUPERSEDED), None
 
 
-def _keep_alive(db: Session, oauth: BaseOAuthTemplate, row: DueRow) -> tuple[KeepaliveOutcome, str | None]:
+def _keep_alive(
+    db: Session, oauth: BaseOAuthTemplate, row: DueRow, due_by: datetime
+) -> tuple[KeepaliveOutcome, str | None]:
     """The row's outcome, and for a failure with no answer to read, the exception's class name."""
     try:
         # The lock api_client.get_valid_token refreshes under, so the two never present one token.
@@ -102,7 +114,7 @@ def _keep_alive(db: Session, oauth: BaseOAuthTemplate, row: DueRow) -> tuple[Kee
         if not lock.acquire(blocking=False):
             return KeepaliveOutcome.LOCKED, None
         try:
-            return _refresh(db, oauth, row)
+            return _refresh(db, oauth, row, due_by)
         finally:
             lock.release()
     except Exception as e:
@@ -117,7 +129,7 @@ def keep_tokens_alive(db: Session, now: datetime | None = None) -> dict[str, int
     """Refresh every due Garmin row, each on its own, and log one line for each."""
     due_by = (now or datetime.now(timezone.utc)) + MARGIN
     rows = [
-        DueRow(connection.id, connection.user_id, cast(str, connection.refresh_token))
+        DueRow(connection.id, connection.user_id)
         for connection in connection_repository.get_garmin_refresh_tokens_due(db, due_by)
     ]
     db.commit()
@@ -125,7 +137,7 @@ def keep_tokens_alive(db: Session, now: datetime | None = None) -> dict[str, int
     oauth = cast(BaseOAuthTemplate, ProviderFactory().get_provider(ProviderName.GARMIN.value).oauth)
     outcomes: Counter[str] = Counter()
     for row in rows:
-        outcome, cause = _keep_alive(db, oauth, row)
+        outcome, cause = _keep_alive(db, oauth, row, due_by)
         outcomes[outcome.value] += 1
         log_structured(
             logger,
