@@ -5,9 +5,11 @@ from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models import UserConnection
+from app.repositories import UserConnectionRepository
 from app.schemas.auth import ConnectionStatus
 from app.services.providers.garmin.strategy import GarminStrategy
 from tests.factories import UserConnectionFactory, UserFactory
@@ -209,6 +211,29 @@ class TestOneEntryCannotCostTheOthers:
             "app.repositories.user_connection_repository.UserConnectionRepository.update_scope",
             side_effect=lambda db_session, conn, scope: fails_once(db_session, conn, scope),
         ):
+            result = push(db, {"userPermissionsChange": [{"userId": GARMIN_USER, "permissions": []}]})
+
+        assert result["userPermissionsChange"]["updated"] == 1
+        assert_ended(db, second)
+        db.refresh(first)
+        assert first.status == ConnectionStatus.ACTIVE
+
+    def test_a_failed_statement_does_not_poison_the_row_after_it(self, db: Session, fake_garmin: FakeGarmin) -> None:
+        """A real database failure aborts the transaction, so the next row needs a rollback first."""
+        first, second = connected(), connected()
+        db.commit()
+        real_update = UserConnectionRepository.update_scope
+        calls = {"n": 0}
+
+        def fails_once(
+            repo: UserConnectionRepository, session: Session, conn: UserConnection, scope: str | None
+        ) -> object:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                session.execute(text("SELECT 1 / 0"))
+            return real_update(repo, session, conn, scope)
+
+        with patch.object(UserConnectionRepository, "update_scope", fails_once):
             result = push(db, {"userPermissionsChange": [{"userId": GARMIN_USER, "permissions": []}]})
 
         assert result["userPermissionsChange"]["updated"] == 1
