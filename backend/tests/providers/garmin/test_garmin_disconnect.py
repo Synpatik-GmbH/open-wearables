@@ -123,6 +123,20 @@ class TestOrdering:
         assert fake_garmin.calls[0].form["refresh_token"] == ["held-refresh"]
 
 
+class TestTheTransaction:
+    def test_no_transaction_is_held_open_across_the_attempt(
+        self, session_factory: Any, committed_member: UUID, fake_garmin: FakeGarmin
+    ) -> None:
+        """A slow Garmin must not hold a pooled connection idle in a transaction."""
+        in_transaction: list[bool] = []
+
+        with session_factory() as session:
+            fake_garmin.on_call = lambda _: in_transaction.append(session.in_transaction())
+            user_connection_service.disconnect(session, committed_member, "garmin", oauth=GarminStrategy().oauth)
+
+        assert in_transaction == [False, False]
+
+
 class TestOneAttempt:
     def test_a_retried_disconnect_on_a_revoked_row_makes_no_attempt(
         self,
@@ -291,6 +305,26 @@ class TestWhichRowsAttempt:
 
         assert status_at_the_call == [ConnectionStatus.ACTIVE]
         assert fake_garmin.calls == []
+
+
+class TestAnotherProvider:
+    """Garmin's own tests carried this until the attempt moved: the path stays for everyone else."""
+
+    def test_a_failing_deregistration_does_not_block_a_polar_disconnect(self, client: TestClient, db: Session) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="polar", status=ConnectionStatus.ACTIVE)
+
+        with patch(
+            "app.services.providers.polar.oauth.PolarOAuth.deregister_user", side_effect=RuntimeError("polar is down")
+        ) as polar:
+            response = client.delete(
+                f"/api/v1/users/{user.id}/connections/polar", headers=api_key_headers(ApiKeyFactory().plain_key)
+            )
+
+        polar.assert_called_once()
+        assert response.status_code == 204
+        row = db.query(UserConnection).filter_by(user_id=user.id, provider="polar").one()
+        assert row.status == ConnectionStatus.REVOKED
 
 
 class TestTheRoute:

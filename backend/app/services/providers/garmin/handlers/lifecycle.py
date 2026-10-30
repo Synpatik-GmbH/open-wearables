@@ -31,6 +31,39 @@ def ends_connection(entry: dict[str, Any]) -> bool:
     return isinstance(permissions, list) and HEALTH_PERMISSION not in permissions
 
 
+def _scope_of(permissions: Any) -> str | None:
+    """The stored scope. Only strings in a list join it: a stray member must not cost the entry."""
+    if isinstance(permissions, list):
+        permissions = [p for p in permissions if isinstance(p, str)]
+    return " ".join(sorted(permissions)) if permissions else None
+
+
+def _note_failure(
+    db: DbSession,
+    results: dict[str, Any],
+    message: str,
+    garmin_user_id: str,
+    trace_id: str,
+    error: Exception,
+) -> None:
+    """One entry's failure stays that entry's: the rest of the batch still has to end.
+
+    The task that runs this reports success, so an entry abandoned here is never retried. Without
+    this, a member who lost Health sharing after a bad entry in the same push would stay active.
+    """
+    db.rollback()
+    results["errors"].append(f"{message}: {type(error).__name__}")
+    log_structured(
+        logger,
+        "error",
+        message,
+        provider="garmin",
+        trace_id=trace_id,
+        garmin_user_id=garmin_user_id,
+        error_type=type(error).__name__,
+    )
+
+
 def process_user_permissions(
     db: DbSession,
     connection_repo: UserConnectionRepository,
@@ -69,35 +102,42 @@ def process_user_permissions(
             )
             continue
 
-        permissions = entry.get("permissions", [])
-        new_scope = " ".join(sorted(permissions)) if permissions else None
+        try:
+            new_scope = _scope_of(entry.get("permissions", []))
+        except Exception as e:
+            _note_failure(db, results, "Failed to read a permissions entry", garmin_user_id, trace_id, e)
+            continue
+
         for connection in connections:
-            user_id = connection.user_id
-            old_scope = connection.scope
-            connection_repo.update_scope(db, connection, new_scope)
+            try:
+                user_id = connection.user_id
+                old_scope = connection.scope
+                connection_repo.update_scope(db, connection, new_scope)
 
-            log_structured(
-                logger,
-                "info",
-                "Updated user permissions scope",
-                provider="garmin",
-                trace_id=trace_id,
-                garmin_user_id=garmin_user_id,
-                user_id=str(user_id),
-                old_scope=old_scope,
-                new_scope=new_scope,
-            )
-            results["updated"] += 1
-
-            if ends_connection(entry):
-                user_connection_service.disconnect(
-                    db,
-                    user_id,
-                    "garmin",
-                    oauth=oauth,
-                    reason="permission_change",
-                    trigger=DeregistrationTrigger.PERMISSION_CHANGE,
+                log_structured(
+                    logger,
+                    "info",
+                    "Updated user permissions scope",
+                    provider="garmin",
+                    trace_id=trace_id,
+                    garmin_user_id=garmin_user_id,
+                    user_id=str(user_id),
+                    old_scope=old_scope,
+                    new_scope=new_scope,
                 )
+                results["updated"] += 1
+
+                if ends_connection(entry):
+                    user_connection_service.disconnect(
+                        db,
+                        user_id,
+                        "garmin",
+                        oauth=oauth,
+                        reason="permission_change",
+                        trigger=DeregistrationTrigger.PERMISSION_CHANGE,
+                    )
+            except Exception as e:
+                _note_failure(db, results, "Failed to apply a permission change", garmin_user_id, trace_id, e)
 
     return results
 
@@ -137,24 +177,27 @@ def process_deregistrations(
             continue
 
         for connection in connections:
-            connection_repo.mark_as_revoked(db, connection)
-            on_connection_revoked(
-                user_id=connection.user_id,
-                provider="garmin",
-                connection_id=connection.id,
-                reason="deregistration",
-                revoked_at=connection.updated_at.isoformat(),
-            )
+            try:
+                connection_repo.mark_as_revoked(db, connection)
+                on_connection_revoked(
+                    user_id=connection.user_id,
+                    provider="garmin",
+                    connection_id=connection.id,
+                    reason="deregistration",
+                    revoked_at=connection.updated_at.isoformat(),
+                )
 
-            log_structured(
-                logger,
-                "info",
-                "Revoked connection via deregistration webhook",
-                provider="garmin",
-                trace_id=trace_id,
-                garmin_user_id=garmin_user_id,
-                user_id=str(connection.user_id),
-            )
-            results["revoked"] += 1
+                log_structured(
+                    logger,
+                    "info",
+                    "Revoked connection via deregistration webhook",
+                    provider="garmin",
+                    trace_id=trace_id,
+                    garmin_user_id=garmin_user_id,
+                    user_id=str(connection.user_id),
+                )
+                results["revoked"] += 1
+            except Exception as e:
+                _note_failure(db, results, "Failed to apply a deregistration", garmin_user_id, trace_id, e)
 
     return results

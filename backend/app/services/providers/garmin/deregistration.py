@@ -14,7 +14,9 @@ this function has no database session to write with.
 ``asyncio`` is what makes the deadline total. ``httpx`` timeouts are per phase, so a server sending
 one byte each second never trips them; cancelling the request is the only bound that reaches the
 last byte, and it closes the socket. Every caller is synchronous (a threadpool route or a Celery
-task), so ``asyncio.run`` has no running loop to collide with.
+task), so a new loop has no running one to collide with. The loop is run by hand rather than by
+``asyncio.run``, which on the way out joins the executor a name lookup runs in: a stalled resolver
+would hold the caller long after the deadline fired.
 """
 
 import asyncio
@@ -73,43 +75,46 @@ def _request(method: str, url: str, **kwargs: Any) -> httpx.Response:
         async with httpx.AsyncClient(timeout=DEADLINE_SECONDS) as client:
             return await client.request(method, url, **kwargs)
 
-    async def bounded() -> httpx.Response:
-        return await asyncio.wait_for(call(), DEADLINE_SECONDS)
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(asyncio.wait_for(call(), DEADLINE_SECONDS))
+    finally:
+        loop.close()
 
-    return asyncio.run(bounded())
 
-
-def _attempt(oauth: BaseOAuthTemplate, held: HeldTokens) -> DeregistrationOutcome:
+def _attempt(oauth: BaseOAuthTemplate, held: HeldTokens) -> tuple[DeregistrationOutcome, str | None]:
+    """The outcome, and for a failure with no answer to read, the exception's class name."""
     if not held.refresh_token:
-        return DeregistrationOutcome.NO_CREDENTIAL
+        return DeregistrationOutcome.NO_CREDENTIAL, None
 
     try:
         data, headers = oauth._prepare_refresh_request(held.refresh_token)
         refresh = _request("POST", oauth.endpoints.token_url, data=data, headers=headers)
         if refresh.status_code in REFRESH_REJECTED_STATUSES:
-            return DeregistrationOutcome.REFRESH_REJECTED
+            return DeregistrationOutcome.REFRESH_REJECTED, None
         if not refresh.is_success:
-            return DeregistrationOutcome.FAILED
+            return DeregistrationOutcome.FAILED, f"refresh_status_{refresh.status_code}"
         answer = refresh.json()
         access_token = answer.get("access_token") if isinstance(answer, dict) else None
         if not access_token or not isinstance(access_token, str):
-            return DeregistrationOutcome.FAILED
+            return DeregistrationOutcome.FAILED, "refresh_no_access_token"
 
         deregistration = _request(
             "DELETE",
             f"{oauth.api_base_url}/partner-gateway/rest/user/registration",
             headers={"Authorization": f"Bearer {access_token}"},
         )
-    except Exception:
-        # A timeout, a transport error, an unreadable answer. Exception text can quote a URL or a
-        # body, so none of it is logged.
-        return DeregistrationOutcome.FAILED
+    except Exception as e:
+        # A timeout, a transport error, an unreadable answer. The class name says which: the text
+        # can quote a URL or a body. Not sent to Sentry, which reports a frame's local variables,
+        # and these frames hold a refresh token.
+        return DeregistrationOutcome.FAILED, type(e).__name__
 
     if deregistration.is_success:
-        return DeregistrationOutcome.CONFIRMED
+        return DeregistrationOutcome.CONFIRMED, None
     if deregistration.status_code == 404:
-        return DeregistrationOutcome.NOT_FOUND
-    return DeregistrationOutcome.FAILED
+        return DeregistrationOutcome.NOT_FOUND, None
+    return DeregistrationOutcome.FAILED, f"deregistration_status_{deregistration.status_code}"
 
 
 def attempt_deregistration(
@@ -120,7 +125,7 @@ def attempt_deregistration(
     user_id: UUID,
 ) -> DeregistrationOutcome:
     """Make the one attempt and log its one line. Never raises."""
-    outcome = _attempt(oauth, held)
+    outcome, cause = _attempt(oauth, held)
     log_structured(
         logger,
         "error" if outcome is DeregistrationOutcome.FAILED else "info",
@@ -130,5 +135,6 @@ def attempt_deregistration(
         outcome=outcome.value,
         trigger=trigger.value,
         user_id=str(user_id),
+        **({"cause": cause} if cause else {}),
     )
     return outcome

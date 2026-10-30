@@ -1,6 +1,8 @@
 """One deregistration attempt at Garmin (Calibra 2.71.3.3, design D-05; spec P15 and AC 14)."""
 
 import json
+import socket
+import threading
 import time
 from uuid import uuid4
 
@@ -152,6 +154,28 @@ class TestTheDeadline:
         assert outcome is DeregistrationOutcome.FAILED
         assert time.monotonic() - started < 2 * short_deadline + 0.2
 
+    def test_a_stalled_name_lookup_does_not_outlive_the_deadline(
+        self, fake_garmin: FakeGarmin, short_deadline: float, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The lookup runs in an executor that ``asyncio.run`` would join on the way out."""
+        released = threading.Event()
+        real_lookup = socket.getaddrinfo
+
+        def stalled(host: object, *args: object, **kwargs: object) -> object:
+            if host not in ("garmin-lookup.test", b"garmin-lookup.test"):  # the IDNA-encoded form
+                return real_lookup(host, *args, **kwargs)
+            released.wait(5 * short_deadline)
+            return []
+
+        monkeypatch.setattr(socket, "getaddrinfo", stalled)
+        started = time.monotonic()
+        try:
+            with pytest.raises(TimeoutError):
+                deregistration._request("GET", "http://garmin-lookup.test/")
+            assert time.monotonic() - started < 2 * short_deadline
+        finally:
+            released.set()
+
     def test_each_call_has_its_own_deadline(self, fake_garmin: FakeGarmin, short_deadline: float) -> None:
         """Two calls each just inside the deadline: the attempt spends more than one deadline."""
         fake_garmin.token = Reply(status=200, body=REFRESHED_TOKEN_BODY, delay_seconds=0.75 * short_deadline)
@@ -223,6 +247,40 @@ class TestTheLogLine:
         assert "held-refresh" not in logged
         assert "held-access" not in logged
         assert "refreshed-access" not in logged
+
+    @pytest.mark.parametrize(
+        ("token", "registration", "cause"),
+        [
+            (Reply(status=500), Reply(status=204), "refresh_status_500"),
+            (Reply(status=200, body=b"{}"), Reply(status=204), "refresh_no_access_token"),
+            (None, Reply(status=503), "deregistration_status_503"),
+        ],
+    )
+    def test_a_failure_says_why(
+        self,
+        fake_garmin: FakeGarmin,
+        capsys: pytest.CaptureFixture[str],
+        token: Reply | None,
+        registration: Reply,
+        cause: str,
+    ) -> None:
+        if token is not None:
+            fake_garmin.token = token
+        fake_garmin.registration = registration
+
+        attempt()
+
+        assert logged_lines(capsys.readouterr().out)[0]["cause"] == cause
+
+    def test_a_failure_with_no_answer_names_the_exception_class(
+        self, fake_garmin: FakeGarmin, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        fake_garmin.registration = Reply(hang_up=True)
+
+        attempt()
+
+        cause = logged_lines(capsys.readouterr().out)[0]["cause"]
+        assert cause.endswith("Error") or cause.endswith("Exception")
 
     def test_held_tokens_do_not_print(self) -> None:
         assert "held-refresh" not in repr(HELD)

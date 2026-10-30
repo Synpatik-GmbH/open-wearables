@@ -161,6 +161,85 @@ class TestPermissionChangePush:
         assert fake_garmin.calls == []
 
 
+class TestOneEntryCannotCostTheOthers:
+    """The task reports success whatever happens here, so nothing retries an abandoned entry."""
+
+    def test_a_list_holding_a_non_string_still_ends_and_stores_the_strings(
+        self, db: Session, fake_garmin: FakeGarmin
+    ) -> None:
+        first = connected()
+
+        push(db, {"userPermissionsChange": [{"userId": GARMIN_USER, "permissions": [None, "ACTIVITY_EXPORT"]}]})
+
+        assert_ended(db, first)
+        assert first.scope == "ACTIVITY_EXPORT"
+
+    def test_a_bad_entry_does_not_stop_the_member_after_it(self, db: Session, fake_garmin: FakeGarmin) -> None:
+        bad = connected(garmin_user="the-bad-entry")
+        member = connected()
+
+        result = push(
+            db,
+            {
+                "userPermissionsChange": [
+                    {"userId": "the-bad-entry", "permissions": 5},
+                    {"userId": GARMIN_USER, "permissions": ["ACTIVITY_EXPORT"]},
+                ]
+            },
+        )
+
+        assert_ended(db, member)
+        assert len(result["userPermissionsChange"]["errors"]) == 1
+        db.refresh(bad)
+        assert bad.status == ConnectionStatus.ACTIVE
+
+    def test_a_row_that_fails_does_not_stop_the_row_after_it(self, db: Session, fake_garmin: FakeGarmin) -> None:
+        first, second = connected(), connected()
+        repo = GarminStrategy().webhooks.connection_repo
+        real_update = repo.update_scope
+        calls = {"n": 0}
+
+        def fails_once(*args: object, **kwargs: object) -> object:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("the database went away")
+            return real_update(*args, **kwargs)
+
+        with patch(
+            "app.repositories.user_connection_repository.UserConnectionRepository.update_scope",
+            side_effect=lambda db_session, conn, scope: fails_once(db_session, conn, scope),
+        ):
+            result = push(db, {"userPermissionsChange": [{"userId": GARMIN_USER, "permissions": []}]})
+
+        assert result["userPermissionsChange"]["updated"] == 1
+        assert_ended(db, second)
+        db.refresh(first)
+        assert first.status == ConnectionStatus.ACTIVE
+
+    def test_a_deregistration_that_fails_does_not_stop_the_row_after_it(self, db: Session) -> None:
+        first, second = connected(), connected()
+        repo = GarminStrategy().webhooks.connection_repo
+        real_revoke = repo.mark_as_revoked
+        calls = {"n": 0}
+
+        def fails_once(db_session: Session, connection: UserConnection) -> UserConnection:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("the database went away")
+            return real_revoke(db_session, connection)
+
+        with patch(
+            "app.repositories.user_connection_repository.UserConnectionRepository.mark_as_revoked",
+            side_effect=fails_once,
+        ):
+            result = push(db, {"deregistrations": [{"userId": GARMIN_USER}]})
+
+        assert result["deregistrations"]["revoked"] == 1
+        assert_ended(db, second)
+        db.refresh(first)
+        assert first.status == ConnectionStatus.ACTIVE
+
+
 class TestRejectedRefresh:
     """Any other outbound Garmin call that finds its refresh token rejected ends the row too."""
 

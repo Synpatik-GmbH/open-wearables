@@ -158,6 +158,9 @@ class UserConnectionService(
                     revoked_at=connection.updated_at.isoformat(),
                 )
             if oauth and held:
+                # The re-read above opened a transaction. Ended first, so a slow Garmin does not
+                # hold a pooled connection idle in it for the length of the attempt.
+                db_session.commit()
                 attempt_deregistration(oauth, held, trigger=trigger, user_id=user_id)
             return
 
