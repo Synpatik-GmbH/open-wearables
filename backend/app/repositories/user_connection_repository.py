@@ -3,7 +3,7 @@ from logging import getLogger
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import CursorResult, and_, func, select, tuple_, update
+from sqlalchemy import CursorResult, and_, func, or_, select, tuple_, update
 from sqlalchemy.orm import Query
 from sqlalchemy.orm.exc import MultipleResultsFound
 
@@ -18,6 +18,11 @@ from app.schemas.model_crud.user_management import (
 )
 
 logger = getLogger(__name__)
+
+
+def refresh_token_expiry(lifetime: int | None) -> datetime | None:
+    """When a refresh token handed over now expires, or None when that is unknown (FORK 2.71.3.3 D-15)."""
+    return datetime.now(timezone.utc) + timedelta(seconds=lifetime) if lifetime else None
 
 
 class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCreate, UserConnectionUpdate]):
@@ -267,6 +272,69 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             .all()
         )
 
+    def get_garmin_refresh_tokens_due(self, db_session: DbSession, due_by: datetime) -> list[UserConnection]:
+        """FORK (Calibra 2.71.3.3, design D-15): every Garmin row whose refresh token needs refreshing.
+
+        ``status != REVOKED`` is the term ``disconnect`` uses: an expired row still earns a
+        deregistration attempt, so its token is kept alive too.
+        """
+        return (
+            db_session.query(self.model)
+            .filter(
+                and_(
+                    self.model.provider == ProviderName.GARMIN.value,
+                    self.model.status != ConnectionStatus.REVOKED,
+                    self.model.refresh_token != "",
+                    or_(
+                        self.model.refresh_token_expires_at.is_(None),
+                        self.model.refresh_token_expires_at <= due_by,
+                    ),
+                ),
+            )
+            .all()
+        )
+
+    def store_refreshed_tokens(
+        self,
+        db_session: DbSession,
+        connection_id: UUID,
+        *,
+        presented_refresh_token: str,
+        access_token: str,
+        refresh_token: str,
+        expires_in: int,
+        refresh_token_expires_in: int | None,
+    ) -> bool:
+        """FORK (Calibra 2.71.3.3, design D-15, INV-10): store a pair on the row that earned it, or nowhere.
+
+        One conditional update, because the call to Garmin ran with no transaction open: the row
+        may have been revoked or reconnected since it was read. A revoked row must keep holding
+        nothing (INV-05), and a reconnected one holds a newer pair than this.
+        """
+        now = datetime.now(timezone.utc)
+        result = cast(
+            CursorResult[tuple[()]],
+            db_session.execute(
+                update(UserConnection)
+                .where(
+                    and_(
+                        UserConnection.id == connection_id,
+                        UserConnection.status != ConnectionStatus.REVOKED,
+                        UserConnection.refresh_token == presented_refresh_token,
+                    ),
+                )
+                .values(
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    token_expires_at=now + timedelta(seconds=expires_in),
+                    refresh_token_expires_at=refresh_token_expiry(refresh_token_expires_in),
+                    updated_at=now,
+                ),
+            ),
+        )
+        db_session.commit()
+        return result.rowcount > 0
+
     def disconnect(self, db_session: DbSession, user_id: UUID, provider: str) -> int:
         """Disconnect a provider in a single UPDATE query. Returns number of rows updated."""
         result = cast(
@@ -285,6 +353,7 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                     access_token=None,
                     refresh_token=None,
                     token_expires_at=None,
+                    refresh_token_expires_at=None,
                     updated_at=datetime.now(timezone.utc),
                 ),
             ),
@@ -304,6 +373,7 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             connection.access_token = None
             connection.refresh_token = None
             connection.token_expires_at = None
+            connection.refresh_token_expires_at = None
         connection.updated_at = datetime.now(timezone.utc)
         db_session.add(connection)
         db_session.commit()
@@ -326,6 +396,7 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         access_token: str,
         refresh_token: str | None,
         expires_in: int,
+        refresh_token_expires_in: int | None = None,
     ) -> UserConnection:
         """Update connection with new tokens after refresh."""
 
@@ -333,6 +404,7 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         if refresh_token:
             connection.refresh_token = refresh_token
         connection.token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        connection.refresh_token_expires_at = refresh_token_expiry(refresh_token_expires_in)
         connection.updated_at = datetime.now(timezone.utc)
         db_session.add(connection)
         db_session.commit()
@@ -349,12 +421,14 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         provider_user_id: str | None = None,
         provider_username: str | None = None,
         scope: str | None = None,
+        refresh_token_expires_in: int | None = None,
     ) -> UserConnection:
         """Update connection with new tokens and user info."""
         connection.access_token = access_token
         if refresh_token:
             connection.refresh_token = refresh_token
         connection.token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        connection.refresh_token_expires_at = refresh_token_expiry(refresh_token_expires_in)
 
         if provider_user_id and not connection.provider_user_id:
             connection.provider_user_id = provider_user_id

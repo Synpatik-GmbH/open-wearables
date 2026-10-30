@@ -16,7 +16,7 @@ from starlette.status import HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED, HTTP_5
 
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
-from app.repositories.user_connection_repository import UserConnectionRepository
+from app.repositories.user_connection_repository import UserConnectionRepository, refresh_token_expiry
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import AuthenticationMethod, ConnectionStatus
 from app.schemas.model_crud.credentials import (
@@ -156,6 +156,7 @@ class BaseOAuthTemplate(ABC):
                     token_response.access_token,
                     token_response.refresh_token or refresh_token,  # Use old refresh token if new one not provided
                     token_response.expires_in,
+                    token_response.refresh_token_lifetime,
                 )
 
             log_structured(
@@ -183,7 +184,7 @@ class BaseOAuthTemplate(ABC):
             #   1. the user really revoked us -> revoke + notify (below)
             #   2. the token we sent was already spent by a CONCURRENT refresh
             #
-            # Providers that ROTATE refresh tokens (Whoop) invalidate the old one the
+            # Providers that ROTATE refresh tokens (Whoop, Garmin) invalidate the old one the
             # instant a refresh succeeds. Two workers handling two webhooks for the same
             # user both load the connection, both hold the same token, and the loser is
             # rejected 150ms later -- while the connection is perfectly healthy and a
@@ -501,6 +502,7 @@ class BaseOAuthTemplate(ABC):
                 provider_user_id=provider_user_id,
                 provider_username=provider_username,
                 scope=scope,
+                refresh_token_expires_in=token_response.refresh_token_lifetime,
             )
             return existing_connection, was_inactive, datetime.now(timezone.utc).isoformat()
 
@@ -512,6 +514,7 @@ class BaseOAuthTemplate(ABC):
             access_token=token_response.access_token,
             refresh_token=token_response.refresh_token,
             token_expires_at=token_expires_at,
+            refresh_token_expires_at=refresh_token_expiry(token_response.refresh_token_lifetime),
             scope=scope,
         )
         new_connection = self.connection_repo.create(db, connection_create)

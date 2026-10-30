@@ -25,6 +25,7 @@ class UserConnectionCreate(UserConnectionBase):
     access_token: str | None = None  # Optional for SDK-based providers (e.g., Apple)
     refresh_token: str | None = None
     token_expires_at: datetime | None = None  # Optional for SDK-based providers
+    refresh_token_expires_at: datetime | None = None
     status: ConnectionStatus = ConnectionStatus.ACTIVE
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

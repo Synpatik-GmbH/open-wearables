@@ -11,6 +11,7 @@ import pytest
 from app.config import settings
 from app.services.providers.garmin import deregistration
 from app.services.providers.garmin.deregistration import (
+    ALERTED_OUTCOMES,
     DeregistrationOutcome,
     DeregistrationTrigger,
     HeldTokens,
@@ -237,6 +238,22 @@ class TestTheLogLine:
         logged = capsys.readouterr().out
         assert '"action": "garmin_deregistration"' in logged
         assert '"outcome": "failed"' in logged
+
+    def test_a_rejected_refresh_is_alerted_too(
+        self, fake_garmin: FakeGarmin, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Spec 2.71.3 v0.8 section 2.6. Same rule, its second literal, and an error like failed."""
+        fake_garmin.token = Reply(status=400)
+
+        attempt()
+
+        logged = capsys.readouterr().out
+        assert '"outcome": "refresh_rejected"' in logged
+        [line] = [json.loads(text) for text in logged.splitlines() if text.startswith("{")]
+        assert line["level"] == "error"
+
+    def test_the_alerted_set_is_exactly_those_two(self) -> None:
+        assert set(ALERTED_OUTCOMES) == {DeregistrationOutcome.FAILED, DeregistrationOutcome.REFRESH_REJECTED}
 
     def test_a_token_never_reaches_the_log(self, fake_garmin: FakeGarmin, capsys: pytest.CaptureFixture[str]) -> None:
         fake_garmin.registration = Reply(status=500, body=b"held-refresh refreshed-access")

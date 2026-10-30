@@ -1,11 +1,12 @@
-"""FORK (Calibra 2.71.3.3, design D-05; spec 2.71.3 v0.7 P15): one deregistration attempt at Garmin.
+"""FORK (Calibra 2.71.3.3, design D-05; spec 2.71.3 v0.8 P15): one deregistration attempt at Garmin.
 
 The connection ends on our side first; this runs afterwards, from tokens held in memory, and
 nothing waits on what it finds. Same rule as Polar (ruling R-2026-10-26-c): one attempt, the
 outcome logged, a failure alerted, no retry.
 
 The access token on the row can sit expired until disconnect: Garmin delivers by push, so no
-outbound call refreshes it. Hence the refresh comes first, always.
+outbound call needs it, and the keep-alive (D-15) looks after the refresh token alone. Hence the
+refresh comes first, always.
 
 The refresh here is not ``BaseOAuthTemplate.refresh_access_token``. That one writes the new tokens
 to the row and revokes it on a rejection; here the row is already revoked and holds nothing, and
@@ -33,7 +34,8 @@ from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
 
-# calibra-ow-deploy scripts/alerts.sh matches this literal, and "outcome": "failed", as strings.
+# calibra-ow-deploy scripts/alerts.sh matches this literal, and "outcome": "failed" and
+# "outcome": "refresh_rejected", as strings.
 ACTION = "garmin_deregistration"
 
 # One total deadline per call, connect to last byte. Two calls at most, so an attempt spends ten
@@ -50,6 +52,9 @@ class DeregistrationOutcome(StrEnum):
     REFRESH_REJECTED = "refresh_rejected"
     NO_CREDENTIAL = "no_credential"
     FAILED = "failed"
+
+
+ALERTED_OUTCOMES = (DeregistrationOutcome.FAILED, DeregistrationOutcome.REFRESH_REJECTED)
 
 
 class DeregistrationTrigger(StrEnum):
@@ -82,14 +87,19 @@ def _request(method: str, url: str, **kwargs: Any) -> httpx.Response:
         loop.close()
 
 
+def post_refresh(oauth: BaseOAuthTemplate, refresh_token: str) -> httpx.Response:
+    """Post a refresh token to Garmin's token endpoint, inside one total deadline. Saves nothing."""
+    data, headers = oauth._prepare_refresh_request(refresh_token)
+    return _request("POST", oauth.endpoints.token_url, data=data, headers=headers)
+
+
 def _attempt(oauth: BaseOAuthTemplate, held: HeldTokens) -> tuple[DeregistrationOutcome, str | None]:
     """The outcome, and for a failure with no answer to read, the exception's class name."""
     if not held.refresh_token:
         return DeregistrationOutcome.NO_CREDENTIAL, None
 
     try:
-        data, headers = oauth._prepare_refresh_request(held.refresh_token)
-        refresh = _request("POST", oauth.endpoints.token_url, data=data, headers=headers)
+        refresh = post_refresh(oauth, held.refresh_token)
         if refresh.status_code in REFRESH_REJECTED_STATUSES:
             return DeregistrationOutcome.REFRESH_REJECTED, None
         if not refresh.is_success:
@@ -128,7 +138,7 @@ def attempt_deregistration(
     outcome, cause = _attempt(oauth, held)
     log_structured(
         logger,
-        "error" if outcome is DeregistrationOutcome.FAILED else "info",
+        "error" if outcome in ALERTED_OUTCOMES else "info",
         "Garmin deregistration attempt",
         provider="garmin",
         action=ACTION,

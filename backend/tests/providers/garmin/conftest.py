@@ -56,6 +56,8 @@ class FakeGarmin:
     registration: Reply = field(default_factory=lambda: Reply(status=204))
     calls: list[Call] = field(default_factory=list)
     on_call: Callable[[Call], None] | None = None
+    # A token-route answer for one refresh token, where a sweep's order is not known.
+    token_for: dict[str, Reply] = field(default_factory=dict)
 
     def paths(self) -> list[str]:
         return [call.path for call in self.calls]
@@ -75,6 +77,7 @@ def _handler(fake: FakeGarmin) -> type[BaseHTTPRequestHandler]:
             fake.calls.append(call)
             if fake.on_call is not None:
                 fake.on_call(call)
+            reply = fake.token_for.get(form.get("refresh_token", [""])[0], reply)
             if reply.hang_up:
                 self.close_connection = True
                 self.connection.close()
