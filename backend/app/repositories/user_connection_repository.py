@@ -3,7 +3,7 @@ from logging import getLogger
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import CursorResult, and_, func, select, tuple_, update
+from sqlalchemy import ColumnElement, CursorResult, and_, func, or_, select, tuple_, update
 from sqlalchemy.orm import Query
 from sqlalchemy.orm.exc import MultipleResultsFound
 
@@ -11,13 +11,18 @@ from app.database import DbSession
 from app.models import UserConnection
 from app.repositories.repositories import CrudRepository
 from app.schemas.auth import ConnectionStatus
-from app.schemas.enums import SdkConnectionOutcome
+from app.schemas.enums import ProviderName, SdkConnectionOutcome
 from app.schemas.model_crud.user_management import (
     UserConnectionCreate,
     UserConnectionUpdate,
 )
 
 logger = getLogger(__name__)
+
+
+def refresh_token_expiry(lifetime: int | None) -> datetime | None:
+    """When a refresh token handed over now expires, or None when that is unknown (FORK 2.71.3.3 D-15)."""
+    return datetime.now(timezone.utc) + timedelta(seconds=lifetime) if lifetime else None
 
 
 class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCreate, UserConnectionUpdate]):
@@ -267,6 +272,80 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             .all()
         )
 
+    def _garmin_refresh_token_is_due(self, due_by: datetime) -> ColumnElement[bool]:
+        """FORK (Calibra 2.71.3.3, design D-15): the one statement of which Garmin rows are due.
+
+        ``status != REVOKED`` is the term ``disconnect`` uses: an expired row still earns a
+        deregistration attempt, so its token is kept alive too.
+        """
+        return and_(
+            self.model.provider == ProviderName.GARMIN.value,
+            self.model.status != ConnectionStatus.REVOKED,
+            self.model.refresh_token != "",
+            or_(
+                self.model.refresh_token_expires_at.is_(None),
+                self.model.refresh_token_expires_at <= due_by,
+            ),
+        )
+
+    def get_garmin_refresh_tokens_due(self, db_session: DbSession, due_by: datetime) -> list[UserConnection]:
+        """Every Garmin row whose refresh token needs refreshing."""
+        return db_session.query(self.model).filter(self._garmin_refresh_token_is_due(due_by)).all()
+
+    def get_garmin_refresh_token_if_due(
+        self, db_session: DbSession, connection_id: UUID, due_by: datetime
+    ) -> str | None:
+        """The refresh token this row holds now, or None once it is no longer due.
+
+        Columns, not the entity: the session's identity map would hand back what it already holds.
+        """
+        return db_session.scalar(
+            select(self.model.refresh_token).where(
+                self.model.id == connection_id, self._garmin_refresh_token_is_due(due_by)
+            )
+        )
+
+    def store_refreshed_tokens(
+        self,
+        db_session: DbSession,
+        connection_id: UUID,
+        *,
+        presented_refresh_token: str,
+        access_token: str,
+        refresh_token: str,
+        expires_in: int,
+        refresh_token_expires_in: int | None,
+    ) -> bool:
+        """FORK (Calibra 2.71.3.3, design D-15, INV-10): store a pair on the row that earned it, or nowhere.
+
+        One conditional update, because the call to Garmin ran with no transaction open: the row
+        may have been revoked or reconnected since it was read. A revoked row must keep holding
+        nothing (INV-05), and a reconnected one holds a newer pair than this.
+        """
+        now = datetime.now(timezone.utc)
+        result = cast(
+            CursorResult[tuple[()]],
+            db_session.execute(
+                update(UserConnection)
+                .where(
+                    and_(
+                        UserConnection.id == connection_id,
+                        UserConnection.status != ConnectionStatus.REVOKED,
+                        UserConnection.refresh_token == presented_refresh_token,
+                    ),
+                )
+                .values(
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    token_expires_at=now + timedelta(seconds=expires_in),
+                    refresh_token_expires_at=refresh_token_expiry(refresh_token_expires_in),
+                    updated_at=now,
+                ),
+            ),
+        )
+        db_session.commit()
+        return result.rowcount > 0
+
     def disconnect(self, db_session: DbSession, user_id: UUID, provider: str) -> int:
         """Disconnect a provider in a single UPDATE query. Returns number of rows updated."""
         result = cast(
@@ -285,6 +364,7 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                     access_token=None,
                     refresh_token=None,
                     token_expires_at=None,
+                    refresh_token_expires_at=None,
                     updated_at=datetime.now(timezone.utc),
                 ),
             ),
@@ -293,8 +373,18 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         return result.rowcount
 
     def mark_as_revoked(self, db_session: DbSession, connection: UserConnection) -> UserConnection:
-        """Mark connection as revoked (when refresh token fails)."""
+        """Mark connection as revoked (when refresh token fails).
+
+        FORK (Calibra 2.71.3.3, design D-05, INV-05): a revoked Garmin row holds no token, whatever
+        path revoked it. A token kept here would earn a deregistration attempt at account deletion
+        for a connection that had already ended.
+        """
         connection.status = ConnectionStatus.REVOKED
+        if connection.provider == ProviderName.GARMIN.value:
+            connection.access_token = None
+            connection.refresh_token = None
+            connection.token_expires_at = None
+            connection.refresh_token_expires_at = None
         connection.updated_at = datetime.now(timezone.utc)
         db_session.add(connection)
         db_session.commit()
@@ -317,6 +407,7 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         access_token: str,
         refresh_token: str | None,
         expires_in: int,
+        refresh_token_expires_in: int | None = None,
     ) -> UserConnection:
         """Update connection with new tokens after refresh."""
 
@@ -324,6 +415,7 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         if refresh_token:
             connection.refresh_token = refresh_token
         connection.token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        connection.refresh_token_expires_at = refresh_token_expiry(refresh_token_expires_in)
         connection.updated_at = datetime.now(timezone.utc)
         db_session.add(connection)
         db_session.commit()
@@ -340,12 +432,14 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         provider_user_id: str | None = None,
         provider_username: str | None = None,
         scope: str | None = None,
+        refresh_token_expires_in: int | None = None,
     ) -> UserConnection:
         """Update connection with new tokens and user info."""
         connection.access_token = access_token
         if refresh_token:
             connection.refresh_token = refresh_token
         connection.token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        connection.refresh_token_expires_at = refresh_token_expiry(refresh_token_expires_in)
 
         if provider_user_id and not connection.provider_user_id:
             connection.provider_user_id = provider_user_id

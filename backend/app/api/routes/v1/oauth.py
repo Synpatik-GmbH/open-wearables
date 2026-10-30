@@ -116,7 +116,9 @@ def oauth_callback(
     # Grace-period flag: automatically kick off a historical sync so integrators
     # who haven't yet adopted the explicit /sync/historical call still get backfill.
     # Controlled by HISTORICAL_SYNC_ON_CONNECT (default: true).
-    if settings.historical_sync_on_connect:
+    # FORK (Calibra 2.71.3.3, design D-09): Garmin never backfills on connect, whatever the member
+    # chose on Garmin's screen.
+    if settings.historical_sync_on_connect and provider_name is not ProviderName.GARMIN:
         caps = strategy.capabilities
         if caps.webhook_callback:
             # this code is going to be removed later, so leave inner imports heres
