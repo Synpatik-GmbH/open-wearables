@@ -265,6 +265,17 @@ class TestWhichRowsAttempt:
         assert fake_garmin.paths() == [TOKEN_PATH, REGISTRATION_PATH]
         assert [line["outcome"] for line in attempts_logged(capsys.readouterr().out)] == ["confirmed"]
 
+    def test_a_row_holding_only_a_refresh_token_gets_its_attempt(
+        self, session_factory: Any, committed_member: UUID, fake_garmin: FakeGarmin
+    ) -> None:
+        """Today's path keys on the access token; the attempt needs only the refresh token."""
+        with session_factory() as session:
+            session.query(UserConnection).filter_by(user_id=committed_member).update({"access_token": None})
+            session.commit()
+            user_connection_service.disconnect(session, committed_member, "garmin", oauth=GarminStrategy().oauth)
+
+        assert fake_garmin.paths() == [TOKEN_PATH, REGISTRATION_PATH]
+
     def test_another_provider_keeps_its_call_before_the_revoke(self, db: Session, fake_garmin: FakeGarmin) -> None:
         user = UserFactory()
         UserConnectionFactory(user=user, provider="polar", status=ConnectionStatus.ACTIVE, access_token="polar-token")

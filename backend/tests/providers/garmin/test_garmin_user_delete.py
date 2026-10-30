@@ -201,12 +201,15 @@ class TestWhichRowsAttempt:
         assert [line["outcome"] for line in attempts_logged(capsys.readouterr().out)] == ["confirmed"]
 
 
-def test_every_attempt_goes_to_garmin_only_once_per_row(db: Session, fake_garmin: FakeGarmin) -> None:
-    """The generic loop must not also call Garmin for the row the attempt covers."""
+def test_every_attempt_goes_to_garmin_only_once_per_row(
+    db: Session, fake_garmin: FakeGarmin, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The generic loop must not also take the row the attempt covers."""
     user = UserFactory()
     UserConnectionFactory(user=user, provider="garmin")
 
     user_service.delete(db, user.id)
 
     assert fake_garmin.paths().count(REGISTRATION_PATH) == 1
+    assert "Deregistering not supported" not in capsys.readouterr().out
     assert db.query(UserConnection).filter_by(user_id=user.id).count() == 0

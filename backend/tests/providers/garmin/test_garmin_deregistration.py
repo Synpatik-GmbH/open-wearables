@@ -65,7 +65,8 @@ class TestOutcome:
 
     @pytest.mark.parametrize("status", [403, 429, 500, 503])
     def test_a_refresh_failing_any_other_way_is_failed(self, fake_garmin: FakeGarmin, status: int) -> None:
-        fake_garmin.token = Reply(status=status)
+        """A token-shaped body on such a status is still a failure: the status decides, not the body."""
+        fake_garmin.token = Reply(status=status, body=REFRESHED_TOKEN_BODY)
 
         assert attempt() is DeregistrationOutcome.FAILED
         assert fake_garmin.paths() == [TOKEN_PATH]
