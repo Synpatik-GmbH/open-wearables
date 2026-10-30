@@ -1,8 +1,13 @@
 """Garmin connection lifecycle event handlers.
 
 Handles webhook events that change the state of a user's Garmin connection:
-- userPermissionsChange: update the OAuth scope stored on the connection
+- userPermissionsChange: update the OAuth scope stored on the connection, and end the connection
+  when Health sharing is gone
 - deregistrations: mark the connection as revoked
+
+FORK (Calibra 2.71.3.3, design D-07): each push applies to every active row holding the Garmin
+user id. Several Open Wearables users can hold the same one, and the first match alone would leave
+the others ingesting after the member ended the connection.
 """
 
 import logging
@@ -11,18 +16,32 @@ from typing import Any
 from app.database import DbSession
 from app.repositories import UserConnectionRepository
 from app.services.outgoing_webhooks.events import on_connection_revoked
+from app.services.providers.garmin.deregistration import DeregistrationTrigger
+from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
+
+HEALTH_PERMISSION = "HEALTH_EXPORT"
+
+
+def ends_connection(entry: dict[str, Any]) -> bool:
+    """Only losing Health sharing ends a connection (spec P14). An absent list says nothing."""
+    permissions = entry.get("permissions")
+    return isinstance(permissions, list) and HEALTH_PERMISSION not in permissions
 
 
 def process_user_permissions(
     db: DbSession,
     connection_repo: UserConnectionRepository,
+    oauth: BaseOAuthTemplate,
     permissions_list: list[dict[str, Any]],
     trace_id: str,
 ) -> dict[str, Any]:
-    """Handle userPermissionsChange entries — update scope on the connection."""
+    """Handle userPermissionsChange entries — update scope, and disconnect on losing Health."""
+    # Imported here: loading the service loads the providers package, and so this module.
+    from app.services.user_connection_service import user_connection_service  # noqa: PLC0415
+
     results: dict[str, Any] = {"updated": 0, "errors": []}
 
     if not isinstance(permissions_list, list):
@@ -38,8 +57,8 @@ def process_user_permissions(
             results["errors"].append("Missing userId in userPermissions entry")
             continue
 
-        connection = connection_repo.get_by_provider_user_id(db, "garmin", garmin_user_id)
-        if not connection:
+        connections = connection_repo.get_all_by_provider_user_id(db, "garmin", garmin_user_id)
+        if not connections:
             log_structured(
                 logger,
                 "info",
@@ -52,21 +71,33 @@ def process_user_permissions(
 
         permissions = entry.get("permissions", [])
         new_scope = " ".join(sorted(permissions)) if permissions else None
-        old_scope = connection.scope
-        connection_repo.update_scope(db, connection, new_scope)
+        for connection in connections:
+            user_id = connection.user_id
+            old_scope = connection.scope
+            connection_repo.update_scope(db, connection, new_scope)
 
-        log_structured(
-            logger,
-            "info",
-            "Updated user permissions scope",
-            provider="garmin",
-            trace_id=trace_id,
-            garmin_user_id=garmin_user_id,
-            user_id=str(connection.user_id),
-            old_scope=old_scope,
-            new_scope=new_scope,
-        )
-        results["updated"] += 1
+            log_structured(
+                logger,
+                "info",
+                "Updated user permissions scope",
+                provider="garmin",
+                trace_id=trace_id,
+                garmin_user_id=garmin_user_id,
+                user_id=str(user_id),
+                old_scope=old_scope,
+                new_scope=new_scope,
+            )
+            results["updated"] += 1
+
+            if ends_connection(entry):
+                user_connection_service.disconnect(
+                    db,
+                    user_id,
+                    "garmin",
+                    oauth=oauth,
+                    reason="permission_change",
+                    trigger=DeregistrationTrigger.PERMISSION_CHANGE,
+                )
 
     return results
 
@@ -93,8 +124,8 @@ def process_deregistrations(
             results["errors"].append("Missing userId in deregistrations entry")
             continue
 
-        connection = connection_repo.get_by_provider_user_id(db, "garmin", garmin_user_id)
-        if not connection:
+        connections = connection_repo.get_all_by_provider_user_id(db, "garmin", garmin_user_id)
+        if not connections:
             log_structured(
                 logger,
                 "info",
@@ -105,24 +136,25 @@ def process_deregistrations(
             )
             continue
 
-        connection_repo.mark_as_revoked(db, connection)
-        on_connection_revoked(
-            user_id=connection.user_id,
-            provider="garmin",
-            connection_id=connection.id,
-            reason="deregistration",
-            revoked_at=connection.updated_at.isoformat(),
-        )
+        for connection in connections:
+            connection_repo.mark_as_revoked(db, connection)
+            on_connection_revoked(
+                user_id=connection.user_id,
+                provider="garmin",
+                connection_id=connection.id,
+                reason="deregistration",
+                revoked_at=connection.updated_at.isoformat(),
+            )
 
-        log_structured(
-            logger,
-            "info",
-            "Revoked connection via deregistration webhook",
-            provider="garmin",
-            trace_id=trace_id,
-            garmin_user_id=garmin_user_id,
-            user_id=str(connection.user_id),
-        )
-        results["revoked"] += 1
+            log_structured(
+                logger,
+                "info",
+                "Revoked connection via deregistration webhook",
+                provider="garmin",
+                trace_id=trace_id,
+                garmin_user_id=garmin_user_id,
+                user_id=str(connection.user_id),
+            )
+            results["revoked"] += 1
 
     return results
