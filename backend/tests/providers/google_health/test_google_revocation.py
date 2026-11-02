@@ -233,3 +233,29 @@ class TestTheLogLine:
         monkeypatch.setattr(revocation, "_request", explode)
 
         assert attempt_revoke(HELD, trigger=DeregistrationTrigger.DISCONNECT, user_id=uuid4()) is RevokeOutcome.FAILED
+
+
+class TestTheAlertLiterals:
+    def test_a_failure_carries_the_literals_the_alert_matches(
+        self, fake_google: FakeGoogle, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """calibra-ow-deploy scripts/alerts.sh matches these two strings literally.
+
+        A rename here is a telemetry migration: change both in step.
+        """
+        fake_google.revoke = Reply(status=500, body=b"{}")
+
+        attempt()
+
+        logged = capsys.readouterr().out
+        assert '"action": "google_health_revoke"' in logged
+        assert '"outcome": "failed"' in logged
+
+    def test_already_invalid_does_not_carry_the_failed_literal(
+        self, fake_google: FakeGoogle, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        fake_google.revoke = Reply(status=400, body=b'{"error": "invalid_token"}')
+
+        attempt()
+
+        assert '"outcome": "failed"' not in capsys.readouterr().out
