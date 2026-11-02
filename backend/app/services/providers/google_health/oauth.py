@@ -55,9 +55,11 @@ class GoogleOAuth(BaseOAuthTemplate):
         """Build Google's authorization URL.
 
         Adds the Google-specific parameters the base template doesn't emit:
-        ``access_type=offline`` (return a refresh token), ``prompt=consent``
-        (always return one), and ``include_granted_scopes=true`` (incremental
-        authorization).
+        ``access_type=offline`` (return a refresh token) and ``prompt=consent``
+        (always return one).
+
+        FORK (Calibra 2.72.3, design D-06): no ``include_granted_scopes``. It would carry a
+        member's earlier grants to this client into the new token, past the three scopes asked for.
         """
         params = {
             "response_type": "code",
@@ -66,7 +68,6 @@ class GoogleOAuth(BaseOAuthTemplate):
             "state": state,
             "scope": self.credentials.default_scope,
             "access_type": "offline",
-            "include_granted_scopes": "true",
             "prompt": "consent",
         }
         return f"{self.endpoints.authorize_url}?{urlencode(params)}", None
