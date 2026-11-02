@@ -11,11 +11,8 @@ from app.schemas.enums import ProviderName, SdkConnectionOutcome
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
 from app.schemas.responses.upload import ConnectionsCoverage, ProviderConnectionCount
 from app.services.outgoing_webhooks.events import on_connection_created, on_connection_revoked
-from app.services.providers.garmin.deregistration import (
-    DeregistrationTrigger,
-    HeldTokens,
-    attempt_deregistration,
-)
+from app.services.providers.attempt_after_revoke import attempt_after_revoke, attempts_after_revoke
+from app.services.providers.garmin.deregistration import DeregistrationTrigger, HeldTokens
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.services import AppService
 from app.utils.exceptions import ResourceNotFoundError, handle_exceptions
@@ -126,10 +123,13 @@ class UserConnectionService(
         runs from the tokens read here. Only the disconnect whose revoke changed the row attempts:
         a concurrent one read the same tokens and finds nothing to update.
 
+        FORK (Calibra 2.72.3, design D-07): Google Health takes the same order, with its revoke as
+        the attempt. The providers are ``ATTEMPT_AFTER_REVOKE``'s.
+
         ``reason`` reaches the log line and the ``connection.revoked`` webhook.
         """
         held = None
-        if oauth and provider == ProviderName.GARMIN.value:
+        if oauth and attempts_after_revoke(provider):
             connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
             if connection:
                 held = HeldTokens(connection.access_token, connection.refresh_token)
@@ -158,10 +158,10 @@ class UserConnectionService(
                     revoked_at=connection.updated_at.isoformat(),
                 )
             if oauth and held:
-                # The re-read above opened a transaction. Ended first, so a slow Garmin does not
+                # The re-read above opened a transaction. Ended first, so a slow provider does not
                 # hold a pooled connection idle in it for the length of the attempt.
                 db_session.commit()
-                attempt_deregistration(oauth, held, trigger=trigger, user_id=user_id)
+                attempt_after_revoke(provider, oauth, held, trigger=trigger, user_id=user_id)
             return
 
         # Nothing updated - check if connection exists (already revoked) or not found

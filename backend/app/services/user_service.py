@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from app.database import DbSession
 from app.models import User
 from app.repositories.user_repository import UserRepository
+from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.user_management import (
     UserConnectionSummary,
@@ -21,13 +22,10 @@ from app.schemas.model_crud.user_management import (
     UserUpdateInternal,
 )
 from app.schemas.utils import OldPaginatedResponse
+from app.services.providers.attempt_after_revoke import attempt_after_revoke, attempts_after_revoke
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.garmin.backfill_state import force_release_backfill_lock
-from app.services.providers.garmin.deregistration import (
-    DeregistrationTrigger,
-    HeldTokens,
-    attempt_deregistration,
-)
+from app.services.providers.garmin.deregistration import DeregistrationTrigger, HeldTokens
 from app.services.services import AppService
 from app.services.sync_coordination import release_stale_primary
 from app.services.user_connection_service import user_connection_service
@@ -79,6 +77,10 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
         FORK (Calibra 2.71.3.3, design D-06): Garmin's one attempt follows the delete, from tokens
         read before it, so a deletion is never held by Garmin and a delete that fails spends no
         attempt: the adapter's deletion sweep re-runs it and makes the only one.
+
+        FORK (Calibra 2.72.3, design D-08): Google Health's revoke follows the delete the same way,
+        for a row that is not revoked. A Google row revoked before 2.72.3 by a rejected refresh
+        kept its tokens, and its grant was already ended or rejected at Google.
         """
         user = self.get(db_session, object_id, raise_404=raise_404)
         if not user:
@@ -86,17 +88,18 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
         user_id = user.id
         provider_factory = ProviderFactory()
         connections = list(user_connection_service.get_connections_by_user(db_session, user.id))
-        garmin_tokens = [
-            held
-            for held in (
-                HeldTokens(connection.access_token, connection.refresh_token)
+        held_tokens = [
+            (provider, held)
+            for provider, held in (
+                (connection.provider, HeldTokens(connection.access_token, connection.refresh_token))
                 for connection in connections
-                if connection.provider == ProviderName.GARMIN.value
+                if attempts_after_revoke(connection.provider)
+                and (connection.provider == ProviderName.GARMIN.value or connection.status != ConnectionStatus.REVOKED)
             )
             if held.any_held
         ]
         for connection in connections:
-            if not connection.access_token or connection.provider == ProviderName.GARMIN.value:
+            if not connection.access_token or attempts_after_revoke(connection.provider):
                 continue
             try:
                 strategy = provider_factory.get_provider(connection.provider)
@@ -131,9 +134,9 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
 
         deleted = self.crud.delete(db_session, user)
 
-        if garmin_tokens and (oauth := provider_factory.get_provider(ProviderName.GARMIN.value).oauth):
-            for held in garmin_tokens:
-                attempt_deregistration(oauth, held, trigger=DeregistrationTrigger.USER_DELETE, user_id=user_id)
+        for provider, held in held_tokens:
+            if oauth := provider_factory.get_provider(provider).oauth:
+                attempt_after_revoke(provider, oauth, held, trigger=DeregistrationTrigger.USER_DELETE, user_id=user_id)
 
         return deleted
 

@@ -2,6 +2,7 @@
 
 import json
 import time
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -20,7 +21,9 @@ HELD = HeldTokens(access_token="held-access", refresh_token="held-refresh")
 USER = UUID("6f1c2a3b-0000-4000-8000-000000000001")
 
 
-def attempt(held: HeldTokens = HELD, trigger: DeregistrationTrigger = DeregistrationTrigger.DISCONNECT) -> RevokeOutcome:
+def attempt(
+    held: HeldTokens = HELD, trigger: DeregistrationTrigger = DeregistrationTrigger.DISCONNECT
+) -> RevokeOutcome:
     return attempt_revoke(held, trigger=trigger, user_id=USER)
 
 
@@ -108,7 +111,7 @@ class TestTheCall:
 
     def test_the_production_url_is_googles_revoke_endpoint(self) -> None:
         # Read off the module's source, because the fixture patches the attribute.
-        assert 'REVOKE_URL = "https://oauth2.googleapis.com/revoke"' in open(revocation.__file__).read()
+        assert 'REVOKE_URL = "https://oauth2.googleapis.com/revoke"' in Path(revocation.__file__).read_text()
 
 
 class TestTheDeadline:
