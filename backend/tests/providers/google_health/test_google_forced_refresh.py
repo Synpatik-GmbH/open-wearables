@@ -61,7 +61,8 @@ def _handler(fake: FakeGoogleApi) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:
             fake.data_auth.append(self.headers.get("Authorization"))
             status = fake.data_statuses.pop(0) if len(fake.data_statuses) > 1 else fake.data_statuses[0]
-            self._answer(status, b'{"dataPoints": []}' if status == 200 else b'{"error": {"code": 401}}')
+            body = b'{"dataPoints": []}' if status == 200 else b'{"error": {"code": %d}}' % status
+            self._answer(status, body)
 
         def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length") or 0)
@@ -216,3 +217,31 @@ class TestARevokedGoogleRowHoldsNoToken:
 
         db.refresh(row)
         assert (row.status, row.refresh_token) == (ConnectionStatus.REVOKED, "held-refresh")
+
+
+class TestTheForcedRetryHasItsOwnAllowance:
+    def test_three_rate_limits_then_a_401_still_refresh_and_retry(
+        self, db: Session, fake_api: FakeGoogleApi, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Codex P2 on #53: the forced retry must not be spent by earlier 429 retries (AC 18)."""
+        monkeypatch.setattr("app.services.providers.api_client.RETRY_BASE_DELAY", 0.0)
+        row = connection(db)
+        fake_api.data_statuses = [429, 429, 429, 401, 200]
+
+        assert call(db, row, fake_api) == {"dataPoints": []}
+
+        assert len(fake_api.token_forms) == 1
+        assert fake_api.data_auth[-1] == "Bearer fresh-access"
+
+    def test_a_polar_request_keeps_its_retry_count(
+        self, db: Session, fake_api: FakeGoogleApi, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("app.services.providers.api_client.RETRY_BASE_DELAY", 0.0)
+        row = connection(db, provider="polar")
+        fake_api.data_statuses = [429, 429, 429, 429, 200]
+
+        with pytest.raises(HTTPException) as raised:
+            call(db, row, fake_api, provider="polar")
+
+        assert raised.value.status_code == 429
+        assert len(fake_api.data_auth) == 4

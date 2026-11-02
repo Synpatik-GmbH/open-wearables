@@ -193,8 +193,12 @@ def make_authenticated_request(
     # Make request with retry logic for rate limiting
     url = f"{api_base_url}{endpoint}"
     refresh_forced = False
+    # FORK (Calibra 2.72.3, D-09; Codex P2 on #53): the forced refresh's retry has its own pass of
+    # the loop, so 429 retries before a 401 cannot spend it. Only that refresh reaches the extra
+    # pass: a 429 on it finds attempt >= MAX_RETRIES and raises as any exhausted 429 does.
+    passes = MAX_RETRIES + 1 + (1 if provider_name in FORCED_REFRESH_ON_401 else 0)
 
-    for attempt in range(MAX_RETRIES + 1):
+    for attempt in range(passes):
         try:
             with httpx.Client(http2=http2) as client:
                 response = client.request(
