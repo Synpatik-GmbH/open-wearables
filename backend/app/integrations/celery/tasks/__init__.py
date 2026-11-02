@@ -27,6 +27,7 @@ from .garmin.backfill_timeout import (
 from .garmin.backfill_trigger import (
     trigger_backfill_for_type as trigger_garmin_backfill_for_type,
 )
+from .garmin.token_keepalive_task import keep_garmin_tokens_alive
 from .periodic_sync_task import sync_all_users
 from .process_aws_upload_task import complete_and_process_aws_upload, process_aws_upload
 from .process_sdk_upload_task import process_sdk_upload
@@ -57,6 +58,7 @@ __all__ = [
     "start_garmin_full_backfill",
     "trigger_garmin_backfill_for_type",
     "trigger_garmin_next_pending_type",
+    "keep_garmin_tokens_alive",
     # Archival
     "run_daily_archival",
     # Apple XML multipart uploads

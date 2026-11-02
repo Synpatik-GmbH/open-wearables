@@ -11,6 +11,11 @@ from app.schemas.enums import ProviderName, SdkConnectionOutcome
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
 from app.schemas.responses.upload import ConnectionsCoverage, ProviderConnectionCount
 from app.services.outgoing_webhooks.events import on_connection_created, on_connection_revoked
+from app.services.providers.garmin.deregistration import (
+    DeregistrationTrigger,
+    HeldTokens,
+    attempt_deregistration,
+)
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.services import AppService
 from app.utils.exceptions import ResourceNotFoundError, handle_exceptions
@@ -109,15 +114,26 @@ class UserConnectionService(
         provider: str,
         oauth: BaseOAuthTemplate | None = None,
         reason: str = "user_disconnected",
+        trigger: DeregistrationTrigger = DeregistrationTrigger.DISCONNECT,
     ) -> None:
         """Disconnect a user from a provider. Raises 404 if connection not found.
 
         If oauth is provided, calls the provider's deregistration API before clearing tokens.
         Deregistration failures are logged but do not block the disconnect.
 
+        FORK (Calibra 2.71.3.3, design D-05): Garmin is the other way round. The revoke commits
+        first, so ingestion stops and the tokens are gone whatever Garmin does, then one attempt
+        runs from the tokens read here. Only the disconnect whose revoke changed the row attempts:
+        a concurrent one read the same tokens and finds nothing to update.
+
         ``reason`` reaches the log line and the ``connection.revoked`` webhook.
         """
-        if oauth:
+        held = None
+        if oauth and provider == ProviderName.GARMIN.value:
+            connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
+            if connection:
+                held = HeldTokens(connection.access_token, connection.refresh_token)
+        elif oauth:
             self._deregister_from_provider(db_session, user_id, provider, oauth)
 
         updated = self.crud.disconnect(db_session, user_id, provider)
@@ -141,6 +157,11 @@ class UserConnectionService(
                     reason=reason,
                     revoked_at=connection.updated_at.isoformat(),
                 )
+            if oauth and held:
+                # The re-read above opened a transaction. Ended first, so a slow Garmin does not
+                # hold a pooled connection idle in it for the length of the attempt.
+                db_session.commit()
+                attempt_deregistration(oauth, held, trigger=trigger, user_id=user_id)
             return
 
         # Nothing updated - check if connection exists (already revoked) or not found

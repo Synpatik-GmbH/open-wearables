@@ -170,8 +170,12 @@ def test_the_google_connect_pull_requests_28_days(client: TestClient, db: Sessio
 
 
 # Every provider but Google Health: the route's rule names one provider, so the set is derived.
+# Not Garmin either, which queues nothing at all on connect (2.71.3.3 D-09;
+# tests/providers/garmin/test_garmin_no_backfill_on_connect.py).
 OTHER_PROVIDERS = sorted(
-    p.value for p in ProviderName if p not in (ProviderName.GOOGLE_HEALTH, ProviderName.UNKNOWN, ProviderName.INTERNAL)
+    p.value
+    for p in ProviderName
+    if p not in (ProviderName.GOOGLE_HEALTH, ProviderName.GARMIN, ProviderName.UNKNOWN, ProviderName.INTERNAL)
 )
 
 

@@ -30,6 +30,13 @@ class OAuthTokenResponse(BaseModel):
     token_type: str
     refresh_token: str | None = None
     expires_in: int
+
+    @property
+    def refresh_token_lifetime(self) -> int | None:
+        """Seconds the refresh token lasts, or None when the answer does not say (FORK 2.71.3.3 D-15)."""
+        lifetime = (self.model_extra or {}).get("refresh_token_expires_in")
+        return lifetime if type(lifetime) is int and lifetime > 0 else None
+
     scope: str | None = None
 
 

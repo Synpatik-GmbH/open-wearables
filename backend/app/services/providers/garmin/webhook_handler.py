@@ -364,7 +364,11 @@ class GarminWebhookHandler(BaseWebhookHandler):
         if "userPermissionsChange" in payload:
             try:
                 response["userPermissionsChange"] = process_user_permissions(
-                    db, self.connection_repo, payload["userPermissionsChange"], request_trace_id
+                    db,
+                    self.connection_repo,
+                    self.garmin_workouts.oauth,
+                    payload["userPermissionsChange"],
+                    request_trace_id,
                 )
             except Exception as e:
                 log_structured(

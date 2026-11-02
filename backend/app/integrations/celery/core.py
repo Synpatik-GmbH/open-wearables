@@ -189,6 +189,13 @@ def create_celery() -> Celery:
             "args": (),
             "kwargs": {},
         },
+        # FORK (Calibra 2.71.3.3, design D-15).
+        "garmin-token-keepalive": {
+            "task": "app.integrations.celery.tasks.garmin.token_keepalive_task.keep_garmin_tokens_alive",
+            "schedule": crontab(hour=4, minute=0),  # Daily at 04:00 UTC
+            "args": (),
+            "kwargs": {},
+        },
         # 2.96.9.2 D-02/D-03: temporary copies are bounded to seven days, checked every 15 minutes.
         "sweep-expired-copies": {
             "task": "app.integrations.celery.tasks.wearable_history_purge_task.sweep_expired_copies",

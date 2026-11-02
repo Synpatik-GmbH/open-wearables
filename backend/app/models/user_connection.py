@@ -41,6 +41,8 @@ class UserConnection(BaseDbModel):
     access_token: Mapped[str | None]
     refresh_token: Mapped[str | None]
     token_expires_at: Mapped[datetime | None]
+    # FORK (Calibra 2.71.3.3, design D-15): null means unknown, which the Garmin keep-alive treats as due.
+    refresh_token_expires_at: Mapped[datetime | None]
     scope: Mapped[str | None]
 
     # Metadata
