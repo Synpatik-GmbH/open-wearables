@@ -138,7 +138,7 @@ Choose `list` (`GOOGLE_USE_RECONCILE=false`) only when you specifically need per
 #--- Google ---#
 GOOGLE_CLIENT_ID=your-google-client-id
 GOOGLE_CLIENT_SECRET=your-google-client-secret
-GOOGLE_DEFAULT_SCOPE=openid email https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly https://www.googleapis.com/auth/googlehealth.nutrition.readonly https://www.googleapis.com/auth/googlehealth.sleep.readonly https://www.googleapis.com/auth/googlehealth.settings.readonly
+GOOGLE_DEFAULT_SCOPE=https://www.googleapis.com/auth/googlehealth.sleep.readonly https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly
 # Fetch mode for 24/7 data (see "Data granularity and fetch modes")
 GOOGLE_USE_RECONCILE=true
 ```
@@ -149,7 +149,7 @@ GOOGLE_USE_RECONCILE=true
     |----------|-------------|---------|
     | `GOOGLE_CLIENT_ID` | OAuth Client ID | — |
     | `GOOGLE_CLIENT_SECRET` | OAuth Client Secret | — |
-    | `GOOGLE_DEFAULT_SCOPE` | Space-separated Health API scopes to request | (full read-only set) |
+    | `GOOGLE_DEFAULT_SCOPE` | Space-separated Health API scopes to request | sleep, health metrics and measurements, activity and fitness (read-only) |
     | `GOOGLE_USE_RECONCILE` | `true` = reconcile (merged, app-accurate, no device attribution); `false` = list (per-device). | `true` |
     | `DEFAULT_DATA_GRANULARITY` | Must be `raw` for Google Health while `rollUp` is disabled — see the [fetch modes](#data-granularity-and-fetch-modes) table | `raw` |
 

@@ -378,9 +378,11 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         FORK (Calibra 2.71.3.3, design D-05, INV-05): a revoked Garmin row holds no token, whatever
         path revoked it. A token kept here would earn a deregistration attempt at account deletion
         for a connection that had already ended.
+
+        FORK (Calibra 2.72.3, design D-09, INV-05): a Google Health row too, for the same reason.
         """
         connection.status = ConnectionStatus.REVOKED
-        if connection.provider == ProviderName.GARMIN.value:
+        if connection.provider in (ProviderName.GARMIN.value, ProviderName.GOOGLE_HEALTH.value):
             connection.access_token = None
             connection.refresh_token = None
             connection.token_expires_at = None

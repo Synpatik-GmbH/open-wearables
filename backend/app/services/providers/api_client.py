@@ -96,6 +96,35 @@ def _get_valid_token(
     return connection.access_token
 
 
+# FORK (Calibra 2.72.3, design D-09): the providers whose 401 on a data call forces one refresh.
+# Google sends no revoke notification the fork can read, so a grant the member removed in their
+# Google account is found here: the forced refresh is rejected, which revokes the connection and
+# emits connection.revoked through refresh_access_token's own path.
+FORCED_REFRESH_ON_401 = frozenset({"google_health"})
+
+
+def _force_refresh(
+    db: DbSession,
+    user_id: UUID,
+    provider_name: str,
+    connection_repo: UserConnectionRepository,
+    oauth: BaseOAuthTemplate,
+) -> str:
+    """Refresh whatever the stored expiry says, under the lock the other refresh takes."""
+    redis_client = get_redis_client()
+    lock_key = f"token_refresh_lock:{provider_name}:{user_id}"
+    with redis_client.lock(lock_key, timeout=60, blocking_timeout=10, sleep=0.2):
+        connection = connection_repo.get_by_user_and_provider(db, user_id, provider_name)
+        if connection:
+            db.refresh(connection)
+        if not connection or not connection.refresh_token:
+            raise HTTPException(
+                status_code=401,
+                detail=f"{provider_name.capitalize()} authorization expired. Please re-authorize.",
+            )
+        return oauth.refresh_access_token(db, user_id, connection.refresh_token).access_token
+
+
 def make_authenticated_request(
     db: DbSession,
     user_id: UUID,
@@ -163,8 +192,13 @@ def make_authenticated_request(
 
     # Make request with retry logic for rate limiting
     url = f"{api_base_url}{endpoint}"
+    refresh_forced = False
+    # FORK (Calibra 2.72.3, D-09; Codex P2 on #53): the forced refresh's retry has its own pass of
+    # the loop, so 429 retries before a 401 cannot spend it. Only that refresh reaches the extra
+    # pass: a 429 on it finds attempt >= MAX_RETRIES and raises as any exhausted 429 does.
+    passes = MAX_RETRIES + 1 + (1 if provider_name in FORCED_REFRESH_ON_401 else 0)
 
-    for attempt in range(MAX_RETRIES + 1):
+    for attempt in range(passes):
         try:
             with httpx.Client(http2=http2) as client:
                 response = client.request(
@@ -268,6 +302,11 @@ def make_authenticated_request(
                 status_code=e.response.status_code,
             )
             if e.response.status_code == 401:
+                if provider_name in FORCED_REFRESH_ON_401 and not refresh_forced:
+                    refresh_forced = True
+                    access_token = _force_refresh(db, user_id, provider_name, connection_repo, oauth)
+                    request_headers["Authorization"] = f"Bearer {access_token}"
+                    continue
                 raise HTTPException(
                     status_code=401,
                     detail=f"{provider_name.capitalize()} authorization expired. Please re-authorize.",
