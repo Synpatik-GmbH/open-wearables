@@ -31,12 +31,18 @@ from tests.factories import (
     UserFactory,
 )
 
+# These tests pin mid-October dates. ``begin_source`` sets ``connection_day`` to today, and
+# ``ck_wearable_history_window`` holds ``start_date`` within the 28 days before it, so each pinned
+# start also pins the connection day; otherwise the tests fail once today passes 10 November 2026.
+CONNECTION_DAY = date(2026, 10, 20)
+
 
 def summary_inputs(db: Session) -> tuple[User, WearableHistorySource, WearableHistorySource, DataSource, EventRecord]:
     member = UserFactory()
     repository = WearableHistoryRepository()
     apple = repository.begin_source(db, member.id, "apple")
     polar = repository.begin_source(db, member.id, "polar")
+    apple.connection_day = polar.connection_day = CONNECTION_DAY
     apple.start_date, polar.start_date = date(2026, 10, 13), date(2026, 10, 15)
     a = DataSourceFactory(user=member, provider="apple", source="watch")
     p = DataSourceFactory(user=member, provider="polar", source="polar")
@@ -133,7 +139,7 @@ def test_unproved_legacy_archives_follow_each_provisional_source_before_grouping
     repository = WearableHistoryRepository()
     for provider, day in [("apple", 13), ("polar", 15)]:
         source = repository.begin_source(db, member.id, provider)
-        source.start_date = date(2026, 10, day)
+        source.connection_day, source.start_date = CONNECTION_DAY, date(2026, 10, day)
     db.flush()
     rows = DataPointSeriesArchiveRepository().get_daily_activity_aggregates_from_archive(
         db, member.id, START, END, [get_series_type_id(SeriesType.steps)]
@@ -193,7 +199,7 @@ def test_every_series_summary_filters_before_aggregation_and_latest_selection(db
 def test_summary_keeps_both_first_night_endpoints_for_every_physiology_family(db: Session, metric: SeriesType) -> None:
     member = UserFactory()
     source = WearableHistoryRepository().begin_source(db, member.id, "apple")
-    source.start_date = date(2026, 10, 13)
+    source.connection_day, source.start_date = CONNECTION_DAY, date(2026, 10, 13)
     data_source = DataSourceFactory(user=member, provider="apple")
     onset, wake = datetime(2026, 10, 12, 20, tzinfo=UTC), datetime(2026, 10, 13, 6, tzinfo=UTC)
     EventRecordFactory(data_source=data_source, category="sleep", start_datetime=onset, end_datetime=wake)

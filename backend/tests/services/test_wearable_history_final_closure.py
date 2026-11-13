@@ -32,6 +32,11 @@ from tests.factories import DataPointSeriesFactory, DataSourceFactory, EventReco
 from tests.services.test_wearable_history_ingress_closure import frozen_source
 from tests.services.test_wearable_history_review_closure import envelope
 
+# These tests pin mid-October dates. ``begin_source`` sets ``connection_day`` to today, and
+# ``ck_wearable_history_window`` holds ``start_date`` within the 28 days before it, so each pinned
+# start also pins the connection day; otherwise the tests fail once today passes 10 November 2026.
+CONNECTION_DAY = date(2026, 10, 20)
+
 
 @pytest.mark.parametrize("transition", ["freeze", "first-night"])
 def test_archive_deletes_only_the_buckets_actually_upserted(db: Session, transition: str) -> None:
@@ -257,7 +262,7 @@ def test_sdk_first_night_uses_the_importers_cleaned_window(
     db: Session, wrapper: str, existing: bool, offload: bool
 ) -> None:
     member, history = frozen_source(db)
-    history.start_date = date(2026, 10, 13)
+    history.connection_day, history.start_date = CONNECTION_DAY, date(2026, 10, 13)
     db.flush()
     raw_start = datetime(2026, 10, 12, 15, tzinfo=UTC)
     clean_start = datetime(2026, 10, 12, 20, tzinfo=UTC)
@@ -437,7 +442,7 @@ def test_sdk_evening_wrapper_cannot_prove_an_evening_sample_for_a_morning_nap(
     db: Session, wrapper: str, offload: bool
 ) -> None:
     member, history = frozen_source(db)
-    history.start_date = date(2026, 10, 13)
+    history.connection_day, history.start_date = CONNECTION_DAY, date(2026, 10, 13)
     db.flush()
     evening = datetime(2026, 10, 12, 20, tzinfo=UTC)
     morning = datetime(2026, 10, 13, 10, tzinfo=UTC)
