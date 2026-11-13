@@ -6,6 +6,7 @@ is the path both take.
 
 from datetime import datetime, timezone
 
+import httpx
 import pytest
 from sqlalchemy.orm import Session
 
@@ -17,8 +18,11 @@ from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectio
 
 @pytest.fixture(autouse=True)
 def _no_polar_deregistration(monkeypatch: pytest.MonkeyPatch) -> None:
-    # User deletion deregisters every connection with Polar over HTTP first.
-    monkeypatch.setattr("app.services.providers.polar.oauth.PolarOAuth.deregister_user", lambda *a, **k: None)
+    # User deletion makes one Polar deregistration attempt over HTTP after the delete (GL-20).
+    monkeypatch.setattr(
+        "app.services.providers.polar.deregistration._request",
+        lambda *a, **k: httpx.Response(204),
+    )
 
 
 def test_true_time_record_is_deleted_with_the_user(db: Session) -> None:

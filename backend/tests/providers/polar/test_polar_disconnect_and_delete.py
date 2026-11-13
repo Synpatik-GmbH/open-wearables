@@ -224,7 +224,7 @@ class TestAccountDeletion:
         fake_polar: FakePolar,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """A revoked row was disconnected, which made its attempt then; or Polar refused its token."""
+        """A revoked row was disconnected, which made its attempt then."""
         delete(session_factory, member_factory(status=ConnectionStatus.REVOKED))
 
         assert fake_polar.calls == []

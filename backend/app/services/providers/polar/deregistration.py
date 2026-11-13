@@ -30,7 +30,7 @@ logger = getLogger(__name__)
 # calibra-ow-deploy scripts/alerts.sh matches this literal, and "outcome": "failed", as strings.
 ACTION = "polar_deregistration"
 
-# One total deadline, connect to last byte, inside the adapter's 15-second timeout for Open Wearables.
+# One total deadline, connect to last byte, inside the adapter's 15-second timeout for a disconnect.
 DEADLINE_SECONDS = 5.0
 
 
