@@ -184,19 +184,20 @@ class TestWhichRowsAttempt:
         assert attempts_logged(capsys.readouterr().out) == []
         assert db.query(User).filter_by(id=user.id).count() == 0
 
-    def test_a_polar_failure_stays_best_effort(
+    def test_another_providers_failure_stays_best_effort(
         self, db: Session, fake_garmin: FakeGarmin, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        """WHOOP stands in for the generic path since Polar moved to the attempt after the delete (GL-20)."""
         user = UserFactory()
-        UserConnectionFactory(user=user, provider="polar")
+        UserConnectionFactory(user=user, provider="whoop")
         UserConnectionFactory(user=user, provider="garmin")
 
         with patch(
-            "app.services.providers.polar.oauth.PolarOAuth.deregister_user", side_effect=RuntimeError("polar is down")
-        ) as polar:
+            "app.services.providers.whoop.oauth.WhoopOAuth.deregister_user", side_effect=RuntimeError("whoop is down")
+        ) as whoop:
             user_service.delete(db, user.id)
 
-        polar.assert_called_once()
+        whoop.assert_called_once()
         assert db.query(User).filter_by(id=user.id).count() == 0
         assert [line["outcome"] for line in attempts_logged(capsys.readouterr().out)] == ["confirmed"]
 
