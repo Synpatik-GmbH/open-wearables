@@ -124,7 +124,7 @@ class UserConnectionService(
         a concurrent one read the same tokens and finds nothing to update.
 
         FORK (Calibra 2.72.3, design D-07): Google Health takes the same order, with its revoke as
-        the attempt. The providers are ``ATTEMPT_AFTER_REVOKE``'s.
+        the attempt. FORK (Calibra GL-20): so does Polar. The providers are ``ATTEMPT_AFTER_REVOKE``'s.
 
         ``reason`` reaches the log line and the ``connection.revoked`` webhook.
         """
@@ -132,7 +132,7 @@ class UserConnectionService(
         if oauth and attempts_after_revoke(provider):
             connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
             if connection:
-                held = HeldTokens(connection.access_token, connection.refresh_token)
+                held = HeldTokens(connection.access_token, connection.refresh_token, connection.provider_user_id)
         elif oauth:
             self._deregister_from_provider(db_session, user_id, provider, oauth)
 

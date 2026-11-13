@@ -292,7 +292,7 @@ class TestWhichRowsAttempt:
 
     def test_another_provider_keeps_its_call_before_the_revoke(self, db: Session, fake_garmin: FakeGarmin) -> None:
         user = UserFactory()
-        UserConnectionFactory(user=user, provider="polar", status=ConnectionStatus.ACTIVE, access_token="polar-token")
+        UserConnectionFactory(user=user, provider="whoop", status=ConnectionStatus.ACTIVE, access_token="whoop-token")
         oauth = MagicMock()
         status_at_the_call: list[ConnectionStatus] = []
 
@@ -301,29 +301,30 @@ class TestWhichRowsAttempt:
 
         oauth.deregister_user.side_effect = record
 
-        user_connection_service.disconnect(db, user.id, "polar", oauth=oauth)
+        user_connection_service.disconnect(db, user.id, "whoop", oauth=oauth)
 
         assert status_at_the_call == [ConnectionStatus.ACTIVE]
         assert fake_garmin.calls == []
 
 
 class TestAnotherProvider:
-    """Garmin's own tests carried this until the attempt moved: the path stays for everyone else."""
+    """Garmin's own tests carried this until the attempt moved: the path stays for everyone else.
+    WHOOP stands in for them since Polar moved to the attempt after the revoke (GL-20)."""
 
-    def test_a_failing_deregistration_does_not_block_a_polar_disconnect(self, client: TestClient, db: Session) -> None:
+    def test_a_failing_deregistration_does_not_block_a_whoop_disconnect(self, client: TestClient, db: Session) -> None:
         user = UserFactory()
-        UserConnectionFactory(user=user, provider="polar", status=ConnectionStatus.ACTIVE)
+        UserConnectionFactory(user=user, provider="whoop", status=ConnectionStatus.ACTIVE)
 
         with patch(
-            "app.services.providers.polar.oauth.PolarOAuth.deregister_user", side_effect=RuntimeError("polar is down")
-        ) as polar:
+            "app.services.providers.whoop.oauth.WhoopOAuth.deregister_user", side_effect=RuntimeError("whoop is down")
+        ) as whoop:
             response = client.delete(
-                f"/api/v1/users/{user.id}/connections/polar", headers=api_key_headers(ApiKeyFactory().plain_key)
+                f"/api/v1/users/{user.id}/connections/whoop", headers=api_key_headers(ApiKeyFactory().plain_key)
             )
 
-        polar.assert_called_once()
+        whoop.assert_called_once()
         assert response.status_code == 204
-        row = db.query(UserConnection).filter_by(user_id=user.id, provider="polar").one()
+        row = db.query(UserConnection).filter_by(user_id=user.id, provider="whoop").one()
         assert row.status == ConnectionStatus.REVOKED
 
 

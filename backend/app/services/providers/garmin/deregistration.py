@@ -69,6 +69,8 @@ class HeldTokens:
 
     access_token: str | None = field(repr=False)
     refresh_token: str | None = field(repr=False)
+    # FORK (Calibra GL-20): Polar's deregistration names the user in its path. Not a secret.
+    provider_user_id: str | None = None
 
     @property
     def any_held(self) -> bool:

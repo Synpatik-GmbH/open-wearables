@@ -81,6 +81,9 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
         FORK (Calibra 2.72.3, design D-08): Google Health's revoke follows the delete the same way,
         for a row that is not revoked. A Google row revoked before 2.72.3 by a rejected refresh
         kept its tokens, and its grant was already ended or rejected at Google.
+
+        FORK (Calibra GL-20, R-2026-10-26-c): Polar's deregistration follows the delete the same way,
+        for a row that is not revoked: a revoked Polar row was disconnected, which made its attempt.
         """
         user = self.get(db_session, object_id, raise_404=raise_404)
         if not user:
@@ -91,7 +94,10 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
         held_tokens = [
             (provider, held)
             for provider, held in (
-                (connection.provider, HeldTokens(connection.access_token, connection.refresh_token))
+                (
+                    connection.provider,
+                    HeldTokens(connection.access_token, connection.refresh_token, connection.provider_user_id),
+                )
                 for connection in connections
                 if attempts_after_revoke(connection.provider)
                 and (connection.provider == ProviderName.GARMIN.value or connection.status != ConnectionStatus.REVOKED)
