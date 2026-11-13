@@ -40,6 +40,11 @@ from app.services.timeseries_service import TimeSeriesService
 from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectionFactory, UserFactory
 from tests.services.test_wearable_history_ingress_closure import frozen_source
 
+# These tests pin mid-October dates. ``begin_source`` sets ``connection_day`` to today, and
+# ``ck_wearable_history_window`` holds ``start_date`` within the 28 days before it, so each pinned
+# start also pins the connection day; otherwise the tests fail once today passes 10 November 2026.
+CONNECTION_DAY = date(2026, 10, 20)
+
 
 def envelope(data: dict) -> dict:
     return {"provider": "apple", "sdkVersion": "1", "syncTimestamp": datetime.now(UTC).isoformat(), "data": data}
@@ -275,7 +280,7 @@ def test_later_offset_matches_importer_before_sdk_transport_and_persistence(
     db: Session, existing_state: bool, offload: bool, admitted: bool
 ) -> None:
     member, source = frozen_source(db)
-    source.start_date = date(2026, 10, 13)
+    source.connection_day, source.start_date = CONNECTION_DAY, date(2026, 10, 13)
     db.flush()
     start = datetime(2026, 10, 12, 15, 30, tzinfo=UTC) if admitted else datetime(2026, 10, 12, 20, tzinfo=UTC)
     middle, end = start + timedelta(hours=1), start + timedelta(hours=2)
@@ -408,7 +413,7 @@ def test_duplicate_sleep_offset_uses_importer_first_stage_identity(
     db: Session, first_offset: str | None, duplicate_offset: str, admitted: bool
 ) -> None:
     member, source = frozen_source(db)
-    source.start_date = date(2026, 10, 13)
+    source.connection_day, source.start_date = CONNECTION_DAY, date(2026, 10, 13)
     db.flush()
     start, end = datetime(2026, 10, 12, 15, 30, tzinfo=UTC), datetime(2026, 10, 12, 17, 30, tzinfo=UTC)
     stages = [
