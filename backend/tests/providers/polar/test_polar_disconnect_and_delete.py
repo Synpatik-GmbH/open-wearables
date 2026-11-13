@@ -113,6 +113,19 @@ class TestDisconnect:
 
         assert seen == [(DEREGISTRATION_PATH, ConnectionStatus.REVOKED, None)]
 
+    def test_connection_revoked_goes_out_before_the_call(
+        self, session_factory: Any, member_factory: Any, fake_polar: FakePolar
+    ) -> None:
+        user_id = member_factory()
+        emitted: list[int] = []
+
+        with patch("app.services.user_connection_service.on_connection_revoked") as revoked:
+            revoked.side_effect = lambda **_: emitted.append(len(fake_polar.calls))
+            disconnect(session_factory, user_id)
+
+        assert emitted == [0]
+        assert len(fake_polar.calls) == 1
+
     def test_the_attempt_presents_the_token_read_before_the_revoke(
         self, session_factory: Any, member_factory: Any, fake_polar: FakePolar
     ) -> None:

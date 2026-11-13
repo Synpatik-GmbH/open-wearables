@@ -204,6 +204,24 @@ POLAR_WEBHOOK_SIGNATURE_SECRET=
   </Step>
 </Steps>
 
+## Disconnect and account deletion
+
+Open Wearables ends the connection on its side first, whatever Polar answers, and then asks Polar once to remove the user's registration (`DELETE /v3/users/{polar-user-id}`, with the access token read before the connection lost it).
+
+- **Disconnect** (`DELETE /api/v1/users/{user_id}/connections/polar`): the connection is revoked and its token cleared, `connection.revoked` is sent, and then the one attempt runs.
+- **User deletion** (`DELETE /api/v1/users/{user_id}`): the user and their data are deleted first, then one attempt runs for a Polar connection that is not already revoked and holds a token. A deletion that fails makes no attempt.
+
+Each attempt has a 5-second total deadline and is never retried. It logs one line, `action="polar_deregistration"`, with `trigger` (`disconnect` or `user_delete`) and `outcome`:
+
+| `outcome` | Meaning | Log level |
+|-----------|---------|-----------|
+| `confirmed` | Polar answered 2xx; the registration is gone | info |
+| `not_found` | Polar answered 404; it holds no registration for the user | info |
+| `no_credential` | No access token or Polar user id was held, so nothing was sent | info |
+| `failed` | Any other answer, a 401 included, a timeout or a transport error; carries a `cause` (the status or the exception's class name) | error |
+
+A `failed` attempt leaves the app registered for that member at Polar until they remove it themselves in Polar Flow. Alert on `polar_deregistration` with `"outcome": "failed"` if you need to know.
+
 ## Rate Limits
 
 Polar AccessLink API uses dynamic rate limits that scale with your registered user count:
