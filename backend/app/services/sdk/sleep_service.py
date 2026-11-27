@@ -355,34 +355,49 @@ def handle_sleep_data(
 
 
 def _keep_uncovered_generic_sleep(
-    stages: list[SleepStateStage], metrics: dict, cleaned: list[SleepStage]
+    stored: list[SleepStateStage], new: list[SleepStateStage], metrics: dict, cleaned: list[SleepStage]
 ) -> tuple[dict, list[SleepStage]]:
-    """FORK (reviews of #56): keep generic ``sleeping`` time that touches no other stage.
+    """FORK (reviews of #56): add back the generic ``sleeping`` time that no kept stage covers.
 
     ``_calculate_final_metrics`` drops every generic ``sleeping`` stage once any light/deep/REM
-    stage is present: right for a wrapper around the same night's detailed stages, wrong for
-    generic sleep standing apart from them, which a cross-writer merge now joins where the two
-    records used to stay separate (generic 00:00-07:00 plus another writer's light 07:00-07:45).
-    A generic span that overlaps any kept stage is the same night described twice — the detailed
-    stages win, as in the live session, which also keeps an iPhone's in-bed margins (stored as
-    generic) out of the sleep total. A generic span that overlaps none is added back, once.
+    stage is present: right for one writer's wrapper around its own detailed stages, wrong for two
+    writers' records that a cross-writer merge now joins where they used to stay separate (generic
+    00:00-07:00 plus another writer's light 07:00-07:45 would store 45 min). Where a kept stage
+    overlaps a generic span, that stage counts; the rest of the span is added back, once.
+
+    The new piece's generic stages are offered only when the piece has no detailed stage of its
+    own: a generic stage beside the same piece's detailed stages is that writer's wrapper, which
+    keeps the existing rule. Stored stages were cleaned when stored, so they carry no wrapper.
     """
-    if not any(s.stage in (SleepStageType.LIGHT, SleepStageType.DEEP, SleepStageType.REM) for s in stages):
+    detailed = (SleepStageType.LIGHT, SleepStageType.DEEP, SleepStageType.REM)
+    if not any(s.stage in detailed for s in stored + new):
         return metrics, cleaned
+    sources = stored if any(s.stage in detailed for s in new) else stored + new
     spans: list[tuple[datetime, datetime]] = []
-    for start, end in sorted((s.start_time, s.end_time) for s in stages if s.stage == SleepStageType.SLEEPING):
+    for start, end in sorted((s.start_time, s.end_time) for s in sources if s.stage == SleepStageType.SLEEPING):
         if spans and start < spans[-1][1]:
             spans[-1] = (spans[-1][0], max(spans[-1][1], end))
         elif start < end:
             spans.append((start, end))
-    apart = [
-        (start, end) for start, end in spans if not any(c.start_time < end and c.end_time > start for c in cleaned)
-    ]
-    if not apart:
+    covered = sorted((c.start_time, c.end_time) for c in cleaned)
+    pieces: list[tuple[datetime, datetime]] = []
+    for start, end in spans:
+        cursor = start
+        for c_start, c_end in covered:
+            if c_end <= cursor or c_start >= end:
+                continue
+            if c_start > cursor:
+                pieces.append((cursor, c_start))
+            cursor = max(cursor, c_end)
+            if cursor >= end:
+                break
+        if cursor < end:
+            pieces.append((cursor, end))
+    if not pieces:
         return metrics, cleaned
     kept = dict(metrics)
-    kept["sleeping_seconds"] += sum((end - start).total_seconds() for start, end in apart)
-    restored = [SleepStage(stage=SleepStageType.SLEEPING, start_time=start, end_time=end) for start, end in apart]
+    kept["sleeping_seconds"] += sum((end - start).total_seconds() for start, end in pieces)
+    restored = [SleepStage(stage=SleepStageType.SLEEPING, start_time=start, end_time=end) for start, end in pieces]
     return kept, sorted(cleaned + restored, key=lambda s: s.start_time)
 
 
@@ -448,7 +463,9 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
             s.stage in (SleepStageType.LIGHT, SleepStageType.DEEP, SleepStageType.REM) for s in existing_state_stages
         )
         if cross_writer and (adjacent.source_name != record_source_name or stored_has_both):
-            metrics, cleaned_stages = _keep_uncovered_generic_sleep(merged_stages, metrics, cleaned_stages)
+            metrics, cleaned_stages = _keep_uncovered_generic_sleep(
+                existing_state_stages, state.stages, metrics, cleaned_stages
+            )
 
         # Expand the session window to cover both records.
         start_time = min(adjacent.start_datetime, start_time)

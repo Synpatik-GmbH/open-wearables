@@ -101,12 +101,12 @@ HealthKit has no sleep session object, only stage samples, so Open Wearables bui
    - for a night uploaded later than that, as soon as it arrives.
 
    Due sessions are closed every 5 minutes (`SLEEP_SYNC_INTERVAL_SECONDS`, 300).
-3. A piece of the same night that arrives after it was closed — within `SLEEP_END_GAP_MINUTES` — is merged into the stored night, whichever writer recorded it, and `sleep.created` is sent again for the merged night. The merged night keeps the stored night's source and device. When the piece comes from another writer, generic "asleep" time that overlaps none of the detailed stages is kept; where it overlaps them, the detailed stages count, as they do within one open session.
+3. A piece of the same night that arrives after it was closed — within `SLEEP_END_GAP_MINUTES` — is merged into the stored night, whichever writer recorded it, and `sleep.created` is sent again for the merged night. The merged night keeps the stored night's source and device. When the piece comes from another writer, generic "asleep" time is kept wherever no detailed or awake stage covers it; where one does, that stage counts. Generic time inside a late piece that has detailed stages of its own is not counted, as before; only the stored night's generic sleep, or that of a piece with no detailed stages, is kept.
 
 An Apple Watch night is usually available 15 to 20 minutes after the phone uploads it, which can be hours after waking up.
 
 <Note>
-An iPhone that records only time in bed is stored as generic sleep. If that record is stored before the watch's night arrives, in-bed time outside the watch's stages (before falling asleep, after the last stage) is counted as sleep.
+An iPhone that records only time in bed is stored as generic sleep. If that record is stored before the watch's night arrives (a watch more than 2 hours late, or a history upload), its in-bed time outside the watch's stages is counted as sleep, and its time in bed is at least that total plus the watch's awake time.
 </Note>
 
 ## Apple Health as a Data Bridge
