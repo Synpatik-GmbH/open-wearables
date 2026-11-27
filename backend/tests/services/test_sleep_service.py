@@ -17,6 +17,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.constants.sleep import SleepStageType
+from app.models import DataSource, EventRecord, SleepDetails
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -798,8 +799,8 @@ class TestHistoricalBulkUploadMerging:
         # Simulate the adjacent record that payload A already wrote to the DB
         mock_adjacent = MagicMock()
         mock_adjacent.id = uuid4()
-        mock_adjacent.data_source_id = uuid4()  # no such row: the merged night keeps the payload's writer
-        mock_adjacent.source_name = "unknown"
+        mock_adjacent.data_source_id = uuid4()
+        mock_adjacent.source_name = "unknown"  # the payload's writer: same-writer merge
         mock_adjacent.start_datetime = _dt("2026-03-22T23:00:00Z")
         mock_adjacent.end_datetime = _dt("2026-03-23T01:00:00Z")
         mock_adjacent.sleep_detail = MagicMock()
@@ -1114,7 +1115,14 @@ class TestLatePieceFromAnotherWriter:
     IPHONE = ("Jan's iPhone", "iPhone15,2")
     AUTOSLEEP = ("AutoSleep", "iPhone15,2")
 
-    def _state(self, provider: str, writer: tuple[str, str], start: str, end: str) -> SleepState:
+    def _state(
+        self,
+        provider: str,
+        writer: tuple[str, str],
+        start: str,
+        end: str,
+        stage: SleepStageType = SleepStageType.LIGHT,
+    ) -> SleepState:
         start_dt, end_dt = _dt(start), _dt(end)
         return SleepState(
             uuid=str(uuid4()),
@@ -1125,12 +1133,10 @@ class TestLatePieceFromAnotherWriter:
             end_time=end_dt,
             last_start_timestamp=start_dt,
             last_end_timestamp=end_dt,
-            stages=[SleepStateStage(stage=SleepStageType.LIGHT, start_time=start_dt, end_time=end_dt)],
+            stages=[SleepStateStage(stage=stage, start_time=start_dt, end_time=end_dt)],
         )
 
     def _nights(self, db: Session, user_id: str) -> list[tuple[str, str | None, datetime, datetime]]:
-        from app.models import DataSource, EventRecord  # noqa: PLC0415
-
         rows = (
             db.query(
                 EventRecord.source_name, DataSource.device_model, EventRecord.start_datetime, EventRecord.end_datetime
@@ -1146,8 +1152,6 @@ class TestLatePieceFromAnotherWriter:
         self, db: Session, nights: list[tuple[str, str | None, datetime, datetime]]
     ) -> str | None:
         """``DataSource.source`` of the one stored night: the row the merged record landed on."""
-        from app.models import DataSource, EventRecord  # noqa: PLC0415
-
         row = (
             db.query(DataSource.source)
             .join(EventRecord, EventRecord.data_source_id == DataSource.id)
@@ -1227,8 +1231,6 @@ class TestLatePieceFromAnotherWriter:
 
     def test_the_merged_night_counts_overlapping_time_once(self, db: Session) -> None:
         """Watch 23:00-06:00 and AutoSleep 23:10-06:45 are one night of 7 h 45 min, not 14 h 35 min."""
-        from app.models import DataSource, EventRecord, SleepDetails  # noqa: PLC0415
-
         user_id = str(uuid4())
         UserFactory(id=UUID(user_id))
         with patch("app.services.sdk.sleep_service.delete_sleep_state"):
@@ -1245,3 +1247,190 @@ class TestLatePieceFromAnotherWriter:
             .all()
         )
         assert [t[0] for t in totals] == [465]
+
+
+class TestCrossWriterMergeKeepsGenericSleep:
+    """FORK (Codex review of #56): ``_calculate_final_metrics`` drops every generic ``sleeping``
+    stage once any light/deep/REM stage is present, even where they do not overlap. Records from
+    two writers used to stay separate, so a cross-writer merge must keep generic sleep wherever no
+    detailed stage covers it. A same-writer merge keeps the existing behaviour."""
+
+    AUTOSLEEP = ("AutoSleep", "iPhone15,2")
+    WATCH = ("Jan's Apple Watch", "Watch7,1")
+
+    def _merged_total(
+        self,
+        db: Session,
+        first: tuple[tuple[str, str], str, str, SleepStageType],
+        later: tuple[tuple[str, str], str, str, SleepStageType],
+    ) -> list[int]:
+        helper = TestLatePieceFromAnotherWriter()
+        user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
+        with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+            for writer, start, end, stage in (first, later):
+                finish_sleep(db, user_id, helper._state("apple", writer, start, end, stage))
+        rows = (
+            db.query(SleepDetails.sleep_total_duration_minutes)
+            .join(EventRecord, SleepDetails.record_id == EventRecord.id)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == UUID(user_id))
+            .all()
+        )
+        return [r[0] for r in rows]
+
+    def test_generic_sleep_next_to_another_writers_detailed_piece_is_kept(self, db: Session) -> None:
+        """Codex's case: generic 00:00-07:00, then another writer's light 07:00-07:45 = 465 min, not 45."""
+        totals = self._merged_total(
+            db,
+            (self.AUTOSLEEP, "2026-04-18T00:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING),
+            (self.WATCH, "2026-04-18T07:00:00Z", "2026-04-18T07:45:00Z", SleepStageType.LIGHT),
+        )
+
+        assert totals == [465]
+
+    def test_a_generic_span_around_another_writers_detailed_piece_is_the_same_night(self, db: Session) -> None:
+        """Generic 23:00-07:00 around a detailed piece 23:30-01:00: the detailed stages win, as live."""
+        totals = self._merged_total(
+            db,
+            (self.AUTOSLEEP, "2026-04-17T23:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING),
+            (self.WATCH, "2026-04-17T23:30:00Z", "2026-04-18T01:00:00Z", SleepStageType.DEEP),
+        )
+
+        assert totals == [90]
+
+    def test_a_later_generic_piece_standing_apart_is_kept(self, db: Session) -> None:
+        """Watch light 23:00-06:00 stored first, AutoSleep generic 06:00-07:00 after it: 480 min."""
+        totals = self._merged_total(
+            db,
+            (self.WATCH, "2026-04-17T23:00:00Z", "2026-04-18T06:00:00Z", SleepStageType.LIGHT),
+            (self.AUTOSLEEP, "2026-04-18T06:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING),
+        )
+
+        assert totals == [480]
+
+    def test_an_iphone_in_bed_night_does_not_add_its_margins_as_sleep(self, db: Session) -> None:
+        """iPhone in bed 01:00-07:30 (stored as generic), then Watch light 01:30-07:00: 330 min, as live."""
+        totals = self._merged_total(
+            db,
+            (("Jan's iPhone", "iPhone15,2"), "2026-04-18T01:00:00Z", "2026-04-18T07:30:00Z", SleepStageType.IN_BED),
+            (self.WATCH, "2026-04-18T01:30:00Z", "2026-04-18T07:00:00Z", SleepStageType.LIGHT),
+        )
+
+        assert totals == [330]
+
+    def test_a_same_writer_merge_keeps_the_existing_rule(self, db: Session) -> None:
+        """Unchanged: one writer's generic wrapper is dropped once that writer sends detailed stages."""
+        totals = self._merged_total(
+            db,
+            (self.WATCH, "2026-04-18T00:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING),
+            (self.WATCH, "2026-04-18T07:00:00Z", "2026-04-18T07:45:00Z", SleepStageType.LIGHT),
+        )
+
+        assert totals == [45]
+
+    def test_overlapping_generic_stages_are_counted_once(self, db: Session) -> None:
+        """Two generic stages of one upload that overlap (00:00-07:00, 06:00-07:00) add 420 min, not 480."""
+        helper = TestLatePieceFromAnotherWriter()
+        user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
+        later = helper._state(
+            "apple", self.AUTOSLEEP, "2026-04-18T00:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING
+        )
+        later.stages.append(
+            SleepStateStage(
+                stage=SleepStageType.SLEEPING,
+                start_time=_dt("2026-04-18T06:00:00Z"),
+                end_time=_dt("2026-04-18T07:00:00Z"),
+            )
+        )
+        with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+            finish_sleep(
+                db, user_id, helper._state("apple", self.WATCH, "2026-04-18T07:00:00Z", "2026-04-18T07:45:00Z")
+            )
+            finish_sleep(db, user_id, later)
+
+        totals = (
+            db.query(SleepDetails.sleep_total_duration_minutes)
+            .join(EventRecord, SleepDetails.record_id == EventRecord.id)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == UUID(user_id))
+            .all()
+        )
+        assert [t[0] for t in totals] == [465]
+
+
+class TestMergeAcrossThreePieces:
+    """FORK (review of ec1cf6d7): a record that kept another writer's generic sleep must keep it when
+    a later piece comes from the writer the record is named for."""
+
+    AUTOSLEEP = ("AutoSleep", "iPhone15,2")
+    WATCH = ("Jan's Apple Watch", "Watch7,1")
+
+    def _total(self, db: Session, pieces: list[tuple[tuple[str, str], str, str, SleepStageType]]) -> list[int]:
+        helper = TestLatePieceFromAnotherWriter()
+        user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
+        with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+            for writer, start, end, stage in pieces:
+                finish_sleep(db, user_id, helper._state("apple", writer, start, end, stage))
+        rows = (
+            db.query(SleepDetails.sleep_total_duration_minutes)
+            .join(EventRecord, SleepDetails.record_id == EventRecord.id)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == UUID(user_id))
+            .all()
+        )
+        return [r[0] for r in rows]
+
+    def test_a_later_piece_from_the_named_writer_keeps_restored_generic_sleep(self, db: Session) -> None:
+        """Watch light 07:00-07:45, AutoSleep generic 00:00-07:00, Watch deep 07:45-08:15: 495 min."""
+        totals = self._total(
+            db,
+            [
+                (self.WATCH, "2026-04-18T07:00:00Z", "2026-04-18T07:45:00Z", SleepStageType.LIGHT),
+                (self.AUTOSLEEP, "2026-04-18T00:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING),
+                (self.WATCH, "2026-04-18T07:45:00Z", "2026-04-18T08:15:00Z", SleepStageType.DEEP),
+            ],
+        )
+
+        assert totals == [495]
+
+    def test_a_later_generic_piece_from_the_named_writer_keeps_everything(self, db: Session) -> None:
+        """AutoSleep generic 00:00-07:00, Watch light 07:00-07:45, AutoSleep generic 07:45-08:00: 480 min."""
+        totals = self._total(
+            db,
+            [
+                (self.AUTOSLEEP, "2026-04-18T00:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING),
+                (self.WATCH, "2026-04-18T07:00:00Z", "2026-04-18T07:45:00Z", SleepStageType.LIGHT),
+                (self.AUTOSLEEP, "2026-04-18T07:45:00Z", "2026-04-18T08:00:00Z", SleepStageType.SLEEPING),
+            ],
+        )
+
+        assert totals == [480]
+
+
+class TestOtherSdkProvidersMergeAsBefore:
+    """FORK (Bogdan's review of #56): only an Apple Health merge keeps the stored night's writer and
+    device. Health Connect and Samsung keep the late piece's, as on release/0.9.0-syn."""
+
+    def test_a_health_connect_merge_lands_on_the_late_pieces_device(self, db: Session) -> None:
+        helper = TestLatePieceFromAnotherWriter()
+        user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
+        writer = "com.sec.android.app.shealth"
+        with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+            finish_sleep(
+                db,
+                user_id,
+                helper._state("health_connect", (writer, "SM-R960"), "2026-04-17T23:00:00Z", "2026-04-18T06:00:00Z"),
+            )
+            finish_sleep(
+                db,
+                user_id,
+                helper._state("health_connect", (writer, "SM-S918B"), "2026-04-18T06:10:00Z", "2026-04-18T06:40:00Z"),
+            )
+
+        nights = helper._nights(db, user_id)
+        assert len(nights) == 1
+        assert nights[0][1] == "SM-S918B"

@@ -26,6 +26,7 @@ class SleepState(BaseModel):
 
     last_start_timestamp: datetime
     last_end_timestamp: datetime
+    # FORK (port of upstream #1892): upstream's two fields; defaulted so older Redis states load.
     last_received_at: datetime | None = None
     has_apple_watch_sleep: bool = False
 

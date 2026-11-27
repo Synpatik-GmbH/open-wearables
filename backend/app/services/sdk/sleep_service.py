@@ -15,12 +15,12 @@ from app.constants.series_types.sdk import (
 from app.constants.sleep import SleepStageType
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
-from app.models import DataSource
 from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
+    SleepStage,
 )
 from app.schemas.providers.mobile_sdk import (
     SLEEP_START_STATES,
@@ -223,14 +223,16 @@ def handle_sleep_data(
     """
     Process SDK sleep data and track sleep sessions using Redis state.
 
-    Sleep sessions are tracked in Redis and automatically finalized to the database when
-    a gap of more than 2 hours (configurable) is detected between consecutive sleep records.
+    Sleep sessions are tracked in Redis and finalized to the database when ``is_ready_to_finish``
+    holds: a gap of more than 2 hours (configurable) since the session's last sample, or, for a
+    session holding Apple Watch sleep, 15 minutes (configurable) since its last upload.
 
     A per-user Redis lock serializes concurrent calls so that parallel Celery tasks
     (e.g. from a bulk historical upload) accumulate stages into the same session instead
     of overwriting each other's state.
 
-    Stale detection uses ``end_time`` (the last sleep-sample timestamp).  When a bulk
+    Stale detection uses ``end_time`` (the last sleep-sample timestamp), and for a session with
+    Apple Watch sleep also ``last_received_at`` (the last upload that added samples).  When a bulk
     historical upload finalizes a session whose ``end_time`` is in the past, the new
     session is merged with any adjacent record already in the database, so consecutive
     payloads within the same night are combined into a single session rather than being
@@ -352,6 +354,38 @@ def handle_sleep_data(
     finalize_stale_sleeps.delay()
 
 
+def _keep_uncovered_generic_sleep(
+    stages: list[SleepStateStage], metrics: dict, cleaned: list[SleepStage]
+) -> tuple[dict, list[SleepStage]]:
+    """FORK (reviews of #56): keep generic ``sleeping`` time that touches no other stage.
+
+    ``_calculate_final_metrics`` drops every generic ``sleeping`` stage once any light/deep/REM
+    stage is present: right for a wrapper around the same night's detailed stages, wrong for
+    generic sleep standing apart from them, which a cross-writer merge now joins where the two
+    records used to stay separate (generic 00:00-07:00 plus another writer's light 07:00-07:45).
+    A generic span that overlaps any kept stage is the same night described twice — the detailed
+    stages win, as in the live session, which also keeps an iPhone's in-bed margins (stored as
+    generic) out of the sleep total. A generic span that overlaps none is added back, once.
+    """
+    if not any(s.stage in (SleepStageType.LIGHT, SleepStageType.DEEP, SleepStageType.REM) for s in stages):
+        return metrics, cleaned
+    spans: list[tuple[datetime, datetime]] = []
+    for start, end in sorted((s.start_time, s.end_time) for s in stages if s.stage == SleepStageType.SLEEPING):
+        if spans and start < spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], end))
+        elif start < end:
+            spans.append((start, end))
+    apart = [
+        (start, end) for start, end in spans if not any(c.start_time < end and c.end_time > start for c in cleaned)
+    ]
+    if not apart:
+        return metrics, cleaned
+    kept = dict(metrics)
+    kept["sleeping_seconds"] += sum((end - start).total_seconds() for start, end in apart)
+    restored = [SleepStage(stage=SleepStageType.SLEEPING, start_time=start, end_time=end) for start, end in apart]
+    return kept, sorted(cleaned + restored, key=lambda s: s.start_time)
+
+
 def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None:
     """Finish a sleep session and save the record to the database.
 
@@ -393,7 +427,7 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         provider=state.provider,
     )
     record_source_name = state.source_name or "unknown"
-    record_device_model = state.device_model
+    record_data_source_id: UUID | None = None
 
     if adjacent is not None:
         # Deserialise the stored stages back to SleepStateStage so we can feed
@@ -405,7 +439,16 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
                     existing_state_stages.append(SleepStateStage.model_validate(s))
 
         # Recalculate from the union of both stage lists.
-        metrics, cleaned_stages = _calculate_final_metrics(existing_state_stages + state.stages)
+        merged_stages = existing_state_stages + state.stages
+        metrics, cleaned_stages = _calculate_final_metrics(merged_stages)
+        # FORK: an Apple Health merge keeps generic sleep that no detailed stage covers when it
+        # joins two writers, or when the stored record already holds both kinds — a state only
+        # such a merge leaves, so a later piece from the writer the record is named for keeps it.
+        stored_has_both = any(s.stage == SleepStageType.SLEEPING for s in existing_state_stages) and any(
+            s.stage in (SleepStageType.LIGHT, SleepStageType.DEEP, SleepStageType.REM) for s in existing_state_stages
+        )
+        if cross_writer and (adjacent.source_name != record_source_name or stored_has_both):
+            metrics, cleaned_stages = _keep_uncovered_generic_sleep(merged_stages, metrics, cleaned_stages)
 
         # Expand the session window to cover both records.
         start_time = min(adjacent.start_datetime, start_time)
@@ -414,12 +457,12 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
             start_time = min(start_time, cleaned_stages[0].start_time)
             end_time = max(end_time, cleaned_stages[-1].end_time)
 
-        # The merged night keeps the stored night's writer and device, as the open session kept
-        # the writer that opened it.
-        stored_source = db_session.get(DataSource, adjacent.data_source_id)
-        record_source_name = adjacent.source_name
-        source_for_lookup = stored_source.source if stored_source else source_for_lookup
-        record_device_model = stored_source.device_model if stored_source else record_device_model
+        # FORK: an Apple Health merged night stays on the stored night's data source (its writer
+        # and device) and keeps its name, as the open session kept the writer that opened it.
+        # Other providers land on the late piece's, as before.
+        if cross_writer:
+            record_source_name = adjacent.source_name
+            record_data_source_id = adjacent.data_source_id
 
         # Remove the old record before creating the merged one (cascade deletes detail).
         event_record_service.delete(db_session, adjacent.id)
@@ -446,9 +489,10 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         category="sleep",
         type="sleep_session",
         source_name=record_source_name,
+        data_source_id=record_data_source_id,
         source=source_for_lookup,
         provider=state.provider,
-        device_model=record_device_model,
+        device_model=state.device_model,
     )
 
     detail = EventRecordDetailCreate(
