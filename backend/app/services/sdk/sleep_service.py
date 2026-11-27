@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 from app.config import settings
+from app.constants.devices_map.device_types import is_apple_own_source
 from app.constants.series_types.sdk import (
     SleepPhase,
     get_apple_sleep_phase,
@@ -14,7 +15,9 @@ from app.constants.series_types.sdk import (
 from app.constants.sleep import SleepStageType
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
+from app.models import DataSource
 from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
+from app.schemas.enums import ProviderName
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -23,6 +26,7 @@ from app.schemas.providers.mobile_sdk import (
     SLEEP_START_STATES,
     SleepState,
     SleepStateStage,
+    SourceInfo,
 )
 from app.schemas.providers.mobile_sdk import (
     SyncRequest as SDKSyncRequest,
@@ -30,6 +34,7 @@ from app.schemas.providers.mobile_sdk import (
 from app.services.event_record_service import event_record_service
 from app.services.sdk.device_resolution import extract_device_info
 from app.services.sdk.sleep_stages import _calculate_final_metrics, normalized_sleep_window, ordered_sleep_stages
+from app.utils.dates import as_utc
 from app.utils.exceptions import SleepLockBusyError
 from app.utils.sleep_interval import interval_gap
 from app.utils.structured_logging import log_structured
@@ -79,6 +84,29 @@ def delete_sleep_state(user_id: str) -> None:
     get_redis_client().srem(active_users_key(), user_id)
 
 
+def is_ready_to_finish(state: SleepState, now: datetime) -> bool:
+    """True after the end gap, or for a session with Apple Watch sleep once its uploads go quiet.
+
+    FORK (port of upstream #1892): the Watch hands the phone the whole night after waking, so
+    once uploads stop for ``sleep_upload_quiet_minutes`` the night is complete; any other session
+    still waits ``sleep_end_gap_minutes`` after its last sample.
+    """
+    if now - as_utc(state.end_time) >= timedelta(minutes=settings.sleep_end_gap_minutes):
+        return True
+    return (
+        state.has_apple_watch_sleep
+        and state.last_received_at is not None
+        and now - as_utc(state.last_received_at) >= timedelta(minutes=settings.sleep_upload_quiet_minutes)
+    )
+
+
+def _is_apple_watch_sample(source: SourceInfo | None) -> bool:
+    """A sample Apple's own HealthKit source recorded on a Watch (upstream #1892's test)."""
+    if source is None or source.device_type is None:
+        return False
+    return str(source.device_type).lower() == "watch" and is_apple_own_source(source.app_id or source.bundle_identifier)
+
+
 def _create_new_sleep_state(
     start_time: datetime,
     end_time: datetime,
@@ -120,6 +148,7 @@ def _apply_transition(
     source_name: str | None = None,
     device_model: str | None = None,
     zone_offset: str | None = None,
+    is_apple_watch: bool = False,
 ) -> SleepState:
     """Apply a transition to the sleep state."""
 
@@ -136,6 +165,8 @@ def _apply_transition(
 
     if zone_offset and not state.zone_offset:
         state.zone_offset = zone_offset
+    if is_apple_watch:
+        state.has_apple_watch_sleep = True
 
     duration_seconds = (end_time - start_time).total_seconds()
 
@@ -237,6 +268,7 @@ def handle_sleep_data(
 
         current_state = load_sleep_state(user_id)
         provider = request.provider
+        received = False
 
         for sjson in ordered_sleep_stages(request.data.sleep):
             # Extract device info
@@ -273,7 +305,13 @@ def handle_sleep_data(
                 original_source_name,
                 device_model,
                 sjson.zoneOffset,
+                is_apple_watch=_is_apple_watch_sample(sjson.source),
             )
+            received = True
+
+        now = datetime.now(timezone.utc)
+        if current_state and received:
+            current_state.last_received_at = now
 
         # Persist the accumulated state to Redis only once after processing the entire batch
         if current_state:
@@ -299,12 +337,8 @@ def handle_sleep_data(
         # finish_sleep now merges the result with any adjacent record already in
         # the DB — so each payload extends the growing record rather than
         # creating a separate session.
-        if current_state:
-            session_end = current_state.end_time
-            if session_end.tzinfo is None:
-                session_end = session_end.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) - session_end >= timedelta(minutes=settings.sleep_end_gap_minutes):
-                finish_sleep(db_session, user_id, current_state)
+        if current_state and is_ready_to_finish(current_state, now):
+            finish_sleep(db_session, user_id, current_state)
 
     finally:
         with contextlib.suppress(Exception):
@@ -344,15 +378,22 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
 
     # --- Merge with an adjacent existing session if one exists ---
     source_for_lookup = state.source_name if state.source_name != "unknown" else None
+    # FORK (with the port of upstream #1892): an Apple Health night can close 15 minutes after its
+    # last upload, so a piece that arrives later — another app's copy, or a Watch piece in a night
+    # the iPhone opened — merges into it whichever writer recorded it, as it would have joined the
+    # one open session. Every other provider keeps the per-writer merge.
+    cross_writer = state.provider == ProviderName.APPLE
     adjacent = event_record_service.find_adjacent_sleep_record(
         db_session,
         UUID(user_id),
         start_time,
         end_time,
         settings.sleep_end_gap_minutes,
-        source=source_for_lookup,
+        source=None if cross_writer else source_for_lookup,
         provider=state.provider,
     )
+    record_source_name = state.source_name or "unknown"
+    record_device_model = state.device_model
 
     if adjacent is not None:
         # Deserialise the stored stages back to SleepStateStage so we can feed
@@ -372,6 +413,13 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         if cleaned_stages:
             start_time = min(start_time, cleaned_stages[0].start_time)
             end_time = max(end_time, cleaned_stages[-1].end_time)
+
+        # The merged night keeps the stored night's writer and device, as the open session kept
+        # the writer that opened it.
+        stored_source = db_session.get(DataSource, adjacent.data_source_id)
+        record_source_name = adjacent.source_name
+        source_for_lookup = stored_source.source if stored_source else source_for_lookup
+        record_device_model = stored_source.device_model if stored_source else record_device_model
 
         # Remove the old record before creating the merged one (cascade deletes detail).
         event_record_service.delete(db_session, adjacent.id)
@@ -397,10 +445,10 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         duration_seconds=int(total_duration),
         category="sleep",
         type="sleep_session",
-        source_name=state.source_name or "unknown",
+        source_name=record_source_name,
         source=source_for_lookup,
         provider=state.provider,
-        device_model=state.device_model,
+        device_model=record_device_model,
     )
 
     detail = EventRecordDetailCreate(
