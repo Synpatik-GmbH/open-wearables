@@ -9,10 +9,12 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
+import pytest
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.finalize_stale_sleep_task import finalize_stale_sleeps
 from app.schemas.providers.mobile_sdk import SleepState
+from app.services.sdk.sleep_service import active_users_key
 
 
 class TestFinalizeStaleSleepsTask:
@@ -366,3 +368,70 @@ class TestFinalizeStaleSleepsTask:
         # Assert
         assert result is None  # Task completes and skips the malformed user
         mock_load_state.assert_called_once_with(user_id)
+
+
+class TestFinalizeQuietAppleWatchSleep:
+    """FORK (port of upstream #1892): the periodic task applies the same rule as the upload path."""
+
+    def _run(self, db: Session, state: SleepState | None) -> tuple[MagicMock, MagicMock, str]:
+        user_id = str(uuid4())
+        mock_redis = MagicMock()
+        mock_redis.smembers.return_value = [user_id]
+        with (
+            patch("app.integrations.celery.tasks.finalize_stale_sleep_task.SessionLocal") as mock_session_local,
+            patch("app.integrations.celery.tasks.finalize_stale_sleep_task.get_redis_client", return_value=mock_redis),
+            patch("app.integrations.celery.tasks.finalize_stale_sleep_task.load_sleep_state", return_value=state),
+            patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finish_sleep") as mock_finish_sleep,
+        ):
+            mock_session_local.return_value.__enter__ = MagicMock(return_value=db)
+            mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
+            finalize_stale_sleeps()
+        return mock_redis, mock_finish_sleep, user_id
+
+    def _state(self, received_ago: int, watch_sleep: bool) -> SleepState:
+        now = datetime.now(timezone.utc)
+        woke_up = now - timedelta(minutes=40)
+        return SleepState(
+            uuid=str(uuid4()),
+            source_name="Apple Watch",
+            device_model="Watch7,1",
+            provider="apple",
+            start_time=woke_up - timedelta(hours=7),
+            end_time=woke_up,
+            last_start_timestamp=woke_up - timedelta(minutes=10),
+            last_end_timestamp=woke_up,
+            last_received_at=now - timedelta(minutes=received_ago),
+            has_apple_watch_sleep=watch_sleep,
+        )
+
+    def test_closes_a_quiet_apple_watch_session(self, db: Session, mock_celery_app: MagicMock) -> None:
+        state = self._state(received_ago=20, watch_sleep=True)
+
+        _, mock_finish_sleep, user_id = self._run(db, state)
+
+        mock_finish_sleep.assert_called_once_with(db, user_id, state)
+
+    @pytest.mark.parametrize(
+        ("received_ago", "watch_sleep"),
+        [(5, True), (20, False)],
+        ids=["watch-still-uploading", "not-apple-watch"],
+    )
+    def test_leaves_a_session_open_until_its_rule_is_met(
+        self, received_ago: int, watch_sleep: bool, db: Session, mock_celery_app: MagicMock
+    ) -> None:
+        _, mock_finish_sleep, _ = self._run(db, self._state(received_ago=received_ago, watch_sleep=watch_sleep))
+
+        mock_finish_sleep.assert_not_called()
+
+    def test_a_user_whose_session_expired_leaves_the_active_set(self, db: Session, mock_celery_app: MagicMock) -> None:
+        """Upstream #1892: an expired Redis state left the user in sleep:active_users forever, and at a
+        5-minute interval every one of them is re-read 12 times as often."""
+        mock_redis, mock_finish_sleep, user_id = self._run(db, None)
+
+        mock_redis.srem.assert_called_once_with(active_users_key(), user_id)
+        mock_finish_sleep.assert_not_called()
+
+    def test_a_live_session_stays_in_the_active_set(self, db: Session, mock_celery_app: MagicMock) -> None:
+        mock_redis, _, _ = self._run(db, self._state(received_ago=5, watch_sleep=True))
+
+        mock_redis.srem.assert_not_called()

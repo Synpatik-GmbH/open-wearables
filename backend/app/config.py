@@ -98,10 +98,14 @@ class Settings(BaseSettings):
 
     # Time between sleep phases to conclude end of sleep session
     sleep_end_gap_minutes: int = 120  # 2 hours
+    # Time without uploads to conclude end of Apple Watch sleep session
+    # FORK (port of upstream #1892): take upstream's lines at the 0.11.0 upgrade.
+    sleep_upload_quiet_minutes: int = 15
 
     # SYNC SETTINGS
     sync_interval_seconds: int = 3600  # Default: 1 hour (3600 seconds)
-    sleep_sync_interval_seconds: int = 3600  # Default: 1 hour (3600 seconds)
+    # FORK (port of upstream #1892): upstream's 300 s default.
+    sleep_sync_interval_seconds: int = 300  # Default: 5 minutes (300 seconds)
     # Re-fetch a trailing window on each *live* pull sync so late provider revisions
     # (e.g. Oura finalising a day's step count after we already moved past it) are
     # picked up. Disabled by default. Set via a compact duration string: "2d", "20h",

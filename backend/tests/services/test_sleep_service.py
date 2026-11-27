@@ -9,7 +9,7 @@ Apple Watch sleep data patterns:
 - Newer Apple Watch (watchOS 9+): "in_bed", "awake", "light", "deep", "rem" stages
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
@@ -17,6 +17,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.constants.sleep import SleepStageType
+from app.models import DataSource, EventRecord, SleepDetails
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -30,6 +31,7 @@ from app.services.sdk.sleep_service import (
     _calculate_final_metrics,
     finish_sleep,
     handle_sleep_data,
+    is_ready_to_finish,
 )
 from app.services.sdk_token_service import create_sdk_user_token
 from tests.factories import UserFactory
@@ -797,6 +799,8 @@ class TestHistoricalBulkUploadMerging:
         # Simulate the adjacent record that payload A already wrote to the DB
         mock_adjacent = MagicMock()
         mock_adjacent.id = uuid4()
+        mock_adjacent.data_source_id = uuid4()
+        mock_adjacent.source_name = "unknown"  # the payload's writer: same-writer merge
         mock_adjacent.start_datetime = _dt("2026-03-22T23:00:00Z")
         mock_adjacent.end_datetime = _dt("2026-03-23T01:00:00Z")
         mock_adjacent.sleep_detail = MagicMock()
@@ -839,3 +843,746 @@ class TestHistoricalBulkUploadMerging:
         assert SleepStageType.LIGHT in stage_types
         assert SleepStageType.DEEP in stage_types
         assert SleepStageType.REM in stage_types
+
+
+class TestReadyToFinish:
+    """FORK (port of upstream #1892): a session closes after the end gap, and one holding Apple
+    Watch sleep also once uploads to it go quiet for ``sleep_upload_quiet_minutes``.
+
+    The fork keeps one open session per user (upstream keys one per writer app, #1876), so these
+    cases are upstream's tests adapted to a single state saved with ``redis.set``.
+    """
+
+    NOW = _dt("2026-04-18T09:00:00Z")
+    WATCH = {"appId": "com.apple.health.FA11388E", "deviceType": "watch", "deviceModel": "Watch7,1"}
+    IPHONE = {"appId": "com.apple.health.81F2A6D0", "deviceType": "phone", "deviceModel": "iPhone15,2"}
+    OURA = {"appId": "com.ouraring.oura", "deviceType": "phone", "deviceModel": "iPhone15,2"}
+    THIRD_PARTY_ON_WATCH = {"appId": "com.tantsissa.AutoSleep", "deviceType": "watch", "deviceModel": "Watch7,1"}
+
+    def _state(
+        self, ended_ago: int, received_ago: int | None, watch_sleep: bool = True, now: datetime = NOW
+    ) -> SleepState:
+        end = now - timedelta(minutes=ended_ago)
+        return SleepState(
+            uuid=str(uuid4()),
+            source_name="Apple Watch",
+            provider="apple",
+            start_time=end - timedelta(hours=7),
+            end_time=end,
+            last_start_timestamp=end - timedelta(minutes=10),
+            last_end_timestamp=end,
+            last_received_at=None if received_ago is None else now - timedelta(minutes=received_ago),
+            has_apple_watch_sleep=watch_sleep,
+        )
+
+    def _payload(self, samples: list[tuple[str, str, str, dict]]) -> SyncRequest:
+        """One upload of (stage, start, end, source) samples."""
+        return SyncRequest.model_validate(
+            {
+                "provider": "apple",
+                "sdkVersion": "0.13.0",
+                "syncTimestamp": "2026-04-18T08:00:00Z",
+                "data": {
+                    "sleep": [
+                        {"id": str(uuid4()), "stage": stage, "startDate": start, "endDate": end, "source": source}
+                        for stage, start, end, source in samples
+                    ]
+                },
+            }
+        )
+
+    def _upload(
+        self,
+        db: Session,
+        mock_redis_func: MagicMock,
+        samples: list[tuple[str, str, str, dict]],
+        existing: SleepState | None = None,
+    ) -> SleepState | None:
+        """Handle one upload and return the state it saved, or None when nothing was saved."""
+        mock_redis_func.return_value.get.return_value = existing.model_dump_json() if existing else None
+        with (
+            patch("app.services.sdk.sleep_service.finish_sleep"),
+            patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps"),
+        ):
+            handle_sleep_data(db, self._payload(samples), str(uuid4()))
+        calls = mock_redis_func.return_value.set.call_args_list
+        return SleepState.model_validate_json(calls[-1].args[1]) if calls else None
+
+    def test_any_session_closes_after_the_end_gap(self) -> None:
+        assert is_ready_to_finish(self._state(ended_ago=120, received_ago=0, watch_sleep=False), self.NOW)
+
+    def test_an_apple_watch_session_closes_after_a_quiet_period(self) -> None:
+        assert is_ready_to_finish(self._state(ended_ago=40, received_ago=15), self.NOW)
+
+    def test_an_apple_watch_session_stays_open_while_uploads_arrive(self) -> None:
+        assert not is_ready_to_finish(self._state(ended_ago=40, received_ago=14), self.NOW)
+
+    def test_a_session_without_apple_watch_sleep_waits_for_the_end_gap(self) -> None:
+        assert not is_ready_to_finish(self._state(ended_ago=40, received_ago=30, watch_sleep=False), self.NOW)
+
+    def test_a_state_without_an_upload_time_waits_for_the_end_gap(self) -> None:
+        """A state saved before this change has no upload time: it keeps the old 2-hour rule."""
+        assert not is_ready_to_finish(self._state(ended_ago=40, received_ago=None), self.NOW)
+
+    def test_a_state_saved_before_the_change_still_loads(self) -> None:
+        legacy = self._state(ended_ago=40, received_ago=None).model_dump(mode="json")
+        del legacy["last_received_at"], legacy["has_apple_watch_sleep"]
+
+        state = SleepState.model_validate(legacy)
+
+        assert state.last_received_at is None
+        assert not state.has_apple_watch_sleep
+
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_an_upload_records_when_it_arrived(self, mock_redis_func: MagicMock, db: Session) -> None:
+        before = datetime.now(timezone.utc)
+
+        saved = self._upload(
+            db, mock_redis_func, [("light", "2026-04-18T01:00:00Z", "2026-04-18T02:00:00Z", self.WATCH)]
+        )
+
+        assert saved is not None
+        assert saved.last_received_at is not None
+        assert saved.last_received_at >= before
+
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.finish_sleep")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_a_fresh_watch_upload_stays_open(
+        self, mock_redis_func: MagicMock, mock_finish_sleep: MagicMock, mock_finalize: MagicMock, db: Session
+    ) -> None:
+        """The quiet period starts at the upload, so the night is not closed in the same call."""
+        mock_redis_func.return_value.get.return_value = None
+        woke_up = datetime.now(timezone.utc) - timedelta(minutes=30)
+        sample = ("light", (woke_up - timedelta(hours=1)).isoformat(), woke_up.isoformat(), self.WATCH)
+
+        handle_sleep_data(db, self._payload([sample]), str(uuid4()))
+
+        mock_finish_sleep.assert_not_called()
+
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.finish_sleep")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_a_new_upload_restarts_the_quiet_period(
+        self, mock_redis_func: MagicMock, mock_finish_sleep: MagicMock, mock_finalize: MagicMock, db: Session
+    ) -> None:
+        """A session already quiet for 20 minutes is not closed by the upload that extends it."""
+        now = datetime.now(timezone.utc)
+        existing = self._state(ended_ago=40, received_ago=20, now=now)
+        mock_redis_func.return_value.get.return_value = existing.model_dump_json()
+        sample = (
+            "awake",
+            existing.end_time.isoformat(),
+            (existing.end_time + timedelta(minutes=5)).isoformat(),
+            self.WATCH,
+        )
+
+        handle_sleep_data(db, self._payload([sample]), str(uuid4()))
+
+        mock_finish_sleep.assert_not_called()
+        saved = SleepState.model_validate_json(mock_redis_func.return_value.set.call_args.args[1])
+        assert saved.last_received_at is not None
+        assert saved.last_received_at > existing.last_received_at  # type: ignore[operator]
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            (WATCH, True),
+            ({**WATCH, "deviceType": "WATCH"}, True),
+            (IPHONE, False),
+            (OURA, False),
+            (THIRD_PARTY_ON_WATCH, False),
+            ({"appId": "com.apple.health.FA11388E", "deviceModel": "Watch7,1"}, False),
+            ({"deviceType": "watch", "deviceModel": "Watch7,1"}, False),
+            ({"bundleIdentifier": "com.apple.health.FA11388E", "deviceType": "watch", "deviceModel": "Watch7,1"}, True),
+        ],
+        ids=[
+            "apple-watch",
+            "apple-watch-upper-case",
+            "apple-iphone",
+            "third-party-on-phone",
+            "third-party-on-watch",
+            "apple-source-no-device-type",
+            "watch-without-app-id",
+            "apple-watch-bundle-identifier-only",
+        ],
+    )
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_only_apple_watch_sleep_marks_the_session(
+        self, mock_redis_func: MagicMock, source: dict, expected: bool, db: Session
+    ) -> None:
+        """Both conditions hold: Apple's own HealthKit source AND a reported watch, as upstream."""
+        saved = self._upload(db, mock_redis_func, [("light", "2026-04-18T01:00:00Z", "2026-04-18T02:00:00Z", source)])
+
+        assert saved is not None
+        assert saved.has_apple_watch_sleep is expected
+
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_watch_sleep_counts_in_a_session_the_iphone_opened(self, mock_redis_func: MagicMock, db: Session) -> None:
+        saved = self._upload(
+            db,
+            mock_redis_func,
+            [
+                ("in_bed", "2026-04-18T00:30:00Z", "2026-04-18T07:00:00Z", self.IPHONE),
+                ("light", "2026-04-18T01:00:00Z", "2026-04-18T02:00:00Z", self.WATCH),
+            ],
+        )
+
+        assert saved is not None
+        assert saved.has_apple_watch_sleep
+
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_the_watch_mark_survives_a_later_iphone_upload(self, mock_redis_func: MagicMock, db: Session) -> None:
+        existing = self._state(ended_ago=40, received_ago=20, now=datetime.now(timezone.utc))
+        sample = (
+            "in_bed",
+            existing.end_time.isoformat(),
+            (existing.end_time + timedelta(minutes=5)).isoformat(),
+            self.IPHONE,
+        )
+
+        saved = self._upload(db, mock_redis_func, [sample], existing=existing)
+
+        assert saved is not None
+        assert saved.has_apple_watch_sleep
+
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_a_night_split_off_inside_an_upload_records_the_upload_time(
+        self, mock_redis_func: MagicMock, db: Session
+    ) -> None:
+        """A sample more than the end gap away starts a new night; that new night is the one saved."""
+        before = datetime.now(timezone.utc)
+        existing = self._state(ended_ago=600, received_ago=500, watch_sleep=False, now=before)
+        start = existing.end_time + timedelta(hours=4)
+
+        saved = self._upload(
+            db,
+            mock_redis_func,
+            [("light", start.isoformat(), (start + timedelta(hours=1)).isoformat(), self.WATCH)],
+            existing,
+        )
+
+        assert saved is not None
+        assert saved.uuid != existing.uuid
+        assert saved.has_apple_watch_sleep
+        assert saved.last_received_at is not None
+        assert saved.last_received_at >= before
+
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_an_upload_without_usable_sleep_keeps_the_upload_time(
+        self, mock_redis_func: MagicMock, db: Session
+    ) -> None:
+        existing = self._state(ended_ago=40, received_ago=30, now=datetime.now(timezone.utc))
+
+        saved = self._upload(
+            db, mock_redis_func, [("napping", "2026-04-18T08:30:00Z", "2026-04-18T08:40:00Z", self.WATCH)], existing
+        )
+
+        assert saved is not None
+        assert saved.last_received_at == existing.last_received_at
+
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.finish_sleep")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_an_upload_without_usable_sleep_closes_a_quiet_watch_session(
+        self, mock_redis_func: MagicMock, mock_finish_sleep: MagicMock, mock_finalize: MagicMock, db: Session
+    ) -> None:
+        """The upload path applies the same rule as the periodic task, not only the end gap."""
+        existing = self._state(ended_ago=40, received_ago=20, now=datetime.now(timezone.utc))
+        mock_redis_func.return_value.get.return_value = existing.model_dump_json()
+
+        handle_sleep_data(
+            db,
+            self._payload([("napping", "2026-04-18T08:30:00Z", "2026-04-18T08:40:00Z", self.WATCH)]),
+            str(uuid4()),
+        )
+
+        mock_finish_sleep.assert_called_once()
+
+
+class TestLatePieceFromAnotherWriter:
+    """FORK (with the port of upstream #1892): a piece of an Apple Health night that arrives after
+    the night was closed merges into it whichever writer recorded it, as it would have joined the
+    one open session while the night was still open. Real database, no mocked service: the merge
+    is a query, and a mocked seam would hide which records it can reach.
+
+    Without this an Apple Watch night closed after the 15-minute quiet period, followed by a later
+    AutoSleep or Oura copy (or a later Watch piece in a night the iPhone opened), was stored as a
+    second overlapping record of the same provider.
+    """
+
+    WATCH = ("Jan's Apple Watch", "Watch7,1")
+    IPHONE = ("Jan's iPhone", "iPhone15,2")
+    AUTOSLEEP = ("AutoSleep", "iPhone15,2")
+
+    def _state(
+        self,
+        provider: str,
+        writer: tuple[str, str],
+        start: str,
+        end: str,
+        stage: SleepStageType = SleepStageType.LIGHT,
+    ) -> SleepState:
+        start_dt, end_dt = _dt(start), _dt(end)
+        return SleepState(
+            uuid=str(uuid4()),
+            source_name=writer[0],
+            device_model=writer[1],
+            provider=provider,
+            start_time=start_dt,
+            end_time=end_dt,
+            last_start_timestamp=start_dt,
+            last_end_timestamp=end_dt,
+            stages=[SleepStateStage(stage=stage, start_time=start_dt, end_time=end_dt)],
+        )
+
+    def _nights(self, db: Session, user_id: str) -> list[tuple[str, str | None, datetime, datetime]]:
+        rows = (
+            db.query(
+                EventRecord.source_name, DataSource.device_model, EventRecord.start_datetime, EventRecord.end_datetime
+            )
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == UUID(user_id), EventRecord.category == "sleep")
+            .order_by(EventRecord.start_datetime)
+            .all()
+        )
+        return [(r[0], r[1], r[2], r[3]) for r in rows]
+
+    def _writer_of_data_source(
+        self, db: Session, nights: list[tuple[str, str | None, datetime, datetime]]
+    ) -> str | None:
+        """``DataSource.source`` of the one stored night: the row the merged record landed on."""
+        row = (
+            db.query(DataSource.source)
+            .join(EventRecord, EventRecord.data_source_id == DataSource.id)
+            .filter(EventRecord.start_datetime == nights[0][2], EventRecord.end_datetime == nights[0][3])
+            .one()
+        )
+        return row[0]
+
+    def _two_pieces(
+        self, db: Session, provider: str, first: tuple[str, str], later: tuple[str, str], overlap: bool = True
+    ) -> list[tuple[str, str | None, datetime, datetime]]:
+        user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
+        with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+            finish_sleep(db, user_id, self._state(provider, first, "2026-04-17T23:00:00Z", "2026-04-18T06:00:00Z"))
+            later_start = "2026-04-17T23:10:00Z" if overlap else "2026-04-18T06:30:00Z"
+            finish_sleep(db, user_id, self._state(provider, later, later_start, "2026-04-18T06:45:00Z"))
+        return self._nights(db, user_id)
+
+    def test_a_later_copy_from_another_app_merges_into_the_watch_night(self, db: Session) -> None:
+        nights = self._two_pieces(db, "apple", self.WATCH, self.AUTOSLEEP)
+
+        assert len(nights) == 1
+        assert nights[0][2] == _dt("2026-04-17T23:00:00Z")
+        assert nights[0][3] == _dt("2026-04-18T06:45:00Z")
+
+    def test_a_later_watch_piece_merges_into_a_night_the_iphone_opened(self, db: Session) -> None:
+        nights = self._two_pieces(db, "apple", self.IPHONE, self.WATCH, overlap=False)
+
+        assert len(nights) == 1
+
+    def test_the_merged_night_keeps_the_stored_nights_writer_and_device(self, db: Session) -> None:
+        """As the open session did: the night is named for the writer that opened it."""
+        nights = self._two_pieces(db, "apple", self.WATCH, self.AUTOSLEEP)
+
+        assert len(nights) == 1
+        assert (nights[0][0], nights[0][1]) == self.WATCH
+        assert self._writer_of_data_source(db, nights) == self.WATCH[0]
+
+    def test_the_same_writer_still_merges(self, db: Session) -> None:
+        nights = self._two_pieces(db, "apple", self.WATCH, self.WATCH, overlap=False)
+
+        assert len(nights) == 1
+        assert (nights[0][0], nights[0][1]) == self.WATCH
+
+    def test_another_sdk_provider_keeps_one_record_per_writer(self, db: Session) -> None:
+        """Only Apple Health has the 15-minute close; Health Connect keeps upstream's merge."""
+        nights = self._two_pieces(db, "health_connect", ("Fitbit", "Pixel Watch"), ("Sleep as Android", "Pixel 8"))
+
+        assert len(nights) == 2
+
+    def test_a_night_more_than_the_end_gap_away_stays_its_own_record(self, db: Session) -> None:
+        user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
+        with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+            finish_sleep(db, user_id, self._state("apple", self.WATCH, "2026-04-17T23:00:00Z", "2026-04-18T06:00:00Z"))
+            finish_sleep(
+                db, user_id, self._state("apple", self.AUTOSLEEP, "2026-04-18T13:00:00Z", "2026-04-18T14:00:00Z")
+            )
+
+        assert len(self._nights(db, user_id)) == 2
+
+    def test_another_providers_night_is_never_merged_in(self, db: Session) -> None:
+        """With the writer filter off for Apple Health, the provider filter alone keeps a night
+        from another provider (Polar, read from its own API) out of the merge."""
+        user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
+        with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+            finish_sleep(
+                db,
+                user_id,
+                self._state("polar", ("Polar", "Vantage V3"), "2026-04-17T23:00:00Z", "2026-04-18T06:00:00Z"),
+            )
+            finish_sleep(db, user_id, self._state("apple", self.WATCH, "2026-04-17T23:10:00Z", "2026-04-18T06:45:00Z"))
+
+        assert sorted(n[0] for n in self._nights(db, user_id)) == ["Jan's Apple Watch", "Polar"]
+
+    def test_the_merged_night_counts_overlapping_time_once(self, db: Session) -> None:
+        """Watch 23:00-06:00 and AutoSleep 23:10-06:45 are one night of 7 h 45 min, not 14 h 35 min."""
+        user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
+        with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+            finish_sleep(db, user_id, self._state("apple", self.WATCH, "2026-04-17T23:00:00Z", "2026-04-18T06:00:00Z"))
+            finish_sleep(
+                db, user_id, self._state("apple", self.AUTOSLEEP, "2026-04-17T23:10:00Z", "2026-04-18T06:45:00Z")
+            )
+
+        totals = (
+            db.query(SleepDetails.sleep_total_duration_minutes)
+            .join(EventRecord, SleepDetails.record_id == EventRecord.id)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == UUID(user_id))
+            .all()
+        )
+        assert [t[0] for t in totals] == [465]
+
+
+Piece = tuple[tuple[str, str], str, str, SleepStageType]
+
+AUTOSLEEP = ("AutoSleep", "iPhone15,2")
+WATCH = ("Jan's Apple Watch", "Watch7,1")
+IPHONE = ("Jan's iPhone", "iPhone15,2")
+
+
+def _sdk_state(provider: str, piece: Piece) -> SleepState:
+    (name, device), start, end, stage = piece
+    start_dt, end_dt = _dt(start), _dt(end)
+    return SleepState(
+        uuid=str(uuid4()),
+        source_name=name,
+        device_model=device,
+        provider=provider,
+        start_time=start_dt,
+        end_time=end_dt,
+        last_start_timestamp=start_dt,
+        last_end_timestamp=end_dt,
+        stages=[SleepStateStage(stage=stage, start_time=start_dt, end_time=end_dt)],
+    )
+
+
+def _store(db: Session, pieces: list[Piece], provider: str = "apple") -> list[tuple[int, int]]:
+    """Close each piece through ``finish_sleep`` in order; (total sleep, time in bed) per stored night."""
+    user_id = str(uuid4())
+    UserFactory(id=UUID(user_id))
+    with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+        for piece in pieces:
+            finish_sleep(db, user_id, _sdk_state(provider, piece))
+    rows = (
+        db.query(SleepDetails.sleep_total_duration_minutes, SleepDetails.sleep_time_in_bed_minutes)
+        .join(EventRecord, SleepDetails.record_id == EventRecord.id)
+        .join(DataSource, EventRecord.data_source_id == DataSource.id)
+        .filter(DataSource.user_id == UUID(user_id))
+        .order_by(EventRecord.start_datetime)
+        .all()
+    )
+    return [(r[0], r[1]) for r in rows]
+
+
+class TestCrossWriterMergeKeepsGenericSleep:
+    """FORK (reviews of #56): ``_calculate_final_metrics`` drops every generic ``sleeping`` stage once
+    any light/deep/REM stage is present. Records from two writers used to stay separate, so a
+    cross-writer merge keeps the generic time that no kept stage covers, counted once. A same-writer
+    merge keeps the existing rule."""
+
+    def test_generic_sleep_next_to_another_writers_detailed_piece_is_kept(self, db: Session) -> None:
+        """Generic 00:00-07:00, then another writer's light 07:00-07:45: 465 min, not 45."""
+        stored = _store(
+            db,
+            [
+                (AUTOSLEEP, "2026-04-18T00:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING),
+                (WATCH, "2026-04-18T07:00:00Z", "2026-04-18T07:45:00Z", SleepStageType.LIGHT),
+            ],
+        )
+
+        assert [total for total, _ in stored] == [465]
+
+    def test_an_edge_overlap_keeps_the_rest_of_the_generic_span(self, db: Session) -> None:
+        """Generic 00:00-07:00, light 06:55-07:45: the 5 overlapping minutes count once (465)."""
+        stored = _store(
+            db,
+            [
+                (AUTOSLEEP, "2026-04-18T00:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING),
+                (WATCH, "2026-04-18T06:55:00Z", "2026-04-18T07:45:00Z", SleepStageType.LIGHT),
+            ],
+        )
+
+        assert [total for total, _ in stored] == [465]
+
+    def test_an_awake_edge_keeps_the_rest_of_the_generic_span(self, db: Session) -> None:
+        """Generic 00:00-07:00, then awake 06:55-07:05 and light 07:05-07:45: 415 + 40 = 455."""
+        user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
+        later = _sdk_state("apple", (WATCH, "2026-04-18T06:55:00Z", "2026-04-18T07:05:00Z", SleepStageType.AWAKE))
+        later.stages.append(
+            SleepStateStage(
+                stage=SleepStageType.LIGHT, start_time=_dt("2026-04-18T07:05:00Z"), end_time=_dt("2026-04-18T07:45:00Z")
+            )
+        )
+        later.end_time = _dt("2026-04-18T07:45:00Z")
+        with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+            finish_sleep(
+                db,
+                user_id,
+                _sdk_state(
+                    "apple", (AUTOSLEEP, "2026-04-18T00:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING)
+                ),
+            )
+            finish_sleep(db, user_id, later)
+        totals = (
+            db.query(SleepDetails.sleep_total_duration_minutes)
+            .join(EventRecord, SleepDetails.record_id == EventRecord.id)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == UUID(user_id))
+            .all()
+        )
+
+        assert [t[0] for t in totals] == [455]
+
+    def test_generic_sleep_outside_a_partial_detailed_piece_is_kept(self, db: Session) -> None:
+        """Generic 23:00-07:00 around a detailed piece 23:30-01:00: 480 min, counted once."""
+        stored = _store(
+            db,
+            [
+                (AUTOSLEEP, "2026-04-17T23:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING),
+                (WATCH, "2026-04-17T23:30:00Z", "2026-04-18T01:00:00Z", SleepStageType.DEEP),
+            ],
+        )
+
+        assert [total for total, _ in stored] == [480]
+
+    def test_detailed_sleep_stored_first_keeps_a_later_generic_piece(self, db: Session) -> None:
+        """Watch light 23:00-06:00, then AutoSleep generic 23:00-07:00: 480 min."""
+        stored = _store(
+            db,
+            [
+                (WATCH, "2026-04-17T23:00:00Z", "2026-04-18T06:00:00Z", SleepStageType.LIGHT),
+                (AUTOSLEEP, "2026-04-17T23:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING),
+            ],
+        )
+
+        assert [total for total, _ in stored] == [480]
+
+    def test_an_iphone_in_bed_record_stored_first_counts_its_margins_as_sleep(self, db: Session) -> None:
+        """Known limit: an in-bed-only record is stored as generic sleep, so in bed 01:00-07:30 stored
+        before Watch light 01:30-07:00 counts 390 min of sleep and 390 in bed (one live session: 330
+        and 390). release/0.9.0-syn stores the two records, 390 and 330."""
+        stored = _store(
+            db,
+            [
+                (IPHONE, "2026-04-18T01:00:00Z", "2026-04-18T07:30:00Z", SleepStageType.IN_BED),
+                (WATCH, "2026-04-18T01:30:00Z", "2026-04-18T07:00:00Z", SleepStageType.LIGHT),
+            ],
+        )
+
+        assert stored == [(390, 390)]
+
+    def test_a_same_writer_merge_keeps_the_existing_rule(self, db: Session) -> None:
+        """Unchanged: one writer's generic wrapper is dropped once that writer sends detailed stages."""
+        stored = _store(
+            db,
+            [
+                (WATCH, "2026-04-18T00:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING),
+                (WATCH, "2026-04-18T07:00:00Z", "2026-04-18T07:45:00Z", SleepStageType.LIGHT),
+            ],
+        )
+
+        assert [total for total, _ in stored] == [45]
+
+    def test_overlapping_generic_stages_are_counted_once(self, db: Session) -> None:
+        """Generic 00:00-07:00 and 06:00-07:00 in one upload are 420 min, plus light 07:00-07:45: 465."""
+        user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
+        later = _sdk_state(
+            "apple", (AUTOSLEEP, "2026-04-18T00:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING)
+        )
+        later.stages.append(
+            SleepStateStage(
+                stage=SleepStageType.SLEEPING,
+                start_time=_dt("2026-04-18T06:00:00Z"),
+                end_time=_dt("2026-04-18T07:00:00Z"),
+            )
+        )
+        with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+            finish_sleep(
+                db,
+                user_id,
+                _sdk_state("apple", (WATCH, "2026-04-18T07:00:00Z", "2026-04-18T07:45:00Z", SleepStageType.LIGHT)),
+            )
+            finish_sleep(db, user_id, later)
+        totals = (
+            db.query(SleepDetails.sleep_total_duration_minutes)
+            .join(EventRecord, SleepDetails.record_id == EventRecord.id)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == UUID(user_id))
+            .all()
+        )
+
+        assert [t[0] for t in totals] == [465]
+
+
+def _watch_night_with_wrapper(start: str, end: str, stages: list[tuple[str, str, SleepStageType]]) -> SleepState:
+    """A Watch piece that sends a generic ``sleeping`` wrapper around its own detailed stages."""
+    state = _sdk_state("apple", (WATCH, start, end, SleepStageType.SLEEPING))
+    for s_start, s_end, stage in stages:
+        state.stages.append(SleepStateStage(stage=stage, start_time=_dt(s_start), end_time=_dt(s_end)))
+    return state
+
+
+def _totals(db: Session, user_id: str) -> list[int]:
+    rows = (
+        db.query(SleepDetails.sleep_total_duration_minutes)
+        .join(EventRecord, SleepDetails.record_id == EventRecord.id)
+        .join(DataSource, EventRecord.data_source_id == DataSource.id)
+        .filter(DataSource.user_id == UUID(user_id))
+        .all()
+    )
+    return [r[0] for r in rows]
+
+
+class TestALatePiecesOwnWrapperIsNotSleep:
+    """FORK (review of b443dbb8): a late piece that sends a generic wrapper around its own detailed
+    stages keeps the existing rule for that wrapper; only another source's generic sleep is kept."""
+
+    WATCH_STAGES = [
+        ("2026-04-17T23:30:00Z", "2026-04-18T03:00:00Z", SleepStageType.LIGHT),
+        ("2026-04-18T03:30:00Z", "2026-04-18T06:30:00Z", SleepStageType.DEEP),
+    ]
+
+    def test_a_cross_writer_merge_does_not_count_the_late_pieces_wrapper(self, db: Session) -> None:
+        """AutoSleep generic 22:00-23:00, then a Watch wrapper 23:00-07:00 around 390 min of stages: 450."""
+        user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
+        with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+            finish_sleep(
+                db,
+                user_id,
+                _sdk_state(
+                    "apple", (AUTOSLEEP, "2026-04-17T22:00:00Z", "2026-04-17T23:00:00Z", SleepStageType.SLEEPING)
+                ),
+            )
+            finish_sleep(
+                db,
+                user_id,
+                _watch_night_with_wrapper("2026-04-17T23:00:00Z", "2026-04-18T07:00:00Z", self.WATCH_STAGES),
+            )
+
+        assert _totals(db, user_id) == [450]
+
+    def test_a_later_wrapper_on_a_record_holding_both_kinds_is_not_sleep(self, db: Session) -> None:
+        """A record that kept AutoSleep's 00:00-07:00 beside Watch light 07:00-07:45 (465), then a Watch
+        wrapper 07:45-09:00 around deep 08:00-08:30: 495, not 540."""
+        user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
+        with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+            finish_sleep(
+                db,
+                user_id,
+                _sdk_state("apple", (WATCH, "2026-04-18T07:00:00Z", "2026-04-18T07:45:00Z", SleepStageType.LIGHT)),
+            )
+            finish_sleep(
+                db,
+                user_id,
+                _sdk_state(
+                    "apple", (AUTOSLEEP, "2026-04-18T00:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING)
+                ),
+            )
+            finish_sleep(
+                db,
+                user_id,
+                _watch_night_with_wrapper(
+                    "2026-04-18T07:45:00Z",
+                    "2026-04-18T09:00:00Z",
+                    [("2026-04-18T08:00:00Z", "2026-04-18T08:30:00Z", SleepStageType.DEEP)],
+                ),
+            )
+
+        assert _totals(db, user_id) == [495]
+
+
+class TestMergeAcrossThreePieces:
+    """FORK (reviews of #56): a record that kept another writer's generic sleep keeps it when a later
+    piece comes from the writer the record is named for."""
+
+    def test_a_later_piece_from_the_named_writer_keeps_restored_generic_sleep(self, db: Session) -> None:
+        """Watch light 00:00-01:00, AutoSleep generic 00:00-07:00, Watch deep 07:00-07:30: 450 min."""
+        stored = _store(
+            db,
+            [
+                (WATCH, "2026-04-18T00:00:00Z", "2026-04-18T01:00:00Z", SleepStageType.LIGHT),
+                (AUTOSLEEP, "2026-04-18T00:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING),
+                (WATCH, "2026-04-18T07:00:00Z", "2026-04-18T07:30:00Z", SleepStageType.DEEP),
+            ],
+        )
+
+        assert [total for total, _ in stored] == [450]
+
+    def test_a_later_generic_piece_from_the_named_writer_keeps_everything(self, db: Session) -> None:
+        """AutoSleep generic 00:00-07:00, Watch light 07:00-07:45, AutoSleep generic 07:45-08:00: 480 min."""
+        stored = _store(
+            db,
+            [
+                (AUTOSLEEP, "2026-04-18T00:00:00Z", "2026-04-18T07:00:00Z", SleepStageType.SLEEPING),
+                (WATCH, "2026-04-18T07:00:00Z", "2026-04-18T07:45:00Z", SleepStageType.LIGHT),
+                (AUTOSLEEP, "2026-04-18T07:45:00Z", "2026-04-18T08:00:00Z", SleepStageType.SLEEPING),
+            ],
+        )
+
+        assert [total for total, _ in stored] == [480]
+
+
+class TestOtherSdkProvidersMergeAsBefore:
+    """FORK (Bogdan's reviews of #56): only an Apple Health merge keeps the stored night's writer and
+    device, or keeps generic sleep beside detailed stages. Health Connect and Samsung merge as on
+    release/0.9.0-syn."""
+
+    def test_a_health_connect_merge_lands_on_the_late_pieces_device(self, db: Session) -> None:
+        helper = TestLatePieceFromAnotherWriter()
+        user_id = str(uuid4())
+        UserFactory(id=UUID(user_id))
+        writer = "com.sec.android.app.shealth"
+        with patch("app.services.sdk.sleep_service.delete_sleep_state"):
+            finish_sleep(
+                db,
+                user_id,
+                helper._state("health_connect", (writer, "SM-R960"), "2026-04-17T23:00:00Z", "2026-04-18T06:00:00Z"),
+            )
+            finish_sleep(
+                db,
+                user_id,
+                helper._state("health_connect", (writer, "SM-S918B"), "2026-04-18T06:10:00Z", "2026-04-18T06:40:00Z"),
+            )
+
+        nights = helper._nights(db, user_id)
+        assert len(nights) == 1
+        assert nights[0][1] == "SM-S918B"
+
+    def test_a_source_less_health_connect_piece_keeps_the_existing_rule(self, db: Session) -> None:
+        """A late piece with no source name has no writer filter for any provider, so it merges into
+        another writer's night; Health Connect still drops the generic sleep there, as before (45)."""
+        stored = _store(
+            db,
+            [
+                (
+                    ("Sleep as Android", "Pixel 8"),
+                    "2026-04-18T00:00:00Z",
+                    "2026-04-18T07:00:00Z",
+                    SleepStageType.SLEEPING,
+                ),
+                (("unknown", "Pixel 8"), "2026-04-18T07:00:00Z", "2026-04-18T07:45:00Z", SleepStageType.LIGHT),
+            ],
+            provider="health_connect",
+        )
+
+        assert [total for total, _ in stored] == [45]

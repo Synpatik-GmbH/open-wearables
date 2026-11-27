@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 from app.config import settings
+from app.constants.devices_map.device_types import is_apple_own_source
 from app.constants.series_types.sdk import (
     SleepPhase,
     get_apple_sleep_phase,
@@ -15,14 +16,17 @@ from app.constants.sleep import SleepStageType
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
 from app.repositories.wearable_history_ingress_repository import WearableHistoryIngressRepository
+from app.schemas.enums import ProviderName
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
+    SleepStage,
 )
 from app.schemas.providers.mobile_sdk import (
     SLEEP_START_STATES,
     SleepState,
     SleepStateStage,
+    SourceInfo,
 )
 from app.schemas.providers.mobile_sdk import (
     SyncRequest as SDKSyncRequest,
@@ -30,6 +34,7 @@ from app.schemas.providers.mobile_sdk import (
 from app.services.event_record_service import event_record_service
 from app.services.sdk.device_resolution import extract_device_info
 from app.services.sdk.sleep_stages import _calculate_final_metrics, normalized_sleep_window, ordered_sleep_stages
+from app.utils.dates import as_utc
 from app.utils.exceptions import SleepLockBusyError
 from app.utils.sleep_interval import interval_gap
 from app.utils.structured_logging import log_structured
@@ -79,6 +84,29 @@ def delete_sleep_state(user_id: str) -> None:
     get_redis_client().srem(active_users_key(), user_id)
 
 
+def is_ready_to_finish(state: SleepState, now: datetime) -> bool:
+    """True after the end gap, or for a session with Apple Watch sleep once its uploads go quiet.
+
+    FORK (port of upstream #1892): the Watch hands the phone the whole night after waking, so
+    once uploads stop for ``sleep_upload_quiet_minutes`` the night is complete; any other session
+    still waits ``sleep_end_gap_minutes`` after its last sample.
+    """
+    if now - as_utc(state.end_time) >= timedelta(minutes=settings.sleep_end_gap_minutes):
+        return True
+    return (
+        state.has_apple_watch_sleep
+        and state.last_received_at is not None
+        and now - as_utc(state.last_received_at) >= timedelta(minutes=settings.sleep_upload_quiet_minutes)
+    )
+
+
+def _is_apple_watch_sample(source: SourceInfo | None) -> bool:
+    """A sample Apple's own HealthKit source recorded on a Watch (upstream #1892's test)."""
+    if source is None or source.device_type is None:
+        return False
+    return str(source.device_type).lower() == "watch" and is_apple_own_source(source.app_id or source.bundle_identifier)
+
+
 def _create_new_sleep_state(
     start_time: datetime,
     end_time: datetime,
@@ -120,6 +148,7 @@ def _apply_transition(
     source_name: str | None = None,
     device_model: str | None = None,
     zone_offset: str | None = None,
+    is_apple_watch: bool = False,
 ) -> SleepState:
     """Apply a transition to the sleep state."""
 
@@ -136,6 +165,8 @@ def _apply_transition(
 
     if zone_offset and not state.zone_offset:
         state.zone_offset = zone_offset
+    if is_apple_watch:
+        state.has_apple_watch_sleep = True
 
     duration_seconds = (end_time - start_time).total_seconds()
 
@@ -192,14 +223,16 @@ def handle_sleep_data(
     """
     Process SDK sleep data and track sleep sessions using Redis state.
 
-    Sleep sessions are tracked in Redis and automatically finalized to the database when
-    a gap of more than 2 hours (configurable) is detected between consecutive sleep records.
+    Sleep sessions are tracked in Redis and finalized to the database when ``is_ready_to_finish``
+    holds: a gap of more than 2 hours (configurable) since the session's last sample, or, for a
+    session holding Apple Watch sleep, 15 minutes (configurable) since its last upload.
 
     A per-user Redis lock serializes concurrent calls so that parallel Celery tasks
     (e.g. from a bulk historical upload) accumulate stages into the same session instead
     of overwriting each other's state.
 
-    Stale detection uses ``end_time`` (the last sleep-sample timestamp).  When a bulk
+    Stale detection uses ``end_time`` (the last sleep-sample timestamp), and for a session with
+    Apple Watch sleep also ``last_received_at`` (the last upload that added samples).  When a bulk
     historical upload finalizes a session whose ``end_time`` is in the past, the new
     session is merged with any adjacent record already in the database, so consecutive
     payloads within the same night are combined into a single session rather than being
@@ -237,6 +270,7 @@ def handle_sleep_data(
 
         current_state = load_sleep_state(user_id)
         provider = request.provider
+        received = False
 
         for sjson in ordered_sleep_stages(request.data.sleep):
             # Extract device info
@@ -273,7 +307,13 @@ def handle_sleep_data(
                 original_source_name,
                 device_model,
                 sjson.zoneOffset,
+                is_apple_watch=_is_apple_watch_sample(sjson.source),
             )
+            received = True
+
+        now = datetime.now(timezone.utc)
+        if current_state and received:
+            current_state.last_received_at = now
 
         # Persist the accumulated state to Redis only once after processing the entire batch
         if current_state:
@@ -299,12 +339,8 @@ def handle_sleep_data(
         # finish_sleep now merges the result with any adjacent record already in
         # the DB — so each payload extends the growing record rather than
         # creating a separate session.
-        if current_state:
-            session_end = current_state.end_time
-            if session_end.tzinfo is None:
-                session_end = session_end.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) - session_end >= timedelta(minutes=settings.sleep_end_gap_minutes):
-                finish_sleep(db_session, user_id, current_state)
+        if current_state and is_ready_to_finish(current_state, now):
+            finish_sleep(db_session, user_id, current_state)
 
     finally:
         with contextlib.suppress(Exception):
@@ -316,6 +352,53 @@ def handle_sleep_data(
     # Dispatch the stale-sleep task so sessions that have gone quiet (including
     # other users' sessions) are finalised promptly without waiting for the next beat.
     finalize_stale_sleeps.delay()
+
+
+def _keep_uncovered_generic_sleep(
+    stored: list[SleepStateStage], new: list[SleepStateStage], metrics: dict, cleaned: list[SleepStage]
+) -> tuple[dict, list[SleepStage]]:
+    """FORK (reviews of #56): add back the generic ``sleeping`` time that no kept stage covers.
+
+    ``_calculate_final_metrics`` drops every generic ``sleeping`` stage once any light/deep/REM
+    stage is present: right for one writer's wrapper around its own detailed stages, wrong for two
+    writers' records that a cross-writer merge now joins where they used to stay separate (generic
+    00:00-07:00 plus another writer's light 07:00-07:45 would store 45 min). Where a kept stage
+    overlaps a generic span, that stage counts; the rest of the span is added back, once.
+
+    The new piece's generic stages are offered only when the piece has no detailed stage of its
+    own: a generic stage beside the same piece's detailed stages is that writer's wrapper, which
+    keeps the existing rule. Stored stages were cleaned when stored, so they carry no wrapper.
+    """
+    detailed = (SleepStageType.LIGHT, SleepStageType.DEEP, SleepStageType.REM)
+    if not any(s.stage in detailed for s in stored + new):
+        return metrics, cleaned
+    sources = stored if any(s.stage in detailed for s in new) else stored + new
+    spans: list[tuple[datetime, datetime]] = []
+    for start, end in sorted((s.start_time, s.end_time) for s in sources if s.stage == SleepStageType.SLEEPING):
+        if spans and start < spans[-1][1]:
+            spans[-1] = (spans[-1][0], max(spans[-1][1], end))
+        elif start < end:
+            spans.append((start, end))
+    covered = sorted((c.start_time, c.end_time) for c in cleaned)
+    pieces: list[tuple[datetime, datetime]] = []
+    for start, end in spans:
+        cursor = start
+        for c_start, c_end in covered:
+            if c_end <= cursor or c_start >= end:
+                continue
+            if c_start > cursor:
+                pieces.append((cursor, c_start))
+            cursor = max(cursor, c_end)
+            if cursor >= end:
+                break
+        if cursor < end:
+            pieces.append((cursor, end))
+    if not pieces:
+        return metrics, cleaned
+    kept = dict(metrics)
+    kept["sleeping_seconds"] += sum((end - start).total_seconds() for start, end in pieces)
+    restored = [SleepStage(stage=SleepStageType.SLEEPING, start_time=start, end_time=end) for start, end in pieces]
+    return kept, sorted(cleaned + restored, key=lambda s: s.start_time)
 
 
 def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None:
@@ -344,15 +427,22 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
 
     # --- Merge with an adjacent existing session if one exists ---
     source_for_lookup = state.source_name if state.source_name != "unknown" else None
+    # FORK (with the port of upstream #1892): an Apple Health night can close 15 minutes after its
+    # last upload, so a piece that arrives later — another app's copy, or a Watch piece in a night
+    # the iPhone opened — merges into it whichever writer recorded it, as it would have joined the
+    # one open session. Every other provider keeps the per-writer merge.
+    cross_writer = state.provider == ProviderName.APPLE
     adjacent = event_record_service.find_adjacent_sleep_record(
         db_session,
         UUID(user_id),
         start_time,
         end_time,
         settings.sleep_end_gap_minutes,
-        source=source_for_lookup,
+        source=None if cross_writer else source_for_lookup,
         provider=state.provider,
     )
+    record_source_name = state.source_name or "unknown"
+    record_data_source_id: UUID | None = None
 
     if adjacent is not None:
         # Deserialise the stored stages back to SleepStateStage so we can feed
@@ -364,7 +454,18 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
                     existing_state_stages.append(SleepStateStage.model_validate(s))
 
         # Recalculate from the union of both stage lists.
-        metrics, cleaned_stages = _calculate_final_metrics(existing_state_stages + state.stages)
+        merged_stages = existing_state_stages + state.stages
+        metrics, cleaned_stages = _calculate_final_metrics(merged_stages)
+        # FORK: an Apple Health merge keeps generic sleep that no detailed stage covers when it
+        # joins two writers, or when the stored record already holds both kinds — a state only
+        # such a merge leaves, so a later piece from the writer the record is named for keeps it.
+        stored_has_both = any(s.stage == SleepStageType.SLEEPING for s in existing_state_stages) and any(
+            s.stage in (SleepStageType.LIGHT, SleepStageType.DEEP, SleepStageType.REM) for s in existing_state_stages
+        )
+        if cross_writer and (adjacent.source_name != record_source_name or stored_has_both):
+            metrics, cleaned_stages = _keep_uncovered_generic_sleep(
+                existing_state_stages, state.stages, metrics, cleaned_stages
+            )
 
         # Expand the session window to cover both records.
         start_time = min(adjacent.start_datetime, start_time)
@@ -372,6 +473,13 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         if cleaned_stages:
             start_time = min(start_time, cleaned_stages[0].start_time)
             end_time = max(end_time, cleaned_stages[-1].end_time)
+
+        # FORK: an Apple Health merged night stays on the stored night's data source (its writer
+        # and device) and keeps its name, as the open session kept the writer that opened it.
+        # Other providers land on the late piece's, as before.
+        if cross_writer:
+            record_source_name = adjacent.source_name
+            record_data_source_id = adjacent.data_source_id
 
         # Remove the old record before creating the merged one (cascade deletes detail).
         event_record_service.delete(db_session, adjacent.id)
@@ -397,7 +505,8 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         duration_seconds=int(total_duration),
         category="sleep",
         type="sleep_session",
-        source_name=state.source_name or "unknown",
+        source_name=record_source_name,
+        data_source_id=record_data_source_id,
         source=source_for_lookup,
         provider=state.provider,
         device_model=state.device_model,
